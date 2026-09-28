@@ -39,6 +39,18 @@ class ParamSpec:
         return ""
 
 
+# Combinations the platform's per-parameter ranges accept but GATK 4.5.0.0 rejects (the validator then scores
+# nothing). Each verified by a real GATK run on 2026-09-28.
+CROSS_CONSTRAINTS = {
+    "gatk": [
+        ("min_assembly_region_size <= max_assembly_region_size",
+         lambda p: p.get("min_assembly_region_size", 50) <= p.get("max_assembly_region_size", 300)),
+        ("base_quality_score_threshold >= 6",
+         lambda p: p.get("base_quality_score_threshold", 18) >= 6),
+    ],
+}
+
+
 class ParamRanges:
     def __init__(self, raw: dict):
         self.raw = raw
@@ -66,6 +78,9 @@ class ParamRanges:
             return [f"unknown tool {config.tool!r}"]
         errs = [f"unknown parameter {k!r}" for k in config.params if k not in specs]
         errs += [e for k, v in config.params.items() if k in specs for e in [specs[k].check(v)] if e]
+        if not errs:
+            params = {**{n: s.default for n, s in specs.items()}, **config.params}
+            errs += [f"GATK rejects: needs {desc}" for desc, ok in CROSS_CONSTRAINTS.get(config.tool, []) if not ok(params)]
         return errs
 
     def defaults(self, tool: str) -> Config:

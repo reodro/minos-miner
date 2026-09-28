@@ -35,6 +35,16 @@ SAFE_ANNOTATION_EXCLUSIONS = (
 )
 
 
+def gatk_error(stderr: str) -> str:
+    """GATK's actual error, not the command line it echoes: the USER ERROR block or the exception line."""
+    lines = (stderr or "").splitlines()
+    for i, line in enumerate(lines):
+        if "A USER ERROR has occurred" in line:
+            return " ".join(l.strip() for l in lines[i:i + 3])
+    exc = [l.strip() for l in lines if "Exception" in l or l.startswith("ERROR")]
+    return exc[0] if exc else " ".join(lines[-3:])[-600:]
+
+
 def records_digest(vcf: Path) -> str:
     """Hash of the VCF body only: identical calls give identical digests whatever the header says."""
     h = hashlib.sha256()
@@ -83,9 +93,8 @@ class GatkRunner:
                            timeout=self.timeout_s)
         dt = time.time() - t0
         if p.returncode != 0 or not out.exists():
-            err = (p.stderr or "").strip()
-            return CallSet(round.round_id, config.key, "", "", dt, ok=False, error=f"rc={p.returncode} {err[-600:]}",
-                           fidelity=fidelity)
+            return CallSet(round.round_id, config.key, "", "", dt, ok=False,
+                           error=f"rc={p.returncode} {gatk_error(p.stderr)}", fidelity=fidelity)
         return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
 
 

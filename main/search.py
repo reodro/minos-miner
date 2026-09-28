@@ -19,7 +19,7 @@ Strategy = Callable[[EvalClient], Awaitable[None]]
 
 class RandomSampler:
     def __init__(self, ranges: ParamRanges, tool: str = "gatk", seed: int = 0):
-        self.specs, self.tool, self.rng = ranges.tools[tool], tool, random.Random(seed)
+        self.ranges, self.specs, self.tool, self.rng = ranges, ranges.tools[tool], tool, random.Random(seed)
 
     def _value(self, s):
         if s.allowed:
@@ -31,7 +31,13 @@ class RandomSampler:
         return round(self.rng.uniform(float(s.min), float(s.max)), 6)
 
     def sample(self, n: int) -> List[Config]:
-        return [Config(self.tool, {k: self._value(s) for k, s in self.specs.items()}) for _ in range(n)]
+        """n configs that pass ParamRanges.errors, including the cross-parameter constraints GATK enforces."""
+        out = []
+        while len(out) < n:
+            c = Config(self.tool, {k: self._value(s) for k, s in self.specs.items()})
+            if not self.ranges.errors(c):
+                out.append(c)
+        return out
 
 
 def random_stream(ranges: ParamRanges, in_flight: int = 8, seed: int = 0, tag: str = "random") -> Strategy:

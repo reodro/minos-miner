@@ -44,6 +44,12 @@ class ParamsTest(unittest.TestCase):
         self.assertTrue(self.r.errors(Config("gatk", {"dont_use_soft_clipped_bases": True})))  # platform allows only False
         self.assertTrue(self.r.errors(Config("freebayes", {})))
 
+    def test_cross_constraints_gatk_rejects(self):
+        d = self.r.defaults("gatk").params
+        self.assertTrue(self.r.errors(Config("gatk", {**d, "min_assembly_region_size": 215, "max_assembly_region_size": 162})))
+        self.assertTrue(self.r.errors(Config("gatk", {**d, "base_quality_score_threshold": 5})))
+        self.assertEqual(self.r.errors(Config("gatk", {**d, "base_quality_score_threshold": 6})), [])
+
 
 class ScoringTest(unittest.TestCase):
     """Checks the wrapper around the upstream formula, not the formula itself."""
