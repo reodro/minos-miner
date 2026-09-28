@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+data/
+*.bam
+*.bai
+*.vcf
+*.vcf.gz
+*.tbi
+*.part

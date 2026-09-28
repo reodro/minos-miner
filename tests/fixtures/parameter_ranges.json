@@ -1,0 +1,489 @@
+{
+    "description": "Valid ranges for tool configuration parameters. Submitted values must be within these ranges. A value outside provided ranges is automatically defaulted.",
+    "tools": {
+        "gatk": {
+            "options_key": "gatk_options",
+            "parameters": [
+                {
+                    "name": "min_base_quality_score",
+                    "type": "int",
+                    "min": 10,
+                    "max": 50,
+                    "default": 10
+                },
+                {
+                    "name": "min_mapping_quality_score",
+                    "type": "int",
+                    "min": 0,
+                    "max": 60,
+                    "default": 20
+                },
+                {
+                    "name": "base_quality_score_threshold",
+                    "type": "int",
+                    "min": 0,
+                    "max": 50,
+                    "default": 18
+                },
+                {
+                    "name": "standard_min_confidence_threshold_for_calling",
+                    "type": "float",
+                    "min": 30.0,
+                    "max": 100.0,
+                    "default": 30.0
+                },
+                {
+                    "name": "emit_ref_confidence",
+                    "type": "enum",
+                    "allowed_values": [
+                        "NONE",
+                        "GVCF",
+                        "BP_RESOLUTION"
+                    ],
+                    "default": "NONE"
+                },
+                {
+                    "name": "pcr_indel_model",
+                    "type": "enum",
+                    "allowed_values": [
+                        "NONE",
+                        "HOSTILE",
+                        "AGGRESSIVE",
+                        "CONSERVATIVE"
+                    ],
+                    "default": "CONSERVATIVE"
+                },
+                {
+                    "name": "min_pruning",
+                    "type": "int",
+                    "min": 2,
+                    "max": 10,
+                    "default": 2
+                },
+                {
+                    "name": "max_alternate_alleles",
+                    "type": "int",
+                    "min": 1,
+                    "max": 20,
+                    "default": 6
+                },
+                {
+                    "name": "min_dangling_branch_length",
+                    "type": "int",
+                    "min": 2,
+                    "max": 20,
+                    "default": 4
+                },
+                {
+                    "name": "recover_all_dangling_branches",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "max_num_haplotypes_in_population",
+                    "type": "int",
+                    "min": 8,
+                    "max": 128,
+                    "default": 128
+                },
+                {
+                    "name": "adaptive_pruning_initial_error_rate",
+                    "type": "float",
+                    "min": 0.0001,
+                    "max": 0.1,
+                    "default": 0.001
+                },
+                {
+                    "name": "pruning_lod_threshold",
+                    "type": "float",
+                    "min": 0.5,
+                    "max": 10.0,
+                    "default": 2.302585
+                },
+                {
+                    "name": "active_probability_threshold",
+                    "type": "float",
+                    "min": 0.001,
+                    "max": 0.05,
+                    "default": 0.002
+                },
+                {
+                    "name": "min_assembly_region_size",
+                    "type": "int",
+                    "min": 1,
+                    "max": 300,
+                    "default": 50
+                },
+                {
+                    "name": "max_assembly_region_size",
+                    "type": "int",
+                    "min": 100,
+                    "max": 700,
+                    "default": 300
+                },
+                {
+                    "name": "assembly_region_padding",
+                    "type": "int",
+                    "min": 0,
+                    "max": 500,
+                    "default": 100
+                },
+                {
+                    "name": "pair_hmm_gap_continuation_penalty",
+                    "type": "int",
+                    "min": 1,
+                    "max": 30,
+                    "default": 10
+                },
+                {
+                    "name": "phred_scaled_global_read_mismapping_rate",
+                    "type": "int",
+                    "min": 10,
+                    "max": 60,
+                    "default": 45
+                },
+                {
+                    "name": "heterozygosity",
+                    "type": "float",
+                    "min": 0.0001,
+                    "max": 0.01,
+                    "default": 0.001
+                },
+                {
+                    "name": "indel_heterozygosity",
+                    "type": "float",
+                    "min": 1e-05,
+                    "max": 0.001,
+                    "default": 0.000125
+                },
+                {
+                    "name": "sample_ploidy",
+                    "type": "int",
+                    "allowed_values": [
+                        2
+                    ],
+                    "default": 2
+                },
+                {
+                    "name": "contamination_fraction_to_filter",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 0.05,
+                    "default": 0.0
+                },
+                {
+                    "name": "max_reads_per_alignment_start",
+                    "type": "int",
+                    "min": 25,
+                    "max": 300,
+                    "default": 50
+                },
+                {
+                    "name": "dont_use_soft_clipped_bases",
+                    "type": "bool",
+                    "allowed_values": [
+                        false
+                    ],
+                    "default": false
+                }
+            ]
+        },
+        "deepvariant": {
+            "options_key": "deepvariant_options",
+            "parameters": [
+                {
+                    "name": "model_type",
+                    "type": "enum",
+                    "allowed_values": [
+                        "WGS",
+                        "WES",
+                        "PACBIO",
+                        "HYBRID_PACBIO_ILLUMINA"
+                    ],
+                    "default": "WGS"
+                },
+                {
+                    "name": "vsc_min_fraction_indels",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 1.0,
+                    "default": 0.12
+                },
+                {
+                    "name": "vsc_min_fraction_snps",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 1.0,
+                    "default": 0.12
+                },
+                {
+                    "name": "vsc_min_count_snps",
+                    "type": "int",
+                    "min": 0,
+                    "max": 50,
+                    "default": 2
+                },
+                {
+                    "name": "vsc_min_count_indels",
+                    "type": "int",
+                    "min": 0,
+                    "max": 50,
+                    "default": 2
+                },
+                {
+                    "name": "min_mapping_quality",
+                    "type": "int",
+                    "min": 0,
+                    "max": 60,
+                    "default": 5
+                },
+                {
+                    "name": "min_base_quality",
+                    "type": "int",
+                    "min": 0,
+                    "max": 50,
+                    "default": 10
+                },
+                {
+                    "name": "realign_reads",
+                    "type": "bool",
+                    "default": true
+                },
+                {
+                    "name": "normalize_reads",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "keep_duplicates",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "max_reads_per_partition",
+                    "type": "int",
+                    "min": 100,
+                    "max": 5000,
+                    "default": 1500
+                },
+                {
+                    "name": "sort_by_haplotypes",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "phase_reads",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "qual_filter",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 50.0,
+                    "default": 1.0
+                },
+                {
+                    "name": "multi_allelic_qual_filter",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 50.0,
+                    "default": 1.0
+                },
+                {
+                    "name": "cnn_homref_call_min_gq",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 50.0,
+                    "default": 20.0
+                },
+                {
+                    "name": "use_multiallelic_model",
+                    "type": "bool",
+                    "default": false
+                }
+            ]
+        },
+        "bcftools": {
+            "options_key": "bcftools_options",
+            "parameters": [
+                {
+                    "name": "min_MQ",
+                    "type": "int",
+                    "min": 15,
+                    "max": 60,
+                    "default": 15
+                },
+                {
+                    "name": "min_BQ",
+                    "type": "int",
+                    "min": 20,
+                    "max": 50,
+                    "default": 20
+                },
+                {
+                    "name": "max_BQ",
+                    "type": "int",
+                    "min": 40,
+                    "max": 60,
+                    "default": 60
+                },
+                {
+                    "name": "delta_BQ",
+                    "type": "int",
+                    "min": 0,
+                    "max": 99,
+                    "default": 30
+                },
+                {
+                    "name": "adjust_MQ",
+                    "type": "int",
+                    "min": 0,
+                    "max": 100,
+                    "default": 50
+                },
+                {
+                    "name": "max_depth",
+                    "type": "int",
+                    "min": 1,
+                    "max": 250,
+                    "default": 250
+                },
+                {
+                    "name": "max_idepth",
+                    "type": "int",
+                    "min": 1,
+                    "max": 250,
+                    "default": 250
+                },
+                {
+                    "name": "no_BAQ",
+                    "type": "bool",
+                    "allowed_values": [
+                        false
+                    ],
+                    "default": false
+                },
+                {
+                    "name": "full_BAQ",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "redo_BAQ",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "open_prob",
+                    "type": "int",
+                    "min": 30,
+                    "max": 60,
+                    "default": 40
+                },
+                {
+                    "name": "ext_prob",
+                    "type": "int",
+                    "min": 20,
+                    "max": 60,
+                    "default": 20
+                },
+                {
+                    "name": "gap_frac",
+                    "type": "float",
+                    "min": 0.002,
+                    "max": 0.05,
+                    "default": 0.002
+                },
+                {
+                    "name": "tandem_qual",
+                    "type": "int",
+                    "min": 0,
+                    "max": 500,
+                    "default": 500
+                },
+                {
+                    "name": "indel_bias",
+                    "type": "float",
+                    "min": 0.5,
+                    "max": 1.0,
+                    "default": 1.0
+                },
+                {
+                    "name": "min_ireads",
+                    "type": "int",
+                    "min": 3,
+                    "max": 50,
+                    "default": 3
+                },
+                {
+                    "name": "indels_cns",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "count_orphans",
+                    "type": "bool",
+                    "allowed_values": [
+                        false
+                    ],
+                    "default": false
+                },
+                {
+                    "name": "multiallelic_caller",
+                    "type": "bool",
+                    "default": true
+                },
+                {
+                    "name": "consensus_caller",
+                    "type": "bool",
+                    "default": false
+                },
+                {
+                    "name": "variants_only",
+                    "type": "bool",
+                    "default": true
+                },
+                {
+                    "name": "ploidy",
+                    "type": "enum",
+                    "allowed_values": [
+                        "GRCh38"
+                    ],
+                    "default": "GRCh38"
+                },
+                {
+                    "name": "prior",
+                    "type": "float",
+                    "min": 0.0001,
+                    "max": 0.0011,
+                    "default": 0.0011
+                },
+                {
+                    "name": "pval_threshold",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 0.5,
+                    "default": 0.5
+                }
+            ],
+            "unsupported_parameters": [
+                "score_vs_ref",
+                "indel_size",
+                "del_bias"
+            ]
+        }
+    },
+    "local_execution_parameters": [
+        "memory_gb",
+        "num_threads",
+        "ref_build",
+        "threads",
+        "timeout"
+    ],
+    "accepted_top_level_keys": [
+        "tool",
+        "version",
+        "{tool}_options"
+    ]
+}

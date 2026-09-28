@@ -1,0 +1,8 @@
+[project]
+name = "minos-miner"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Miner for Bittensor subnet 107 (Minos)"
+
+[tool.setuptools]
+packages = ["common", "answer_set", "evaluator", "main", "backtest"]
