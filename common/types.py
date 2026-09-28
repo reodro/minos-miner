@@ -108,6 +108,20 @@ class AnswerSet:
     notes: Dict[str, object] = field(default_factory=dict)
 
 
+FULL = "full"   # fidelity of a full-region evaluation; anything else is a sub-region like "chr20:1-1000000"
+
+
+@dataclass(frozen=True)
+class EvalJob:
+    """A request to evaluate one config on one round. Search decides every field; the executor only runs it."""
+    job_id: str
+    round: Round
+    config: Config
+    fidelity: str = FULL
+    priority: int = 0           # higher runs first
+    tag: str = ""               # opaque to the executor: strategy lane, generation, ...
+
+
 @dataclass(frozen=True)
 class CallSet:
     """Output of running one config on one round."""
@@ -118,6 +132,8 @@ class CallSet:
     runtime_s: float
     ok: bool = True
     error: Optional[str] = None
+    job_id: str = ""
+    fidelity: str = FULL
 
 
 @dataclass
@@ -139,6 +155,9 @@ class ScoreResult:
     core: Optional[float] = None
     score: Optional[float] = None               # 0-100, v2 formula; expected value when the answer set is uncertain
     gate_passed: Optional[bool] = None
+    score_sd: Optional[float] = None            # spread of score over answer-set uncertainty (None = exact truth)
+    fidelity: str = FULL
+    job_id: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

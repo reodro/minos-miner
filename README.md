@@ -8,11 +8,27 @@ the best one submitted. The last submission before the deadline is the one score
 
 | Package | Owner | Job | KPI (measured in `backtest/`) |
 |---|---|---|---|
-| `common/` | everyone | Shared contracts (`types.py`), the upstream v2 formula (`scoring.py`), parameter ranges, platform client | — |
+| `common/` | everyone | Contracts (`types.py`: `EvalJob`, `CallSet`, `AnswerSet`, `ScoreResult`), the upstream v2 formula (`scoring.py`), parameter ranges, platform client, `ResultStore` | — |
 | `answer_set/` | A | `build(round)` at round start, `update(answer_set, callsets)` during the round | oracle gap, germline exactness, synthetic precision/recall/calibration |
-| `evaluator/` | B | `run(round, config) -> CallSet` (expensive, fleet), `score(callset, answer_set) -> ScoreResult` (milliseconds) | s/eval, exactness vs hap.py (<1e-9), evals/s/core |
-| `main/` | C | Round loop, search (`Searcher`), submission | backtested rank / P(win) against the real leaderboards |
+| `evaluator/` | B | `Runner` (config -> callset, GATK), `Executor` (where/when jobs run: local cores, fleet, simulation; priority, dedup, cache), `Scorer` (callset x answer set -> score) | s/eval, exactness vs validator (bit-identical calls, equal score), evals/s/core |
+| `main/` | C | `EvalClient` (async `map`/`submit`/`quorum`), search strategies, round loop, submission | backtested rank / P(win); core utilisation in `SimExecutor` |
 | `backtest/` | everyone | Released rounds + real field scores, KPI functions | — |
+
+### How a round runs
+
+```
+answer_set.build ──▶ AnswerSet v1 ──(update every N callsets)──▶ v2 ...
+                            │                                     │ rescore all stored callsets
+strategies ──await client.map/submit──▶ EvalClient ──EvalJob──▶ Executor ──CallSet──▶ Scorer ──▶ ResultStore
+(async, many at once)          ◀──────────── Outcome (score) ◀────────────────────────────┘
+round loop: baselines first (first working one is submitted), then all strategies; resubmit on improvement.
+```
+
+- Strategies never know where jobs run; the executor never knows why a job was chosen.
+- Workers return **callsets, not scores**, so an answer-set upgrade only re-scores (milliseconds), never re-runs.
+- Barriers (`map(..., quorum=0.9)`) never idle the executor: other strategies keep it busy, and stragglers
+  keep running and still report. `SimExecutor` measures this: a lone GA barrier with stragglers used 30% of
+  the cores; with a streaming and a sequential strategy alongside it, 88%.
 
 ## Rules
 
@@ -35,8 +51,9 @@ the best one submitted. The last submission before the deadline is the one score
 
 - `answer_set.OracleProvider` - released truth as an answer set (upper bound; lets `main`
   and `evaluator` work before the real builder exists).
-- `evaluator.FakeEvaluator` - deterministic toy landscape through the real formula
-  (lets `main` build and test the search loop without GATK).
+- `evaluator.FakeRunner` / `FakeScorer` - deterministic toy landscape through the real formula.
+- `evaluator.SimExecutor` - virtual clock with simulated runtimes, crashes and stragglers: thousands of
+  evals per second for testing strategies and scheduling without GATK.
 - `main.DryRunSubmitter` - records submissions instead of sending them.
 
 ## Setup

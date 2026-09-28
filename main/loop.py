@@ -1,17 +1,19 @@
-"""One live (or replayed) round: build truth, search, keep the best config submitted."""
+"""One live (or replayed) round: build truth, run strategies concurrently, keep the best config submitted."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from answer_set.base import AnswerSetProvider
 from common.params import ParamRanges
-from common.types import AnswerSet, CallSet, Config, Round, ScoreResult
-from evaluator.base import Evaluator
-from main.search import Searcher
+from common.store import ResultStore
+from common.types import FULL, CallSet, Config, Round, ScoreResult
+from evaluator.base import Executor, Scorer
+from main.client import EvalClient, Outcome
+from main.search import Strategy
 from main.submitter import Submitter
 
 log = logging.getLogger(__name__)
@@ -19,118 +21,104 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class LoopSettings:
-    workers: int = 4
     update_every: int = 50              # new callsets between answer_set.update() calls
     resubmit_margin: float = 0.0        # score points a new best must gain before resubmitting
     stop_before_deadline_s: float = 120.0
     max_evals: Optional[int] = None     # budget by count (backtests must match config count, not wall time)
+    poll_timeout: float = 1.0
 
 
 @dataclass
 class RoundOutcome:
-    answer_set_version: int
-    evaluated: int
-    failed: int
-    best: Optional[ScoreResult]
+    answer_set_version: int = 1
+    evaluated: int = 0
+    failed: int = 0
+    best: Optional[ScoreResult] = None
     submissions: List[Tuple[float, str, float]] = field(default_factory=list)   # (t, config_key, score)
+    utilization: Optional[float] = None                                        # SimExecutor only
 
 
-def run_round(round: Round, provider: AnswerSetProvider, evaluator: Evaluator, searcher: Searcher,
-              submitter: Submitter, ranges: ParamRanges, settings: LoopSettings,
-              baselines: List[Config], deadline_ts: Optional[float] = None,
-              clock: Callable[[], float] = time.time) -> RoundOutcome:
-    answer_set: AnswerSet = provider.build(round)
-    configs: Dict[str, Config] = {}
-    callsets: Dict[str, CallSet] = {}
-    results: Dict[str, ScoreResult] = {}
-    outcome = RoundOutcome(answer_set.version, 0, 0, None)
-    submitted_key: Optional[str] = None
+async def run_round_async(round: Round, provider: AnswerSetProvider, executor: Executor, scorer: Scorer,
+                          strategies: List[Strategy], submitter: Submitter, ranges: ParamRanges,
+                          settings: LoopSettings, baselines: List[Config], store: Optional[ResultStore] = None,
+                          deadline_ts: Optional[float] = None,
+                          clock: Optional[Callable[[], float]] = None) -> RoundOutcome:
+    virtual = hasattr(executor, "now")
+    clock = clock or ((lambda: executor.now) if virtual else time.time)
+    client = EvalClient(round, executor, scorer, ranges, store or ResultStore(), provider.build(round),
+                        budget=settings.max_evals)
+    out = RoundOutcome(client.answer_set.version)
+    submitted: List[Optional[str]] = [None]
     since_update: List[CallSet] = []
+
+    def maybe_submit():
+        best = client.best(FULL)
+        if best is None:
+            return
+        out.best = best
+        key = submitted[0]
+        if best.config_key == key:
+            return
+        current = client.latest[(key, FULL)].score if key else None
+        if current is None or best.score > current + settings.resubmit_margin:
+            if submitter.submit(round, client.configs[best.config_key]):
+                submitted[0] = best.config_key
+                out.submissions.append((clock(), best.config_key, best.score))
+
+    def on_result(o: Outcome):
+        if o.ok:
+            out.evaluated += 1
+            since_update.append(client.callsets[(o.config.key, o.result.fidelity)])
+        else:
+            out.failed += 1
+        maybe_submit()
+
+    client.on_result.append(on_result)
+    client.on_rescore.append(maybe_submit)
 
     def time_left() -> bool:
         return deadline_ts is None or clock() < deadline_ts - settings.stop_before_deadline_s
 
-    def budget_left() -> bool:
-        return settings.max_evals is None or outcome.evaluated + outcome.failed < settings.max_evals
-
-    def maybe_submit():
-        nonlocal submitted_key
-        ok = [r for r in results.values() if r.score is not None and r.gate_passed]
-        if not ok:
-            return
-        best = max(ok, key=lambda r: r.score)
-        outcome.best = best
-        if best.config_key == submitted_key:
-            return
-        # Compare against the submitted config's CURRENT score: an answer-set upgrade rescored it.
-        current = results[submitted_key].score if submitted_key else None
-        if current is None or best.score > current + settings.resubmit_margin:
-            if submitter.submit(round, configs[best.config_key]):
-                submitted_key = best.config_key
-                outcome.submissions.append((clock(), best.config_key, best.score))
-
-    def accept(cs: CallSet):
-        nonlocal answer_set
-        callsets[cs.config_key] = cs
-        if not cs.ok:
-            outcome.failed += 1
-            return
-        outcome.evaluated += 1
-        r = evaluator.score(cs, answer_set)
-        results[cs.config_key] = r
-        searcher.observe([r])
-        since_update.append(cs)
-        if len(since_update) >= settings.update_every:
-            new = provider.update(answer_set, list(since_update))
-            since_update.clear()
-            if new.version != answer_set.version:
-                answer_set = new
-                outcome.answer_set_version = new.version
-                for k, c in callsets.items():
-                    if c.ok:
-                        results[k] = evaluator.score(c, answer_set)
-                searcher.rescored(list(results.values()))
-        maybe_submit()
-
-    def valid_new(cands: List[Config]) -> List[Config]:
-        out = []
-        for c in cands:
-            errs = ranges.errors(c)
-            if errs:
-                log.warning("skipping invalid config %s: %s", c.key, errs)
-            elif c.key not in configs:
-                configs[c.key] = c
-                out.append(c)
-        return out
-
-    def run_safe(c: Config) -> CallSet:
-        try:
-            return evaluator.run(round, c)
-        except Exception as e:  # a crashed run is a failed config, never a crashed round
-            log.warning("run failed for %s: %s", c.key, e)
-            return CallSet(round.round_id, c.key, "", "", 0.0, ok=False, error=str(e))
-
-    # Baselines first and in order: the first one that runs is submitted immediately,
-    # so the round never ends without a submission.
-    for c in valid_new(baselines):
-        accept(run_safe(c))
-        if submitted_key is not None or not time_left():
-            break
-
-    with ThreadPoolExecutor(max_workers=settings.workers) as pool:
-        pending = {}
-        while time_left() and budget_left():
-            room = settings.workers - len(pending)
-            if settings.max_evals is not None:
-                room = min(room, settings.max_evals - outcome.evaluated - outcome.failed - len(pending))
-            for c in valid_new(searcher.propose(room)) if room > 0 else []:
-                pending[pool.submit(run_safe, c)] = c
-            if not pending:
+    async def search():
+        # Baselines first, in order: the first one that runs is submitted, so the round never ends empty.
+        for c in baselines:
+            await client.submit(c, priority=10, tag="baseline")
+            if submitted[0] is not None:
                 break
-            done, _ = wait(pending, timeout=5.0, return_when=FIRST_COMPLETED)
-            for f in done:
-                pending.pop(f)
-                accept(f.result())
-        for f in pending:
-            f.cancel()
-    return outcome
+        await asyncio.gather(*(s(client) for s in strategies))
+
+    task = asyncio.create_task(search())
+    idle_spins = 0
+    try:
+        while time_left():
+            for _ in range(20):                  # let every strategy react before time moves on
+                await asyncio.sleep(0)
+            if task.done() and client.in_flight == 0:
+                break
+            batch = executor.poll(0) if virtual else await asyncio.to_thread(executor.poll, settings.poll_timeout)
+            for cs in batch:
+                client.deliver(cs)
+            if len(since_update) >= settings.update_every:
+                new = provider.update(client.answer_set, list(since_update))
+                since_update.clear()
+                if new.version != client.answer_set.version:
+                    client.rescore(new)
+                    out.answer_set_version = new.version
+            idle_spins = idle_spins + 1 if (virtual and not batch and client.in_flight == 0) else 0
+            if idle_spins > 1000:                 # strategies alive but submitting nothing: a strategy bug
+                log.warning("strategies stalled with nothing in flight; ending round")
+                break
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception) as e:
+            if not isinstance(e, asyncio.CancelledError):
+                log.warning("search task ended with %r", e)
+    if hasattr(executor, "utilization"):
+        out.utilization = executor.utilization()
+    return out
+
+
+def run_round(*args, **kwargs) -> RoundOutcome:
+    return asyncio.run(run_round_async(*args, **kwargs))
