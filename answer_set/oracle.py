@@ -28,7 +28,9 @@ class OracleProvider:
         with gzip.open(os.path.join(d, "mutations.vcf.gz"), "rt") as f:
             n_targets = sum(1 for line in f if not line.startswith("#"))
         return AnswerSet(round.round_id, 1, Regime.UNKNOWN, None, germline, synthetic, n_targets,
-                         notes={"source": "oracle"})
+                         notes={"source": "oracle", "truth_vcf": os.path.join(d, "truth.vcf.gz"),
+                                "mutations_vcf": os.path.join(d, "mutations.vcf.gz"), "region": round.region,
+                                "reference": round.reference})
 
     def update(self, answer_set: AnswerSet, new_callsets: Iterable[CallSet]) -> AnswerSet:
         return answer_set
