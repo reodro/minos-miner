@@ -65,18 +65,66 @@ def field_scores(tag: str) -> List[float]:
     return sorted(by_sub.values(), reverse=True)
 
 
+def discover(since: str, platform: Optional[Platform] = None, max_missing: int = 20) -> List[str]:
+    """Finalized round ids back to `since` (ISO time), newest first.
+
+    The API lists only the latest 100 rounds, so older ids are found by stepping back
+    72 minutes and probing +-5 minutes around each slot (the grid drifts by a minute
+    across restarts). Stops after `max_missing` consecutive empty slots.
+    """
+    import datetime as dt
+    import urllib.error
+    p = platform or Platform()
+    recent = [r for r in p.rounds(limit=100) if r.get("is_finalized")]
+    ids = [r["round_id"] for r in recent]
+    t = dt.datetime.fromisoformat(recent[-1]["round_id"])
+    stop = dt.datetime.fromisoformat(since)
+    missing = 0
+    while t > stop and missing < max_missing:
+        expected = t - dt.timedelta(minutes=72)
+        found = None
+        for off in (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5):
+            rid = (expected + dt.timedelta(minutes=off)).isoformat()
+            try:
+                if p.leaderboard(rid)["round"].get("is_finalized"):
+                    found = rid
+                    break
+            except urllib.error.HTTPError:
+                continue
+        if found:
+            ids.append(found)
+            t = dt.datetime.fromisoformat(found)
+            missing = 0
+        else:
+            t = expected
+            missing += 1
+    return [i for i in ids if dt.datetime.fromisoformat(i) >= stop]
+
+
 def main():
+    from concurrent.futures import ThreadPoolExecutor
     ap = argparse.ArgumentParser()
-    ap.add_argument("--last", type=int, default=20)
+    ap.add_argument("--last", type=int, default=20, help="newest N finalized rounds")
+    ap.add_argument("--since", help="every finalized round since this ISO time (overrides --last)")
     ap.add_argument("--no-bam", action="store_true")
+    ap.add_argument("--workers", type=int, default=4)
     a = ap.parse_args()
     p = Platform()
-    for r in p.rounds(limit=100):
-        if a.last <= 0:
-            break
-        if r.get("is_finalized"):
-            print(fetch(r["round_id"], p, with_bam=not a.no_bam))
-            a.last -= 1
+    if a.since:
+        ids = discover(a.since, p)
+    else:
+        ids = [r["round_id"] for r in p.rounds(limit=100) if r.get("is_finalized")][:a.last]
+    print(f"{len(ids)} rounds", flush=True)
+
+    def one(rid):
+        try:
+            return fetch(rid, p, with_bam=not a.no_bam)
+        except Exception as e:  # one bad round must not stop the rest
+            return f"FAILED {rid}: {e}"
+
+    with ThreadPoolExecutor(a.workers) as pool:
+        for line in pool.map(one, ids):
+            print(line, flush=True)
 
 
 if __name__ == "__main__":
