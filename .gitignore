@@ -8,3 +8,6 @@ data/
 *.vcf.gz
 *.tbi
 *.part
+
+# Experiment workspace: all exploratory scripts, runs and scratch output. Never committed.
+test/

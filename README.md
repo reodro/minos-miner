@@ -28,6 +28,8 @@ the best one submitted. The last submission before the deadline is the one score
 6. **Noise floor.** Identical full search runs differed by ~0.08 points in the previous project.
    Do not claim an effect below ~0.1 from a single pair; replicate.
 7. Data never goes in git: it lives under `DATA_DIR` (default `/minos/data`).
+8. **All experiments run in `test/`** (git-ignored): exploratory scripts, backtest runs, scratch output.
+   `tests/` holds only the unit tests that guard the contracts; those stay in git.
 
 ## Mocks, so the parts can be built in parallel
 
