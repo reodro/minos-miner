@@ -17,6 +17,11 @@ class Settings:
         return os.path.join(self.data_dir, "rounds")
 
     @property
+    def kg_dir(self) -> str:
+        """1000G data from scripts/fetch_reference_data.sh: raw/, phased/, mask/."""
+        return os.path.join(self.data_dir, "1kg")
+
+    @property
     def cache_dir(self) -> str:
         return os.path.join(self.data_dir, "cache")
 
