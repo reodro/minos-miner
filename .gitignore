@@ -11,3 +11,4 @@ data/
 
 # Experiment workspace: all exploratory scripts, runs and scratch output. Never committed.
 test/
+evaluator/gatk_patch/build/

@@ -29,6 +29,10 @@ if SETTINGS.minos_subnet_dir not in sys.path:
     sys.path.insert(0, SETTINGS.minos_subnet_dir)
 
 GATK_IMAGE = "broadinstitute/gatk:4.5.0.0"
+GATK_JAR_IN_IMAGE = "/gatk/gatk-package-4.5.0.0-local.jar"
+# JVM flags the image's `gatk` wrapper adds (`gatk --dry-run`); used when we call java directly.
+WRAPPER_JVM = ["-Dsamjdk.use_async_io_read_samtools=false", "-Dsamjdk.use_async_io_write_samtools=true",
+               "-Dsamjdk.use_async_io_write_tribble=false", "-Dsamjdk.compression_level=2"]
 SAFE_ANNOTATION_EXCLUSIONS = (
     "Coverage", "DepthPerSampleHC", "ChromosomeCounts", "BaseQualityRankSumTest", "ExcessHet", "FisherStrand",
     "InbreedingCoeff", "MappingQualityRankSumTest", "ReadPosRankSumTest", "StrandOddsRatio", "StrandBiasBySample",
@@ -58,22 +62,33 @@ def records_digest(vcf: Path) -> str:
 class GatkRunner:
     """The validator's HaplotypeCaller command (minos_subnet/templates/gatk.py) plus the verified speed-ups."""
 
-    def __init__(self, work_dir: Optional[str] = None, threads: int = 1, memory_gb: int = 4, timeout_s: int = 1800):
+    def __init__(self, work_dir: Optional[str] = None, threads: int = 1, memory_gb: int = 4, timeout_s: int = 1800,
+                 patch_jar: Optional[str] = None):
+        """patch_jar: our patched GATK classes (evaluator/gatk_patch), put before the GATK jar on the classpath,
+        still inside the validator's image. None = the stock `gatk` wrapper."""
         self.work_dir = Path(work_dir or os.path.join(SETTINGS.cache_dir, "callsets"))
         self.threads, self.memory_gb, self.timeout_s = threads, memory_gb, timeout_s
+        self.patch_jar = Path(patch_jar).resolve() if patch_jar else None
 
-    def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path) -> list:
+    def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path, jvm_props: Optional[dict] = None) -> list:
         from templates.tool_params import validate_and_build_flags   # upstream
         flags = validate_and_build_flags(config.tool, config.params)
         if not flags["valid"]:
             raise ValueError("; ".join(flags["errors"]))
         bam, ref = Path(round.bam).resolve(), Path(round.reference).resolve()
+        heap = f"-Xmx{max(512, int(self.memory_gb * 1024 * 0.8))}m"
         cmd = ["docker", "run", "--rm", "--name", f"minos-run-{uuid.uuid4().hex[:10]}",
                f"--cpus={self.threads}", f"--memory={self.memory_gb}g",
                "-v", f"{bam.parent}:/data/bams:ro", "-v", f"{ref.parent}:/data/reference:ro",
-               "-v", f"{out_vcf.parent}:/data/output", GATK_IMAGE,
-               "gatk", "--java-options", f"-Xmx{max(512, int(self.memory_gb * 1024 * 0.8))}m", "HaplotypeCaller",
-               "-R", f"/data/reference/{ref.name}", "-I", f"/data/bams/{bam.name}",
+               "-v", f"{out_vcf.parent}:/data/output"]
+        if self.patch_jar is None:
+            cmd += [GATK_IMAGE, "gatk", "--java-options", heap, "HaplotypeCaller"]
+        else:
+            props = [f"-D{k}={v}" for k, v in (jvm_props or {}).items()]
+            cmd += ["-v", f"{self.patch_jar.parent}:/patch:ro", GATK_IMAGE, "java", *WRAPPER_JVM, heap, *props,
+                    "-cp", f"/patch/{self.patch_jar.name}:{GATK_JAR_IN_IMAGE}", "org.broadinstitute.hellbender.Main",
+                    "HaplotypeCaller"]
+        cmd += ["-R", f"/data/reference/{ref.name}", "-I", f"/data/bams/{bam.name}",
                "-O", f"/data/output/{out_vcf.name}", "--native-pair-hmm-threads", str(self.threads),
                "-L", round.region if fidelity == FULL else fidelity]
         for f in flags["flags"]:
