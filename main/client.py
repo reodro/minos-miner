@@ -47,7 +47,7 @@ class EvalClient:
         self.round, self.executor, self.scorer, self.ranges, self.store = round, executor, scorer, ranges, store
         self.answer_set = answer_set
         self.budget = budget
-        self.spent = 0                                              # full-cost jobs sent to the executor
+        self.spent = 0.0                                            # full-evaluation units sent to the executor
         self._ids = itertools.count()
         self._pending: Dict[str, Tuple[asyncio.Future, Config, str]] = {}
         self.callsets: Dict[Tuple[str, str], CallSet] = {}          # (config_key, fidelity) -> callset
@@ -72,11 +72,12 @@ class EvalClient:
             fut.set_result(Outcome(config, cached, None, tag))
             return fut
         job = EvalJob(f"j{next(self._ids)}", self.round, config, fidelity, priority, tag)
-        if self.executor.cost_hint(job) > 0:
+        cost = self.executor.cost_hint(job)
+        if cost > 0:
             if self.exhausted:
                 fut.set_result(Outcome(config, None, "budget exhausted", tag))
                 return fut
-            self.spent += 1
+            self.spent += cost            # budget is in full-evaluation units: a batched rider costs ~0.01
         self.configs[config.key] = config
         self._pending[job.job_id] = (fut, config, tag)
         self.executor.submit([job])

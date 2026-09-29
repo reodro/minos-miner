@@ -19,7 +19,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from common.scoring import finalize
 from common.settings import SETTINGS
@@ -33,6 +33,15 @@ GATK_JAR_IN_IMAGE = "/gatk/gatk-package-4.5.0.0-local.jar"
 # JVM flags the image's `gatk` wrapper adds (`gatk --dry-run`); used when we call java directly.
 WRAPPER_JVM = ["-Dsamjdk.use_async_io_read_samtools=false", "-Dsamjdk.use_async_io_write_samtools=true",
                "-Dsamjdk.use_async_io_write_tribble=false", "-Dsamjdk.compression_level=2"]
+# Read only by HaplotypeCaller's genotyping engine (verified in the GATK 4.5.0.0 source and by 54/54 bit-identical
+# batch outputs): configs differing only in these can share one patched run.
+GENOTYPING_BRANCH_PARAMS = ("standard_min_confidence_threshold_for_calling", "indel_heterozygosity",
+                            "max_alternate_alleles", "contamination_fraction_to_filter")
+GENOTYPING_DEFAULTS = {"standard_min_confidence_threshold_for_calling": 30.0, "indel_heterozygosity": 0.000125,
+                       "max_alternate_alleles": 6, "contamination_fraction_to_filter": 0.0}
+DIVERGED = "minos:diverged"      # batch variant whose own run would differ; the executor re-runs it alone
+DEFAULT_PATCH_JAR = os.path.join(os.path.dirname(__file__), "gatk_patch", "build", "minos-patch.jar")
+
 SAFE_ANNOTATION_EXCLUSIONS = (
     "Coverage", "DepthPerSampleHC", "ChromosomeCounts", "BaseQualityRankSumTest", "ExcessHet", "FisherStrand",
     "InbreedingCoeff", "MappingQualityRankSumTest", "ReadPosRankSumTest", "StrandOddsRatio", "StrandBiasBySample",
@@ -97,12 +106,16 @@ class GatkRunner:
             cmd += ["-AX", a]
         return cmd
 
-    def run(self, round: Round, config: Config, fidelity: str = FULL) -> CallSet:
-        if config.tool != "gatk":
-            raise ValueError(f"GatkRunner cannot run {config.tool!r}")
+    def _out(self, round: Round, config: Config, fidelity: str) -> Path:
         fid = "full" if fidelity == FULL else hashlib.sha1(fidelity.encode()).hexdigest()[:8]
         out = self.work_dir / round.tag / f"{config.key}_{fid}.vcf.gz"
         out.parent.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def run(self, round: Round, config: Config, fidelity: str = FULL) -> CallSet:
+        if config.tool != "gatk":
+            raise ValueError(f"GatkRunner cannot run {config.tool!r}")
+        out = self._out(round, config, fidelity)
         t0 = time.time()
         p = subprocess.run(self.command(round, config, fidelity, out), capture_output=True, text=True,
                            timeout=self.timeout_s)
@@ -111,6 +124,58 @@ class GatkRunner:
             return CallSet(round.round_id, config.key, "", "", dt, ok=False,
                            error=f"rc={p.returncode} {gatk_error(p.stderr)}", fidelity=fidelity)
         return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
+
+    # ---- batching: configs that differ only in genotyping parameters share one run (needs patch_jar) ----------
+    def branch_key(self, config: Config, fidelity: str = FULL) -> Optional[str]:
+        """Configs with the same key can be evaluated in one run_batch. None = cannot be batched."""
+        if self.patch_jar is None or config.tool != "gatk":
+            return None
+        shared = {k: v for k, v in config.params.items() if k not in GENOTYPING_BRANCH_PARAMS}
+        return Config("gatk", shared).key + ":" + fidelity
+
+    def run_batch(self, round: Round, configs: List[Config], fidelity: str = FULL) -> List[CallSet]:
+        """One patched run: configs[0] is the main output, the rest are genotyping variants.
+
+        A variant whose own run would have downsampled reads differently (random-stream divergence, see
+        gatk_patch) comes back as CallSet(ok=False, error=DIVERGED): its output here is not exact and it must be
+        run on its own.
+        """
+        if len(configs) == 1 or self.patch_jar is None:
+            return [self.run(round, c, fidelity) for c in configs]
+        keys = {self.branch_key(c, fidelity) for c in configs}
+        if len(keys) != 1 or None in keys:
+            raise ValueError("run_batch needs configs that differ only in genotyping parameters")
+        main = self._out(round, configs[0], fidelity)
+        outs = [self._out(round, c, fidelity) for c in configs[1:]]
+        spec = main.parent / f"variants_{uuid.uuid4().hex[:10]}.tsv"
+        spec.write_text("".join(
+            "\t".join([f"/data/output/{o.name}"] + [str(c.params.get(p, GENOTYPING_DEFAULTS[p]))
+                                                     for p in GENOTYPING_BRANCH_PARAMS]) + "\n"
+            for c, o in zip(configs[1:], outs)))
+        t0 = time.time()
+        try:
+            p = subprocess.run(self.command(round, configs[0], fidelity, main,
+                                            jvm_props={"minos.gt.variants": f"/data/output/{spec.name}"}),
+                               capture_output=True, text=True, timeout=self.timeout_s)
+        finally:
+            spec.unlink(missing_ok=True)
+        dt = time.time() - t0
+        if p.returncode != 0 or not main.exists():
+            err = f"rc={p.returncode} {gatk_error(p.stderr)}"
+            return [CallSet(round.round_id, c.key, "", "", dt, ok=False, error=err, fidelity=fidelity) for c in configs]
+        out = [CallSet(round.round_id, configs[0].key, str(main), records_digest(main), dt, fidelity=fidelity)]
+        for c, o in zip(configs[1:], outs):
+            status = Path(str(o) + ".minos")
+            state = status.read_text().strip() if status.exists() else "missing"
+            status.unlink(missing_ok=True)
+            if state == "exact" and o.exists():
+                out.append(CallSet(round.round_id, c.key, str(o), records_digest(o), dt, fidelity=fidelity))
+            else:
+                o.unlink(missing_ok=True)
+                out.append(CallSet(round.round_id, c.key, "", "", dt, ok=False,
+                                   error=DIVERGED if state == "diverged" else f"variant status {state}",
+                                   fidelity=fidelity))
+        return out
 
 
 class HappyScorer:

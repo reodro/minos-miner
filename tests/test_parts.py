@@ -192,3 +192,66 @@ class OracleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BatchingExecutorTest(unittest.TestCase):
+    """LocalExecutor batching with a fake runner: grouping, diverged re-run, cost hints."""
+
+    class BatchRunner(FakeRunner):
+        GT = "standard_min_confidence_threshold_for_calling"
+
+        def __init__(self, r, diverge=()):
+            super().__init__(r)
+            self.batches, self.solo, self.diverge = [], [], set(diverge)
+
+        def branch_key(self, config, fidelity):
+            return Config("gatk", {k: v for k, v in config.params.items() if k != self.GT}).key + fidelity
+
+        def run(self, round, config, fidelity):
+            time.sleep(0.05)
+            self.solo.append(config.key)
+            return super().run(round, config, fidelity)
+
+        def run_batch(self, round, configs, fidelity):
+            time.sleep(0.05)
+            self.batches.append([c.key for c in configs])
+            out = []
+            for i, c in enumerate(configs):
+                cs = super().run(round, c, fidelity)
+                out.append(replace(cs, ok=False, error="minos:diverged") if i and c.key in self.diverge else cs)
+            return out
+
+    def drain(self, ex, n):
+        got, deadline = {}, time.time() + 10
+        while len(got) < n and time.time() < deadline:
+            for cs in ex.poll(0.2):
+                got[cs.job_id] = cs
+        return got
+
+    def test_groups_queued_genotyping_variants_and_reruns_diverged(self):
+        r = ranges(); d = r.defaults("gatk").params
+        conf = [Config("gatk", {**d, self.BatchRunner.GT: c}) for c in (30.0, 40.0, 50.0, 60.0)]
+        other = Config("gatk", {**d, "min_pruning": 4})
+        runner = self.BatchRunner(r, diverge={conf[2].key})
+        ex = LocalExecutor(runner, workers=1)
+        blocker = Config("gatk", {**d, "min_pruning": 7})
+        ex.submit([EvalJob("block", ROUND, blocker)])              # occupies the only worker
+        jobs = [EvalJob(f"c{i}", ROUND, c) for i, c in enumerate(conf)] + [EvalJob("o", ROUND, other)]
+        self.assertEqual(ex.cost_hint(jobs[0]), 1.0)
+        ex.submit(jobs[:1])
+        self.assertEqual(ex.cost_hint(jobs[1]), 0.01)              # would ride along with c0
+        ex.submit(jobs[1:])
+        got = self.drain(ex, 6)
+        self.assertEqual(len(got), 6)
+        self.assertTrue(all(cs.ok for cs in got.values()))
+        self.assertIn([c.key for c in conf], runner.batches)       # one batch for the four variants
+        self.assertIn(conf[2].key, runner.solo)                    # the diverged one re-ran alone
+        self.assertIn(other.key, runner.solo)                      # different branch key: not batched
+
+    def test_no_batching_without_run_batch(self):
+        r = ranges(); runner = FakeRunner(r)
+        ex = LocalExecutor(runner, workers=2)
+        cfgs = RandomSampler(r, seed=4).sample(5)
+        ex.submit([EvalJob(f"x{i}", ROUND, c) for i, c in enumerate(cfgs)])
+        self.assertEqual(len(self.drain(ex, 5)), 5)
+        self.assertEqual(ex.batches_run, 0)
