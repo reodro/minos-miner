@@ -141,3 +141,16 @@ class CodecTest(unittest.TestCase):
         cs = CallSet(r.round_id, "k", "/n/x.vcf.gz", "d", 1.0, job_id="j", score=s)
         self.assertEqual(codec.callset_from(codec.callset_to(cs)), cs)
         self.assertEqual(codec.callset_from(codec.callset_to(replace(cs, score=None))), replace(cs, score=None))
+
+
+class InventoryTest(unittest.TestCase):
+    def test_new_hosts_inherit_user_and_key(self):
+        from evaluator.fleet.inventory import load
+        p = Path(tempfile.mkdtemp()) / "fleet.json"
+        p.write_text(json.dumps([{"host": "1.1.1.1", "user": "ubuntu", "key_filename": "~/.ssh/k"},
+                                 {"host": "2.2.2.2", "port": 2222},
+                                 {"host": "3.3.3.3", "enabled": False}]))
+        hosts = load(p)
+        self.assertEqual([(h.name, h.user, h.key_filename) for h in hosts],
+                         [("1.1.1.1", "ubuntu", "~/.ssh/k"), ("2.2.2.2:2222", "ubuntu", "~/.ssh/k")])
+        self.assertEqual(len(load(p, enabled_only=False)), 3)

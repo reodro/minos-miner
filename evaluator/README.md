@@ -93,7 +93,9 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
 ```
 
 - **Inventory**: `workers: null` = the node's own rule floor(cores x 0.95 - 1); `port` lets several machines share
-  one IP; optional `repo` / `data_dir`. No passphrase field: unlock keys with `ssh-agent`.
+  one IP; optional `repo` / `data_dir`; an entry without `user` / `key_filename` inherits them from the first entry
+  that has them (a new host can be just `{"host": ..., "port": ...}`). No passphrase field: unlock keys with
+  `ssh-agent`.
 - **`FleetExecutor`** (main) implements the same Executor protocol, so search and main do not change. For every
   enabled host it keeps one SSH session running the node agent (`python -m evaluator.fleet.node --stdio`); jobs go
   down and scored callsets come back as JSON lines on that session. One queue with dedup and a result cache; a
@@ -107,8 +109,10 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   queue; main reconnects later. When main stops, every node stops and kills the GATK containers it started.
 - **Node side**: `LocalExecutor` (batching, divergence repair, dedup) + `DecisionCacheScorer` threads; only scores
   travel back (~1 KB per result), VCFs stay on the node.
-- **Setup a node**: `control provision` runs `scripts/setup_node.sh` over SSH (docker, JDK, venv, images, patch
-  jar, reference genomes).
+- **Setup a node**: `control provision` copies the repo and **main's reference genomes** (rsync), then runs
+  `scripts/setup_node.sh` over SSH: docker, JDK, venv from `requirements.txt`, the GATK image and the **hap.py image
+  at upstream's pinned digest** (pre-pulled, so the first scoring does not stall), the patch jar, and any genome main
+  did not have (from the platform's reference endpoint).
 - Tested: `tests/test_fleet.py` runs the real node agent as subprocesses (fake GATK): scored results, families as
   one group, a killed node's jobs re-queued to the other, nodes with a failing self-test or other code rejected.
   `test/fleet_local.py` (real GATK, 2 nodes from an inventory, no ssh hop): 8 configs incl. a family of 6, the node

@@ -7,6 +7,7 @@
 - `port`: several machines may share one IP behind different ports (e.g. vast.ai).
 - optional `repo` / `data_dir`: where the code and data live on that host (default /minos/minos-miner, /minos/data).
 - `host: "local"`: run the node as a local subprocess instead of over SSH (tests, or this machine as a node).
+- an entry without `user` / `key_filename` inherits them from the first entry that has them.
 There is deliberately no passphrase field: unlock keys with ssh-agent. The file is re-read at every round start,
 so hosts can be added or disabled between rounds.
 """
@@ -70,10 +71,15 @@ class Host:
 
 
 def load(path: Path = INVENTORY, enabled_only: bool = True) -> List[Host]:
+    """Hosts from the inventory. An entry without `user` / `key_filename` takes them from the first entry that has
+    them, so a new host can be just {"host": ..., "port": ...}."""
     if not path.exists():
         return []
+    entries = json.loads(path.read_text())
+    donor = next((e for e in entries if e.get("key_filename")), {})
     hosts = []
-    for e in json.loads(path.read_text()):
+    for e in entries:
+        e = {**{k: donor[k] for k in ("user", "key_filename") if k in donor}, **e}
         known = {k: e[k] for k in ("host", "user", "port", "key_filename", "workers", "enabled", "repo", "data_dir")
                  if k in e and e[k] is not None}
         h = Host(**known, extra={k: v for k, v in e.items() if k not in known})

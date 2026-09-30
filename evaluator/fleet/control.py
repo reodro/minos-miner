@@ -1,7 +1,7 @@
 """Control every sub-VPS from main, over SSH, using the inventory (~/.minos/fleet.json).
 
     python -m evaluator.fleet.control status              reachable? cores, workers, docker, patch jar, genomes, code, disk
-    python -m evaluator.fleet.control provision [HOST..]  copy the repo, run scripts/setup_node.sh (fresh machines)
+    python -m evaluator.fleet.control provision [HOST..]  copy the repo + main's genomes, run scripts/setup_node.sh
     python -m evaluator.fleet.control sync [HOST..]       copy the repo + self-test bundle, rebuild the patch jar
     python -m evaluator.fleet.control selftest [HOST..]   run the node self-test everywhere
     python -m evaluator.fleet.control reap [HOST..]       kill stray GATK containers left by a crashed node
@@ -56,8 +56,19 @@ def status(h: Host) -> dict:
             "code_same_as_main": get(6) == code_digest(), "workers": h.workers or get(7)}
 
 
+def push_genomes(h: Host) -> None:
+    """Main's reference genomes (FASTA, index, dict, SDF) to the host, every chromosome main has; the node's setup
+    then downloads only what is still missing. No dependence on the platform's endpoint for what main already has."""
+    ref = f"{SETTINGS.data_dir}/reference/"
+    sh(h, f"mkdir -p {h.data_dir}/reference")
+    p = subprocess.run(h.rsync([ref], f"{h.data_dir}/reference/"), capture_output=True, text=True, timeout=7200)
+    if p.returncode != 0:
+        raise RuntimeError(f"pushing genomes: {p.stderr[-300:]}")
+
+
 def provision(h: Host) -> dict:
     copy_repo(h)
+    push_genomes(h)
     p = sh(h, f"cd {h.repo} && DATA_DIR={h.data_dir} bash scripts/setup_node.sh", timeout=7200)
     sync(h)
     return {"host": h.name, "ok": p.returncode == 0, "tail": (p.stdout + p.stderr).strip()[-300:]}

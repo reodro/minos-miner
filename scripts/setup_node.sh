@@ -18,9 +18,11 @@ systemctl enable --now docker
 # python env
 python3 -m venv .venv && .venv/bin/pip install -q --upgrade pip && .venv/bin/pip install -q -r requirements.txt
 
-# images: the validator's GATK, samtools; hap.py (digest pinned upstream) is pulled on first use
+# images: the validator's GATK, and hap.py at the exact digest upstream pins (pulled now: pulling it on first use
+# would stall the node's first scoring for minutes)
 docker pull -q broadinstitute/gatk:4.5.0.0
-docker pull -q quay.io/biocontainers/samtools:1.20--h50ea8bc_0
+HAPPY=$(grep -oP 'HAPPY_DOCKER_IMAGE = "\K[^"]+' /minos/minos_subnet/utils/scoring.py)
+docker pull -q "$HAPPY"
 
 # the GATK batching patch, compiled against the exact jar inside the validator image
 mkdir -p /opt/gatk
@@ -30,7 +32,8 @@ if [ ! -f /opt/gatk/gatk-package-4.5.0.0-local.jar ]; then
 fi
 bash evaluator/gatk_patch/build.sh
 
-# reference genomes (+ SDF for hap.py)
+# reference genomes (+ SDF for hap.py): `control provision` pushes main's copies first; this only downloads what is
+# still missing (fetch_genome.sh skips files already present)
 DATA_DIR="$DATA_DIR" bash scripts/fetch_genome.sh
 
 echo "node ready. workers: $(.venv/bin/python -c 'from common.settings import default_workers; print(default_workers())')"
