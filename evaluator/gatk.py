@@ -2,6 +2,9 @@
 
 Verified in test/ (2026-09-28; 3 rounds x 3 configs against the validator-identical baseline):
   used     - SAFE_ANNOTATION_EXCLUSIONS (-AX): bit-identical calls, x1.135.
+           - batching (gatk_patch): variants differing only in genotyping params cost ~0.8 s extra each; in PairHMM
+             params ~13 s per distinct PairHMM set (vs ~73 s full). 54/54 + 62/62 bit-identical to stock runs;
+             variants whose own run would draw random numbers differently come back DIVERGED and are re-run.
              Excluding QualByDepth or DepthPerAlleleBySample changes QUAL; RMSMappingQuality is required.
            - 1 thread per job: x2.06 throughput vs 4 threads per job on a saturated box; calls identical.
   rejected - GVCF re-genotyping (heterozygosity changes calls; QUAL shifts flip stand_call_conf thresholds in ~13%
@@ -39,6 +42,13 @@ GENOTYPING_BRANCH_PARAMS = ("standard_min_confidence_threshold_for_calling", "in
                             "max_alternate_alleles", "contamination_fraction_to_filter")
 GENOTYPING_DEFAULTS = {"standard_min_confidence_threshold_for_calling": 30.0, "indel_heterozygosity": 0.000125,
                        "max_alternate_alleles": 6, "contamination_fraction_to_filter": 0.0}
+# Read only when HaplotypeCaller builds its PairHMM likelihood engine (verified in the source): variants differing
+# in these get one extra likelihood computation per distinct set, still sharing traversal and assembly.
+PAIRHMM_BRANCH_PARAMS = ("base_quality_score_threshold", "pcr_indel_model", "pair_hmm_gap_continuation_penalty",
+                         "phred_scaled_global_read_mismapping_rate")
+PAIRHMM_DEFAULTS = {"base_quality_score_threshold": 18, "pcr_indel_model": "CONSERVATIVE",
+                    "pair_hmm_gap_continuation_penalty": 10, "phred_scaled_global_read_mismapping_rate": 45}
+BRANCH_PARAMS = GENOTYPING_BRANCH_PARAMS + PAIRHMM_BRANCH_PARAMS
 DIVERGED = "minos:diverged"      # batch variant whose own run would differ; the executor re-runs it alone
 DEFAULT_PATCH_JAR = os.path.join(os.path.dirname(__file__), "gatk_patch", "build", "minos-patch.jar")
 
@@ -125,12 +135,12 @@ class GatkRunner:
                            error=f"rc={p.returncode} {gatk_error(p.stderr)}", fidelity=fidelity)
         return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
 
-    # ---- batching: configs that differ only in genotyping parameters share one run (needs patch_jar) ----------
+    # ---- batching: configs differing only in genotyping/PairHMM parameters share one run (needs patch_jar) ----
     def branch_key(self, config: Config, fidelity: str = FULL) -> Optional[str]:
         """Configs with the same key can be evaluated in one run_batch. None = cannot be batched."""
         if self.patch_jar is None or config.tool != "gatk":
             return None
-        shared = {k: v for k, v in config.params.items() if k not in GENOTYPING_BRANCH_PARAMS}
+        shared = {k: v for k, v in config.params.items() if k not in BRANCH_PARAMS}
         return Config("gatk", shared).key + ":" + fidelity
 
     def run_batch(self, round: Round, configs: List[Config], fidelity: str = FULL) -> List[CallSet]:
@@ -144,13 +154,14 @@ class GatkRunner:
             return [self.run(round, c, fidelity) for c in configs]
         keys = {self.branch_key(c, fidelity) for c in configs}
         if len(keys) != 1 or None in keys:
-            raise ValueError("run_batch needs configs that differ only in genotyping parameters")
+            raise ValueError("run_batch needs configs that differ only in genotyping/PairHMM parameters")
         main = self._out(round, configs[0], fidelity)
         outs = [self._out(round, c, fidelity) for c in configs[1:]]
         spec = main.parent / f"variants_{uuid.uuid4().hex[:10]}.tsv"
         spec.write_text("".join(
-            "\t".join([f"/data/output/{o.name}"] + [str(c.params.get(p, GENOTYPING_DEFAULTS[p]))
-                                                     for p in GENOTYPING_BRANCH_PARAMS]) + "\n"
+            "\t".join([f"/data/output/{o.name}"]
+                      + [str(c.params.get(p, GENOTYPING_DEFAULTS[p])) for p in GENOTYPING_BRANCH_PARAMS]
+                      + [str(c.params.get(p, PAIRHMM_DEFAULTS[p])) for p in PAIRHMM_BRANCH_PARAMS]) + "\n"
             for c, o in zip(configs[1:], outs)))
         t0 = time.time()
         try:

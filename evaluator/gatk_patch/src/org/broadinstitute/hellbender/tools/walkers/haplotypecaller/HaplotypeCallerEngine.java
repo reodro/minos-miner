@@ -999,17 +999,37 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
                 haplotypeBAMWriter.isPresent(),
                 suspiciousLocations,
                 readLikelihoods);
-        // minos: same region, same haplotypes and read likelihoods, one extra genotyping pass per variant.
-        // Genotyping marginalizes into new objects, so the shared inputs are never modified; each variant has
-        // its own engine, so cross-region genotyping state stays per variant.
+        // minos: one extra genotyping pass per variant. Variants whose PairHMM parameters equal the main config's
+        // reuse its likelihoods; the others share one likelihood computation per distinct PairHMM parameter set,
+        // on the same region, haplotypes and reads (computeReadLikelihoods copies its inputs; the only thing it
+        // writes on shared reads is a transient attribute read back within the same call). Each variant has its
+        // own genotyping engine and random streams.
+        final Map<String, AlleleLikelihoods<GATKRead, Haplotype>> minosLikelihoods = new HashMap<>();
         for (final MinosGenotypingVariant v : minosGenotypingVariants) {
+            AlleleLikelihoods<GATKRead, Haplotype> rl = subsettedReadLikelihoodsFinal;
+            AlleleLikelihoods<GATKRead, Haplotype> preFilter = readLikelihoods;
+            if (v.likelihoodKey != null) {
+                rl = minosLikelihoods.get(v.likelihoodKey);
+                if (rl == null) {
+                    rl = possiblyUncollapseHaplotypesInReadLikelihoods(untrimmedAssemblyResult,
+                            minosLikelihoodEngines.get(v.likelihoodKey).computeReadLikelihoods(assemblyResult, samplesList, reads, true));
+                    // exactly the main path's next step: genotyping sees reads realigned to their best haplotype
+                    if (!(hcArgs.pileupDetectionArgs.generatePDHaplotypes && !hcArgs.pileupDetectionArgs.useDeterminedHaplotypesDespitePdhmmMode)) {
+                        rl.changeEvidence(AssemblyBasedCallerUtils.realignReadsToTheirBestHaplotype(rl,
+                                assemblyResult.getReferenceHaplotype(), assemblyResult.getPaddedReferenceLoc(), aligner,
+                                readToHaplotypeSWParameters));
+                    }
+                    minosLikelihoods.put(v.likelihoodKey, rl);
+                }
+                preFilter = rl;
+            }
             Utils.minosSetRandomOverride(v.rng);          // its QD jitter comes from its own stream, as in its own run
             Utils.minosSetRandomDataOverride(v.rdg);      // and its contamination downsampling too
             try {
-                v.engine.assignGenotypeLikelihoods(haplotypes, subsettedReadLikelihoodsFinal, perSampleFilteredReadList,
+                v.engine.assignGenotypeLikelihoods(rl.alleles(), rl, perSampleFilteredReadList,
                         assemblyResult.getFullReferenceWithPadding(), assemblyResult.getPaddedReferenceLoc(),
                         regionForGenotyping.getSpan(), features, givenAlleles, emitReferenceConfidence(), hcArgs.maxMnpDistance,
-                        readsHeader, haplotypeBAMWriter.isPresent(), suspiciousLocations, readLikelihoods)
+                        readsHeader, haplotypeBAMWriter.isPresent(), suspiciousLocations, preFilter)
                     .getCalls().stream().map(RMSMappingQuality.getInstance()::finalizeRawMQ).forEach(v.writer::add);
             } finally {
                 Utils.minosSetRandomOverride(null);
@@ -1133,6 +1153,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
      */
     public void shutdown() {
         minosSyncRandom();
+        minosLikelihoodEngines.values().forEach(ReadLikelihoodCalculationEngine::close);
         for (final MinosGenotypingVariant v : minosGenotypingVariants) {
             if (v.writer != null) {
                 v.writer.close();
@@ -1219,6 +1240,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
     private static final class MinosGenotypingVariant {
         final String output;
         final HaplotypeCallerGenotypingEngine engine;
+        final String likelihoodKey;          // null = same PairHMM parameters as the main config
         final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng =
                 Utils.minosGlobalRandom().copyState();   // same state as the global at start, like a fresh run
         final org.broadinstitute.hellbender.utils.MinosRecordingWell well = Utils.minosGlobalWell().copyState();
@@ -1227,13 +1249,15 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         VariantContextWriter writer;
         boolean diverged = false;
 
-        MinosGenotypingVariant(final String output, final HaplotypeCallerGenotypingEngine engine) {
+        MinosGenotypingVariant(final String output, final HaplotypeCallerGenotypingEngine engine, final String likelihoodKey) {
             this.output = output;
             this.engine = engine;
+            this.likelihoodKey = likelihoodKey;
         }
     }
 
     private final List<MinosGenotypingVariant> minosGenotypingVariants = new ArrayList<>();
+    private final Map<String, ReadLikelihoodCalculationEngine> minosLikelihoodEngines = new LinkedHashMap<>();
 
     private void minosInitGenotypingVariants() {
         final String spec = System.getProperty("minos.gt.variants");
@@ -1260,12 +1284,28 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
             args.standardArgs.genotypeArgs.maxAlternateAlleles = Integer.parseInt(f[3]);
             args.standardArgs.CONTAMINATION_FRACTION = Double.parseDouble(f[4]);
             args.standardArgs.setSampleContamination(java.util.Collections.emptyMap());   // rebuild as a fresh run would
+            String likelihoodKey = null;
+            if (f.length > 5) {                    // optional PairHMM columns: bqt, pcr_indel_model, gcp, mismapping
+                args.likelihoodArgs.BASE_QUALITY_SCORE_THRESHOLD = Byte.parseByte(f[5]);
+                args.likelihoodArgs.pcrErrorModel = PairHMMLikelihoodCalculationEngine.PCRErrorModel.valueOf(f[6]);
+                args.likelihoodArgs.gcpHMM = Integer.parseInt(f[7]);
+                args.likelihoodArgs.phredScaledGlobalReadMismappingRate = Integer.parseInt(f[8]);
+                final String key = f[5] + "|" + f[6] + "|" + f[7] + "|" + f[8];
+                final String mainKey = hcArgs.likelihoodArgs.BASE_QUALITY_SCORE_THRESHOLD + "|" + hcArgs.likelihoodArgs.pcrErrorModel
+                        + "|" + hcArgs.likelihoodArgs.gcpHMM + "|" + hcArgs.likelihoodArgs.phredScaledGlobalReadMismappingRate;
+                if (!key.equals(mainKey)) {
+                    likelihoodKey = key;
+                    minosLikelihoodEngines.computeIfAbsent(key, k -> AssemblyBasedCallerUtils.createLikelihoodCalculationEngine(
+                            args.likelihoodArgs, args.fbargs, !args.softClipLowQualityEnds, args.likelihoodArgs.likelihoodEngineImplementation));
+                }
+            }
             final HaplotypeCallerGenotypingEngine engine =
                     new HaplotypeCallerGenotypingEngine(args, samplesList, !hcArgs.doNotRunPhysicalPhasing, hcArgs.applyBQD);
             engine.setAnnotationEngine(annotationEngine);
-            minosGenotypingVariants.add(new MinosGenotypingVariant(f[0], engine));
+            minosGenotypingVariants.add(new MinosGenotypingVariant(f[0], engine, likelihoodKey));
         }
-        logger.info("minos: " + minosGenotypingVariants.size() + " genotyping variants");
+        logger.info("minos: " + minosGenotypingVariants.size() + " variants, " + minosLikelihoodEngines.size()
+                + " extra likelihood engines");
         if (!minosGenotypingVariants.isEmpty()) {
             Utils.minosGlobalRandom().setRecording(true);
             Utils.minosGlobalWell().setRecording(true);
