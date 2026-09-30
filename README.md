@@ -94,4 +94,5 @@ Data never goes in git; it lives under `DATA_DIR` (default `/minos/data`). The G
 ```
 
 `replay` prints what the miner would have submitted, its **true** score and its rank among the real submissions.
-Reference point (2026-09-30, one 16-core machine, 20 min): 296 configs evaluated, true 87.22, rank 44 of 60.
+Reference points (round 092900Z, 20 min): one 16-core machine - 296 configs, true 87.22, rank 44/60; fleet of two
+16-core sub-VPSs - 587 configs, true 87.53, rank 36/60.

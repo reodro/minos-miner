@@ -118,7 +118,10 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   one group, a killed node's jobs re-queued to the other, nodes with a failing self-test or other code rejected.
   `test/fleet_local.py` (real GATK, 2 nodes from an inventory, no ssh hop): 8 configs incl. a family of 6, the node
   holding all 8 jobs killed at 61 s - all re-queued, finished by the other node, **8/8 scores identical** to the
-  single-machine path in 188 s, no agent or container left behind. **Not yet run over real ssh / separate VPSs.**
+  single-machine path in 188 s, no agent or container left behind.
+  **Real fleet** (2 x 16-core VPS, 28 workers, 2026-09-30): provisioned in ~4 min each, self-test identical on both;
+  replay 092900Z, 20 min: **587 configs** (single machine: 296), both nodes 14/14 containers and 86-99% CPU, main
+  ~2% CPU; final submission true score 87.53, rank 36/60 (single machine: 87.22, rank 44).
 - Trap found: `LocalExecutor.poll` used to return at once when idle; callers poll in loops, and the spin starved the
   scoring threads of the GIL (scoring 20x slower). An idle poll now waits for a submit.
 
