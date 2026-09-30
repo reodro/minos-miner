@@ -8,8 +8,8 @@
 - optional `repo` / `data_dir`: where the code and data live on that host (default /minos/minos-miner, /minos/data).
 - `host: "local"`: run the node as a local subprocess instead of over SSH (tests, or this machine as a node).
 - an entry without `user` / `key_filename` / `key_passphrase` inherits them from the first entry that has them.
-- `key_passphrase`: main starts its own ssh-agent and unlocks the key with it; the passphrase is handed to ssh-add
-  through an environment variable and never logged or written anywhere else. Main keeps this file at mode 600 itself.
+- `key_passphrase`: main starts its own ssh-agent and unlocks the key with it. Each entry may have its own key and
+  passphrase; entries without them use the first entry's (like the legacy fleet.json).
 The file is re-read at every round start, so hosts can be added or disabled between rounds.
 """
 from __future__ import annotations
@@ -18,7 +18,6 @@ import atexit
 import hashlib
 import json
 import os
-import stat
 import subprocess
 import tempfile
 import threading
@@ -83,11 +82,6 @@ def load(path: Path = INVENTORY, enabled_only: bool = True) -> List[Host]:
     if not path.exists():
         return []
     entries = json.loads(path.read_text())
-    if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        try:
-            os.chmod(path, 0o600)                               # keep it private; never a reason to stop mining
-        except OSError:
-            pass
     donor = next((e for e in entries if e.get("key_filename")), {})
     hosts = []
     for e in entries:
