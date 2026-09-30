@@ -157,7 +157,7 @@ class InventoryTest(unittest.TestCase):
 
 
 class PassphraseTest(unittest.TestCase):
-    def test_agent_unlocks_an_encrypted_key_and_loose_permissions_are_refused(self):
+    def test_agent_unlocks_an_encrypted_key_and_the_inventory_is_kept_private(self):
         import subprocess
         from evaluator.fleet.inventory import ensure_agent, load
         d = Path(tempfile.mkdtemp())
@@ -165,11 +165,9 @@ class PassphraseTest(unittest.TestCase):
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "pw-123", "-f", str(key)], check=True)
         inv = d / "fleet.json"
         inv.write_text(json.dumps([{"host": "1.1.1.1", "key_filename": str(key), "key_passphrase": "pw-123"}]))
-        inv.chmod(0o640)
-        with self.assertRaises(PermissionError):
-            load(inv)
-        inv.chmod(0o600)
-        hosts = load(inv)
+        inv.chmod(0o644)
+        hosts = load(inv)                                        # works anyway, and tightens the file
+        self.assertEqual(inv.stat().st_mode & 0o777, 0o600)
         self.assertNotIn("pw-123", repr(hosts))
         ensure_agent(hosts)
         listed = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True).stdout
