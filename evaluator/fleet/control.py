@@ -6,7 +6,8 @@
     python -m evaluator.fleet.control selftest [HOST..]   run the node self-test everywhere
     python -m evaluator.fleet.control reap [HOST..]       kill stray GATK containers left by a crashed node
 
-Hosts run in parallel. Nothing here stores secrets: keys come from key_filename / ssh-agent.
+Hosts run in parallel. Keys come from key_filename; a key_passphrase in the inventory is unlocked in a private
+ssh-agent (see inventory.ensure_agent).
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from typing import Callable, List
 from common.settings import SETTINGS
 from evaluator.fleet import selftest
 from evaluator.fleet.coordinator import push
-from evaluator.fleet.inventory import REPO, Host, code_digest, load
+from evaluator.fleet.inventory import REPO, Host, code_digest, ensure_agent, load
 
 EXCLUDES = ["--exclude", ".git/", "--exclude", ".venv/", "--exclude", "test/", "--exclude", "__pycache__/",
             "--exclude", "evaluator/gatk_patch/build/", "--exclude", "*.pyc"]
@@ -100,6 +101,7 @@ def on_hosts(fn: Callable[[Host], dict], names: List[str]) -> List[dict]:
     hosts = [h for h in load() if not names or h.name in names or h.host in names]
     if not hosts:
         sys.exit("no matching enabled hosts in the inventory")
+    ensure_agent(hosts)
 
     def safe(h):
         try:

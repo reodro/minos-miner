@@ -7,15 +7,21 @@
 - `port`: several machines may share one IP behind different ports (e.g. vast.ai).
 - optional `repo` / `data_dir`: where the code and data live on that host (default /minos/minos-miner, /minos/data).
 - `host: "local"`: run the node as a local subprocess instead of over SSH (tests, or this machine as a node).
-- an entry without `user` / `key_filename` inherits them from the first entry that has them.
-There is deliberately no passphrase field: unlock keys with ssh-agent. The file is re-read at every round start,
-so hosts can be added or disabled between rounds.
+- an entry without `user` / `key_filename` / `key_passphrase` inherits them from the first entry that has them.
+- `key_passphrase` (the user's choice): main starts its own ssh-agent and unlocks the key with it; the passphrase is
+  read only from this file (which must be mode 600), handed to ssh-add through an environment variable, and never
+  logged or written anywhere else. The file is re-read at every round start, so hosts can be added or disabled.
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
+import stat
+import subprocess
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -33,6 +39,7 @@ class Host:
     user: str = "root"
     port: int = 22
     key_filename: Optional[str] = None
+    key_passphrase: Optional[str] = field(default=None, repr=False, compare=False)   # never printed
     workers: Optional[int] = None
     enabled: bool = True
     repo: str = "/minos/minos-miner"
@@ -76,12 +83,14 @@ def load(path: Path = INVENTORY, enabled_only: bool = True) -> List[Host]:
     if not path.exists():
         return []
     entries = json.loads(path.read_text())
+    if any(e.get("key_passphrase") for e in entries) and path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise PermissionError(f"{path} holds a key passphrase and is readable by others: chmod 600 {path}")
     donor = next((e for e in entries if e.get("key_filename")), {})
     hosts = []
     for e in entries:
-        e = {**{k: donor[k] for k in ("user", "key_filename") if k in donor}, **e}
-        known = {k: e[k] for k in ("host", "user", "port", "key_filename", "workers", "enabled", "repo", "data_dir")
-                 if k in e and e[k] is not None}
+        e = {**{k: donor[k] for k in ("user", "key_filename", "key_passphrase") if k in donor}, **e}
+        known = {k: e[k] for k in ("host", "user", "port", "key_filename", "key_passphrase", "workers", "enabled",
+                                   "repo", "data_dir") if k in e and e[k] is not None}
         h = Host(**known, extra={k: v for k, v in e.items() if k not in known})
         if h.enabled or not enabled_only:
             hosts.append(h)
@@ -97,3 +106,44 @@ def code_digest(root: Path = REPO) -> str:
                 h.update(str(p.relative_to(root)).encode())
                 h.update(p.read_bytes())
     return h.hexdigest()[:16]
+
+
+# ---- ssh-agent for passphrase-protected keys --------------------------------------------------------------------
+_AGENT_LOCK = threading.Lock()
+_UNLOCKED: set = set()
+
+
+def ensure_agent(hosts: List[Host]) -> None:
+    """Start one ssh-agent for this process (its children inherit SSH_AUTH_SOCK) and add every key that has a
+    passphrase. The passphrase goes to ssh-add through an environment variable read by a tiny askpass script; neither
+    the script nor anything else on disk contains it. The agent is killed when this process exits."""
+    need = {(os.path.expanduser(h.key_filename), h.key_passphrase) for h in hosts if h.key_filename and h.key_passphrase}
+    need = {k for k in need if k[0] not in _UNLOCKED}
+    if not need:
+        return
+    with _AGENT_LOCK:
+        if "MINOS_AGENT_PID" not in os.environ:
+            out = subprocess.run(["ssh-agent", "-s"], capture_output=True, text=True, check=True).stdout
+            for line in out.splitlines():
+                if line.startswith(("SSH_AUTH_SOCK=", "SSH_AGENT_PID=")):
+                    k, _, v = line.partition(";")[0].partition("=")
+                    os.environ[k] = v
+            os.environ["MINOS_AGENT_PID"] = os.environ["SSH_AGENT_PID"]
+            atexit.register(lambda pid=os.environ["SSH_AGENT_PID"]: subprocess.run(["kill", pid], capture_output=True))
+        d = tempfile.mkdtemp(prefix="minos-askpass-")
+        ask = os.path.join(d, "askpass.sh")
+        with open(ask, "w") as f:
+            f.write('#!/bin/sh\nprintf "%s" "$MINOS_KEY_PASSPHRASE"\n')
+        os.chmod(ask, 0o700)
+        try:
+            for key, passphrase in need:
+                env = {**os.environ, "SSH_ASKPASS": ask, "SSH_ASKPASS_REQUIRE": "force", "DISPLAY": ":0",
+                       "MINOS_KEY_PASSPHRASE": passphrase}
+                p = subprocess.run(["ssh-add", key], stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env)
+                if p.returncode != 0:
+                    raise RuntimeError(f"ssh-add {key} failed (wrong passphrase?)")   # no passphrase in the message
+                _UNLOCKED.add(key)
+        finally:
+            os.remove(ask)
+            os.rmdir(d)
+

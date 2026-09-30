@@ -30,7 +30,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from common.settings import SETTINGS
 from common.types import AnswerSet, CallSet, EvalJob, Round
 from evaluator.fleet import codec, selftest
-from evaluator.fleet.inventory import INVENTORY, Host, code_digest, load
+from evaluator.fleet.inventory import INVENTORY, Host, code_digest, ensure_agent, load
 from evaluator.local import job_key
 
 log = logging.getLogger(__name__)
@@ -102,6 +102,7 @@ class FleetExecutor:
     def refresh_hosts(self) -> None:
         """Re-read the inventory: start sessions for new enabled hosts, close the ones no longer enabled."""
         hosts = {h.name: h for h in load(self.inventory)}
+        ensure_agent(list(hosts.values()))                    # unlock passphrase-protected keys once
         with self._lock:
             for name, s in list(self._sessions.items()):
                 if name not in hosts:

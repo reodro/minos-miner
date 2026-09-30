@@ -85,7 +85,8 @@ configs and submits.
 ```
 ~/.minos/fleet.json on main (the inventory; re-read at every round start):
   [{"host": "1.2.3.4", "user": "root", "port": 22, "key_filename": "~/.ssh/id_ed25519",
-    "workers": null, "enabled": true}]
+    "key_passphrase": "...", "workers": null, "enabled": true},
+   {"host": "5.6.7.8"}]                                # inherits user, key and passphrase
 
 python -m evaluator.fleet.control provision            # fresh machines: copy repo, run scripts/setup_node.sh
 python -m evaluator.fleet.control status | sync | selftest | reap
@@ -94,8 +95,9 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
 
 - **Inventory**: `workers: null` = the node's own rule floor(cores x 0.95 - 1); `port` lets several machines share
   one IP; optional `repo` / `data_dir`; an entry without `user` / `key_filename` inherits them from the first entry
-  that has them (a new host can be just `{"host": ..., "port": ...}`). No passphrase field: unlock keys with
-  `ssh-agent`.
+  that has them (a new host can be just `{"host": ..., "port": ...}`). `key_passphrase` (optional, also inherited):
+  main starts a private `ssh-agent` and unlocks the key through an environment variable - the passphrase is never
+  written anywhere else or logged, and main refuses an inventory that is readable by other users (mode must be 600).
 - **`FleetExecutor`** (main) implements the same Executor protocol, so search and main do not change. For every
   enabled host it keeps one SSH session running the node agent (`python -m evaluator.fleet.node --stdio`); jobs go
   down and scored callsets come back as JSON lines on that session. One queue with dedup and a result cache; a

@@ -154,3 +154,24 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual([(h.name, h.user, h.key_filename) for h in hosts],
                          [("1.1.1.1", "ubuntu", "~/.ssh/k"), ("2.2.2.2:2222", "ubuntu", "~/.ssh/k")])
         self.assertEqual(len(load(p, enabled_only=False)), 3)
+
+
+class PassphraseTest(unittest.TestCase):
+    def test_agent_unlocks_an_encrypted_key_and_loose_permissions_are_refused(self):
+        import subprocess
+        from evaluator.fleet.inventory import ensure_agent, load
+        d = Path(tempfile.mkdtemp())
+        key = d / "k"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "pw-123", "-f", str(key)], check=True)
+        inv = d / "fleet.json"
+        inv.write_text(json.dumps([{"host": "1.1.1.1", "key_filename": str(key), "key_passphrase": "pw-123"}]))
+        inv.chmod(0o640)
+        with self.assertRaises(PermissionError):
+            load(inv)
+        inv.chmod(0o600)
+        hosts = load(inv)
+        self.assertNotIn("pw-123", repr(hosts))
+        ensure_agent(hosts)
+        listed = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True).stdout
+        fingerprint = subprocess.run(["ssh-keygen", "-lf", str(key) + ".pub"], capture_output=True, text=True).stdout.split()[1]
+        self.assertIn(fingerprint, listed)
