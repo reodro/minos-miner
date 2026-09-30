@@ -1,7 +1,7 @@
-"""Search strategies. Owner: main.
+"""Search strategies. Owner: search.
 
 A strategy is an async function `strategy(client)` that runs until the client is exhausted or the round ends
-(the round loop cancels it). It can stream, wait on barriers, or run sequential chains - see main/client.py.
+(the round loop cancels it). It can stream, wait on barriers, or run sequential chains - see search/client.py.
 RF_UCB, QGA, ladder, restarts, local polish ... are each one strategy; several run at once.
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Awaitable, Callable, List
 
 from common.params import ParamRanges
 from common.types import Config
-from main.client import EvalClient
+from search.client import EvalClient
 
 Strategy = Callable[[EvalClient], Awaitable[None]]
 

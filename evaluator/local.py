@@ -170,6 +170,22 @@ class LocalExecutor:
             costs = [c for c in costs if c is not None]
             return min(costs, default=1.0)
 
+    def cost_hints(self, jobs: List[EvalJob]) -> List[float]:
+        """cost_hint for jobs submitted together: a job that can ride in the batch of one listed before it
+        costs only its variant cost, as if that one were already queued."""
+        out = []
+        for i, job in enumerate(jobs):
+            c = self.cost_hint(job)
+            bk = self._branch(job)
+            if c > 0 and bk is not None and hasattr(self.runner, "variant_cost"):
+                for prev in jobs[:i]:
+                    if prev.round.round_id == job.round.round_id and self._branch(prev) == bk:
+                        v = self.runner.variant_cost(prev.config, job.config, job.fidelity)
+                        if v is not None:
+                            c = min(c, v)
+            out.append(c)
+        return out
+
     def idle_slots(self) -> int:
         with self._lock:
             return max(0, self.workers - len(self._running) - len(self._queue))

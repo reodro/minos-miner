@@ -62,32 +62,58 @@ class EvalClient:
         return self.budget is not None and self.spent >= self.budget
 
     def submit(self, config: Config, *, fidelity: str = FULL, priority: int = 0, tag: str = "") -> asyncio.Future:
-        fut = asyncio.get_running_loop().create_future()
-        errs = self.ranges.errors(config)
-        if errs:
-            fut.set_result(Outcome(config, None, "invalid: " + "; ".join(errs), tag))
-            return fut
-        cached = self.latest.get((config.key, fidelity))
-        if cached is not None:
-            fut.set_result(Outcome(config, cached, None, tag))
-            return fut
-        job = EvalJob(f"j{next(self._ids)}", self.round, config, fidelity, priority, tag)
-        cost = self.executor.cost_hint(job)
-        if cost > 0:
-            if self.exhausted:
-                fut.set_result(Outcome(config, None, "budget exhausted", tag))
-                return fut
-            self.spent += cost            # budget is in full-evaluation units: a batched rider costs ~0.01
-        self.configs[config.key] = config
-        self._pending[job.job_id] = (fut, config, tag)
-        self.executor.submit([job])
-        return fut
+        return self.submit_many([config], fidelity=fidelity, priority=priority, tag=tag)[0]
+
+    def submit_many(self, configs: Iterable[Config], *, fidelity: str = FULL, priority: int = 0,
+                    tag: str = "") -> List[asyncio.Future]:
+        """Several configs in ONE executor call, so related ones (a family: same config except cheap
+        parameters) are queued together and can share one GATK run. Budget: each is charged the executor's
+        cost for it as part of this group (a batch rider costs a fraction of a full run)."""
+        loop = asyncio.get_running_loop()
+        futs, jobs = [], []
+        for config in configs:
+            fut = loop.create_future()
+            futs.append(fut)
+            errs = self.ranges.errors(config)
+            if errs:
+                fut.set_result(Outcome(config, None, "invalid: " + "; ".join(errs), tag))
+                continue
+            cached = self.latest.get((config.key, fidelity))
+            if cached is not None:
+                fut.set_result(Outcome(config, cached, None, tag))
+                continue
+            jobs.append((fut, EvalJob(f"j{next(self._ids)}", self.round, config, fidelity, priority, tag)))
+        if not jobs:
+            return futs
+        hints = getattr(self.executor, "cost_hints", None)
+        costs = hints([j for _, j in jobs]) if hints else [self.executor.cost_hint(j) for _, j in jobs]
+        send = []
+        for (fut, job), cost in zip(jobs, costs):
+            if cost > 0:
+                if self.exhausted:
+                    fut.set_result(Outcome(job.config, None, "budget exhausted", tag))
+                    continue
+                self.spent += cost            # budget is in full-evaluation units
+            self.configs[job.config.key] = job.config
+            self._pending[job.job_id] = (fut, job.config, tag)
+            send.append(job)
+        if send:
+            self.executor.submit(send)
+        return futs
+
+    def variant_cost(self, main: Config, variant: Config, fidelity: str = FULL) -> float:
+        """Extra cost (fraction of a full run) of evaluating `variant` in the same run as `main`; 1.0 if they
+        cannot share a run or the evaluator cannot tell."""
+        runner = getattr(self.executor, "runner", None)
+        f = getattr(runner, "variant_cost", None)
+        c = f(main, variant, fidelity) if f else None
+        return 1.0 if c is None else c
 
     async def map(self, configs: Iterable[Config], *, quorum: float = 1.0, fidelity: str = FULL, priority: int = 0,
                   tag: str = "") -> List[Optional[Outcome]]:
         """Outcomes in input order. Returns once ceil(quorum * n) are done; the rest are None here but keep
         running, and their results still reach the store and every listener."""
-        futs = [self.submit(c, fidelity=fidelity, priority=priority, tag=tag) for c in configs]
+        futs = self.submit_many(configs, fidelity=fidelity, priority=priority, tag=tag)
         need = math.ceil(quorum * len(futs))
         pending = set(futs)
         while len(futs) - len(pending) < need:

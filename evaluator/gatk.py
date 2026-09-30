@@ -212,6 +212,8 @@ class GatkRunner:
         """Configs with the same key can be evaluated in one run_batch. None = cannot be batched."""
         if self.patch_jar is None or config.tool != "gatk":
             return None
+        if config.params.get("emit_ref_confidence", "NONE") != "NONE":
+            return None                   # the patch refuses GVCF modes: such a config always runs alone
         shared = {k: v for k, v in config.params.items() if k not in BRANCH_PARAMS}
         return Config("gatk", shared).key + ":" + fidelity
 

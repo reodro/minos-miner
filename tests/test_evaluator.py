@@ -131,3 +131,10 @@ class SpliceRepairTest(unittest.TestCase):
                 body = [l.split("\t")[1] + ":" + l.split("\t")[7].strip() for l in f if not l.startswith("#")]
             self.assertEqual(body, ["15:batch", "160:repair", "420:batch"])
             self.assertTrue((d / "out.vcf.gz.tbi").exists())
+
+
+class GvcfNotBatchedTest(unittest.TestCase):
+    def test_gvcf_configs_run_alone(self):
+        r = GatkRunner(patch_jar="/nonexistent.jar")
+        self.assertIsNone(r.branch_key(Config("gatk", {"emit_ref_confidence": "GVCF"})))
+        self.assertIsNotNone(r.branch_key(Config("gatk", {"emit_ref_confidence": "NONE"})))

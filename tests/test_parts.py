@@ -10,7 +10,8 @@ from common.settings import SETTINGS
 from common.store import ResultStore
 from common.types import FULL, AnswerSet, CallSet, ClassCounts, Config, EvalJob, Regime, Round, ScoreResult
 from evaluator import FakeRunner, FakeScorer, LocalExecutor, SimExecutor
-from main import DryRunSubmitter, EvalClient, LoopSettings, RandomSampler, random_stream, run_round
+from main import DryRunSubmitter, LoopSettings, run_round
+from search import EvalClient, RandomSampler, random_stream, rf_ucb
 from tests.helpers import ranges
 
 ROUND_0817 = os.path.join(SETTINGS.rounds_dir, "20260928T081700Z")
@@ -258,3 +259,43 @@ class BatchingExecutorTest(unittest.TestCase):
         ex.submit([EvalJob(f"x{i}", ROUND, c) for i, c in enumerate(cfgs)])
         self.assertEqual(len(self.drain(ex, 5)), 5)
         self.assertEqual(ex.batches_run, 0)
+
+
+class FamilySubmitTest(unittest.TestCase):
+    """submit_many: a family reaches the executor in one call, runs as one batch, and is charged as a family."""
+
+    def test_family_is_one_batch_and_cheap(self):
+        r = ranges(); d = r.defaults("gatk").params
+        runner = BatchingExecutorTest.BatchRunner(r)
+        runner.variant_cost = lambda main, v, fid: (0.02 if runner.branch_key(main, fid) == runner.branch_key(v, fid)
+                                                    else None)
+        ex = LocalExecutor(runner, workers=1)
+        gt = BatchingExecutorTest.BatchRunner.GT
+        fam = [Config("gatk", {**d, gt: c}) for c in (30.0, 40.0, 50.0)]
+
+        async def go():
+            client = EvalClient(ROUND, ex, FakeScorer(runner), r, ResultStore(), StubProvider().build(ROUND), budget=10)
+            futs = client.submit_many(fam)
+            while client.in_flight:
+                for cs in await asyncio.to_thread(ex.poll, 0.2):
+                    client.deliver(cs)
+            return client.spent, [f.result().ok for f in futs]
+
+        spent, oks = asyncio.run(go())
+        self.assertEqual(runner.batches, [[c.key for c in fam]])
+        self.assertTrue(all(oks))
+        self.assertAlmostEqual(spent, 1.0 + 2 * 0.02)
+
+
+class RfUcbTest(unittest.TestCase):
+    def test_beats_random_on_the_fake_landscape_and_respects_budget(self):
+        r = ranges()
+        best = {"random": [], "rf": []}
+        for seed in range(3):
+            for name, strat in (("random", random_stream(r, in_flight=8, seed=seed)), ("rf", rf_ucb(r, seed=seed))):
+                runner = FakeRunner(r, seed=seed)
+                out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [strat],
+                                DryRunSubmitter(), r, LoopSettings(max_evals=120), baselines=[])
+                self.assertLessEqual(out.evaluated + out.failed, 120 + 8)     # in-flight ones may finish after
+                best[name].append(out.best.score)
+        self.assertGreater(sum(best["rf"]), sum(best["random"]))

@@ -12,8 +12,8 @@ from common.params import ParamRanges
 from common.store import ResultStore
 from common.types import FULL, CallSet, Config, Round, ScoreResult
 from evaluator.base import Executor, Scorer
-from main.client import EvalClient, Outcome
-from main.search import Strategy
+from search.client import EvalClient, Outcome
+from search.base import Strategy
 from main.submitter import Submitter
 
 log = logging.getLogger(__name__)
