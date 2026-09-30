@@ -52,6 +52,7 @@ class LocalExecutor:
         self._cancelled = set()
         self._solo = set()                         # job ids that must not be batched again
         self._repair: Dict[str, CallSet] = {}      # job id -> its diverged batch output, for runner.repair
+        self._ended = set()                        # round ids whose results are no longer wanted (end_round)
         self._lock = threading.Lock()
         self._wake = threading.Event()             # set by submit(): an idle poll() waits on it instead of spinning
         self.batches_run = 0
@@ -141,6 +142,11 @@ class LocalExecutor:
                 jobs = self._running.pop(f)
                 for job, cs in zip(jobs, f.result()):
                     k = job_key(job)
+                    if job.round.round_id in self._ended:        # its round is over: nobody wants this result
+                        self._inflight.pop(k, None)
+                        self._waiters.pop(k, None)
+                        self._repair.pop(job.job_id, None)
+                        continue
                     if not cs.ok and cs.error == DIVERGED:
                         # its batch output was not exact: repair it if the runner can, else run it alone
                         # (still counts as in flight)
@@ -162,6 +168,24 @@ class LocalExecutor:
     def cancel(self, job_ids: Iterable[str]) -> None:
         with self._lock:
             self._cancelled.update(job_ids)
+
+    def end_round(self, round_id: str) -> None:
+        """The round is over: drop its queued jobs, kill its running GATK containers, deliver nothing more for it.
+        Frees every worker for the next round at once instead of letting stale batches run on for minutes."""
+        with self._lock:
+            self._ended.add(round_id)
+            keep = [item for item in self._queue if item[2].round.round_id != round_id]
+            for item in self._queue:
+                if item[2].round.round_id == round_id:
+                    k = job_key(item[2])
+                    self._inflight.pop(k, None)
+                    self._waiters.pop(k, None)
+                    self._repair.pop(item[2].job_id, None)
+            self._queue = keep
+            heapq.heapify(self._queue)
+        kill = getattr(self.runner, "kill_round", None)
+        if kill:
+            kill(round_id)
 
     def cost_hint(self, job: EvalJob) -> float:
         """0 if done or in flight; if a queued job would carry it in its batch, the runner's variant cost

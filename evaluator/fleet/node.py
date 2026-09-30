@@ -4,6 +4,7 @@
 
 main -> node   {"type": "round", "round": {...}, "answer_set": {...}, "bam_url": ..., "bai_url": ..., "keep": [...]}
                {"type": "jobs", "groups": [[job, ...], ...]}          one group = one GATK run (a family)
+               {"type": "abort", "round_id"}                          round over: drop its jobs, kill its containers
 node -> main   {"type": "ready", "ok": bool, "digest", "expected", "code", "workers"}   after the self-test
                {"type": "round_ready", "round_id"} | {"type": "round_failed", "round_id", "error"}
                {"type": "result", "callset": {...}}                   carries its score; the VCF stays here
@@ -49,6 +50,7 @@ class Node:
         self._stop = threading.Event()
         self.score_threads = score_threads
         self._scorers: list = []
+        self._aborted: set = set()
 
     # ---- messages -----------------------------------------------------------------------------------------------
     def send(self, msg: dict) -> None:
@@ -137,7 +139,8 @@ class Node:
                         except Exception as e:  # noqa: BLE001
                             pairs.append((replace(c, ok=False, error=f"scoring failed on node: {e}"), None))
                 for c, r in pairs:
-                    self.send({"type": "result", "callset": codec.callset_to(replace(c, score=r) if r else c)})
+                    if c.round_id not in self._aborted:
+                        self.send({"type": "result", "callset": codec.callset_to(replace(c, score=r) if r else c)})
 
     # ---- main loop -------------------------------------------------------------------------------------------------
     def serve(self) -> None:
@@ -155,7 +158,12 @@ class Node:
                     threading.Thread(target=self.prepare_round, args=(msg,), daemon=True).start()
                 elif msg["type"] == "jobs":
                     self.take_jobs(msg)
+                elif msg["type"] == "abort":                  # main ended the round: stop its work, report nothing
+                    self._aborted.add(msg["round_id"])
+                    self.executor.end_round(msg["round_id"])
             for cs in self.executor.poll(0.5):
+                if cs.round_id in self._aborted:
+                    continue
                 if cs.ok:
                     self._to_score.put(cs)
                 else:

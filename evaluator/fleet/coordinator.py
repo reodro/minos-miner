@@ -114,6 +114,7 @@ class FleetExecutor:
         self._cancelled = set()
         self._rounds: Dict[str, _Published] = {}
         self._sessions: Dict[str, _Session] = {}
+        self._ended = set()                                      # round ids ended by end_round()
         self._stopping = False
         LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -213,6 +214,8 @@ class FleetExecutor:
             self._fail_if_unservable(msg["round_id"])
         elif t == "result":
             cs = codec.callset_from(msg["callset"])
+            if cs.round_id in self._ended:
+                return                                            # the round is over; its jobs were already freed
             job = s.jobs.pop(cs.job_id, None)
             for g in s.groups:
                 g.discard(cs.job_id)
@@ -319,6 +322,33 @@ class FleetExecutor:
     def cancel(self, job_ids: Iterable[str]) -> None:
         with self._lock:
             self._cancelled.update(job_ids)
+
+    def end_round(self, round_id: str) -> None:
+        """The round is over: drop its queued jobs, tell every node holding its work to abort (the node kills those
+        GATK containers), and free those workers at once for the next round. Late results for it are ignored."""
+        with self._cv:
+            self._ended.add(round_id)
+            keep = []
+            for item in self._queue:
+                job = item[2]
+                if job.round.round_id == round_id:
+                    self._inflight.pop(job_key(job), None)
+                    self._waiters.pop(job_key(job), None)
+                else:
+                    keep.append(item)
+            self._queue = keep
+            heapq.heapify(self._queue)
+            for s in self._sessions.values():
+                mine = [jid for jid, j in s.jobs.items() if j.round.round_id == round_id]
+                if not mine:
+                    continue
+                for jid in mine:
+                    self._inflight.pop(job_key(s.jobs.pop(jid)), None)
+                for g in s.groups:
+                    g.difference_update(mine)
+                s.groups = [g for g in s.groups if g]
+                s.send({"type": "abort", "round_id": round_id})
+            self._pump()
 
     def cost_hint(self, job: EvalJob) -> float:
         return self.cost_hints([job])[0]

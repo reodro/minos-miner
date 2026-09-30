@@ -108,6 +108,10 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   downloads the BAM from the presigned URL itself.
 - **Failure**: when a session ends (node died, network dropped), that node's unfinished jobs go straight back to the
   queue; main reconnects later. When main stops, every node stops and kills the GATK containers it started.
+- **End of round**: after the final submission main calls `end_round`: queued jobs of the round are dropped and every
+  node holding its work gets "abort" - it drops the round's local queue, kills exactly that round's containers
+  (names carry the round tag) and reports nothing more for it, so all workers are free at the start of the next round.
+  `LocalExecutor.end_round` does the same on one machine.
 - **Node side**: `LocalExecutor` (batching, divergence repair, dedup) + `DecisionCacheScorer` threads; only scores
   travel back (~1 KB per result), VCFs stay on the node.
 - **Setup a node**: `control provision` copies the repo and **main's reference genomes** (rsync), then runs
@@ -133,6 +137,9 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   multi-parameter families, deep and non-deep rounds). All exactness tests so far used 3 base configs.
 - **Family cost cap / splitting**: a batch's time is solo + sum of variant costs; split families that would run
   longer than ~4-5 min and spread them over idle workers.
+- **End-of-round scheduling**: in the last minutes, do not start a job whose expected runtime (solo ~132 s at load,
+  a batch ~ solo + its variants' costs) exceeds the time left before the final submission - it would only be killed
+  by `end_round`. Prefer cheap work then (genotyping variants of the best configs, +1.4 s each).
 
 ## Ideas (not planned; decide with data)
 

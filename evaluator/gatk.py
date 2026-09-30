@@ -163,7 +163,8 @@ class GatkRunner:
         self.work_dir = Path(work_dir or os.path.join(SETTINGS.cache_dir, "callsets"))
         self.threads, self.memory_gb, self.timeout_s = threads, memory_gb, timeout_s
         self.patch_jar = Path(patch_jar).resolve() if patch_jar else None
-        self.container_prefix = container_prefix     # names this runner's containers, so its owner can stop them
+        self.container_prefix = container_prefix     # containers are named <prefix>-<round tag>-<id>, so the owner can
+                                                     # stop all of them, or exactly one round's (kill_round)
 
     def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path, jvm_props: Optional[dict] = None) -> list:
         from templates.tool_params import validate_and_build_flags   # upstream
@@ -172,7 +173,7 @@ class GatkRunner:
             raise ValueError("; ".join(flags["errors"]))
         bam, ref = Path(round.bam).resolve(), Path(round.reference).resolve()
         heap = f"-Xmx{max(512, int(self.memory_gb * 1024 * 0.8))}m"
-        cmd = ["docker", "run", "--rm", "--name", f"{self.container_prefix}-{uuid.uuid4().hex[:10]}",
+        cmd = ["docker", "run", "--rm", "--name", f"{self.container_prefix}-{round.tag}-{uuid.uuid4().hex[:10]}",
                f"--cpus={self.threads}", f"--memory={self.memory_gb}g",
                "-v", f"{bam.parent}:/data/bams:ro", "-v", f"{ref.parent}:/data/reference:ro",
                "-v", f"{out_vcf.parent}:/data/output"]
@@ -191,6 +192,15 @@ class GatkRunner:
         for a in SAFE_ANNOTATION_EXCLUSIONS:
             cmd += ["-AX", a]
         return cmd
+
+    def kill_round(self, round_id: str) -> int:
+        """Kill this runner's running containers of one round (the round is over: their results are useless)."""
+        tag = Round.tag_of(round_id)
+        ids = subprocess.run(["docker", "ps", "-q", "--filter", f"name={self.container_prefix}-{tag}-"],
+                             capture_output=True, text=True).stdout.split()
+        if ids:
+            subprocess.run(["docker", "kill", *ids], capture_output=True)
+        return len(ids)
 
     def _docker(self, cmd: list) -> subprocess.CompletedProcess:
         """Run a GATK container; on timeout also kill the container (killing the docker client leaves it running)."""

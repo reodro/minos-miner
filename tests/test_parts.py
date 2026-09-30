@@ -405,3 +405,28 @@ class RoundSafetyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EndRoundTest(unittest.TestCase):
+    def test_local_executor_drops_and_kills_the_rounds_work(self):
+        r = ranges(); d = r.defaults("gatk").params
+        killed = []
+
+        class Slow(FakeRunner):
+            def run(self, round, config, fidelity=FULL):
+                time.sleep(0.5)
+                return super().run(round, config, fidelity)
+
+            def kill_round(self, round_id):
+                killed.append(round_id)
+
+        ex = LocalExecutor(Slow(r), workers=1)
+        ex.submit([EvalJob(f"j{i}", ROUND, Config("gatk", {**d, "min_pruning": p})) for i, p in enumerate((3, 4, 5))])
+        time.sleep(0.1)                                   # j0 is running, j1/j2 are queued
+        ex.end_round(ROUND.round_id)
+        self.assertEqual(killed, [ROUND.round_id])
+        got = []
+        for _ in range(4):
+            got += ex.poll(0.4)
+        self.assertEqual(got, [])                          # neither the running job nor the queued ones report
+        self.assertEqual(ex.idle_slots(), 1)

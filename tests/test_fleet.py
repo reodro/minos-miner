@@ -114,6 +114,17 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(len(got), len(jobs))
         self.assertTrue(all(cs.ok for cs in got.values()))
 
+    def test_end_round_frees_every_node_at_once(self):
+        ex = self.fleet(("a", 2, {"MINOS_FAKE_DELAY": "30"}), ("b", 2, {"MINOS_FAKE_DELAY": "30"}))
+        self.wait_ready(2)
+        ex.submit([EvalJob(f"j{i}", self.round, c) for i, c in enumerate(self.others + self.family)])
+        time.sleep(1.0)
+        self.assertGreater(sum(n["open_groups"] for n in ex.nodes()), 0)
+        ex.end_round(self.round.round_id)
+        self.assertEqual(sum(n["open_groups"] for n in ex.nodes()), 0)     # workers free for the next round
+        self.assertEqual(ex.idle_slots(), 4)
+        self.assertEqual(self.wait(1, timeout=3), {})                      # nothing of the ended round arrives
+
     def test_a_round_no_node_can_prepare_fails_its_jobs(self):
         ex = self.fleet(("noref", 2, {}), reference=False)          # the node lacks the round's reference genome
         t0 = time.time()

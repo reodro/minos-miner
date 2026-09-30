@@ -154,7 +154,10 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
             except Exception:  # noqa: BLE001
                 pass
         maybe_submit(force=True)                  # last chance: the best found so far, whatever the interval
-        if client.in_flight:                      # nobody will read them: free the workers for the next round
+        end = getattr(executor, "end_round", None)  # nobody will read this round's results any more: free every
+        if end:                                   # worker (queued jobs dropped, running containers killed)
+            end(round.round_id)
+        elif client.in_flight:
             executor.cancel(list(client._pending))
         task.cancel()
         try:

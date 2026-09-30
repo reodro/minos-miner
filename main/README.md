@@ -15,6 +15,8 @@ Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatfor
 3. **Submissions**: a better config is resubmitted at most every `resubmit_interval_s` (300 s live - on-chain
    commitments are rate-limited); the best config found is submitted once more just before the loop stops.
 4. Scoring runs in a background thread in packed batches, so GATK workers stay fed while hap.py runs.
+5. Round end: after the final submission the executor ends the round (`end_round`): its queued jobs are dropped and
+   its running GATK containers killed, locally or on every fleet node, so the next round starts with every worker free.
 
 ## Live platform (`miner.UpstreamPlatform`)
 
