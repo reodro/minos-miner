@@ -207,6 +207,9 @@ class BatchingExecutorTest(unittest.TestCase):
         def branch_key(self, config, fidelity):
             return Config("gatk", {k: v for k, v in config.params.items() if k != self.GT}).key + fidelity
 
+        def variant_cost(self, main, variant, fidelity):
+            return 0.02 if self.branch_key(main, fidelity) == self.branch_key(variant, fidelity) else None
+
         def run(self, round, config, fidelity):
             time.sleep(0.05)
             self.solo.append(config.key)
@@ -239,7 +242,7 @@ class BatchingExecutorTest(unittest.TestCase):
         jobs = [EvalJob(f"c{i}", ROUND, c) for i, c in enumerate(conf)] + [EvalJob("o", ROUND, other)]
         self.assertEqual(ex.cost_hint(jobs[0]), 1.0)
         ex.submit(jobs[:1])
-        self.assertEqual(ex.cost_hint(jobs[1]), 0.01)              # would ride along with c0
+        self.assertEqual(ex.cost_hint(jobs[1]), 0.02)              # would ride along with c0: the runner's variant cost
         ex.submit(jobs[1:])
         got = self.drain(ex, 6)
         self.assertEqual(len(got), 6)

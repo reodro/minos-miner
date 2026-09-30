@@ -63,6 +63,11 @@ ASSEMBLY_DEFAULTS = {"min_pruning": 2, "min_dangling_branch_length": 4, "recover
 ACTIVITY_BRANCH_PARAMS = ("active_probability_threshold", "min_assembly_region_size", "max_assembly_region_size")
 ACTIVITY_DEFAULTS = {"active_probability_threshold": 0.002, "min_assembly_region_size": 50, "max_assembly_region_size": 300}
 BRANCH_PARAMS = GENOTYPING_BRANCH_PARAMS + PAIRHMM_BRANCH_PARAMS + ASSEMBLY_BRANCH_PARAMS + ACTIVITY_BRANCH_PARAMS
+# Extra cost of one batch variant, as a fraction of a solo run, by the most expensive stage it changes
+# (measured at production load by test/timing_tiers.py). A variant that differs in several tiers pays the highest.
+VARIANT_COST = {"genotyping": 0.011, "pairhmm": 0.12, "assembly": 0.55, "activity": 0.59}   # 1.4 / 16.3 / 72 / 78 s of 132 s (14 workers, 16 cores)
+_TIER_OF = {**{p: "genotyping" for p in GENOTYPING_BRANCH_PARAMS}, **{p: "pairhmm" for p in PAIRHMM_BRANCH_PARAMS},
+            **{p: "assembly" for p in ASSEMBLY_BRANCH_PARAMS}, **{p: "activity" for p in ACTIVITY_BRANCH_PARAMS}}
 def variant_line(config: Config, output: str) -> str:
     """One line of the patch's variants file: output path, then every branch parameter (config value or default)."""
     def fmt(v):
@@ -164,6 +169,15 @@ class GatkRunner:
             return None
         shared = {k: v for k, v in config.params.items() if k not in BRANCH_PARAMS}
         return Config("gatk", shared).key + ":" + fidelity
+
+    def variant_cost(self, main: Config, variant: Config, fidelity: str = FULL) -> Optional[float]:
+        """Extra cost of evaluating `variant` inside `main`'s batch, as a fraction of a solo run. None = not batchable."""
+        key = self.branch_key(main, fidelity)
+        if key is None or key != self.branch_key(variant, fidelity):
+            return None
+        defaults = {**GENOTYPING_DEFAULTS, **PAIRHMM_DEFAULTS, **ASSEMBLY_DEFAULTS, **ACTIVITY_DEFAULTS}
+        changed = [p for p in BRANCH_PARAMS if main.params.get(p, defaults[p]) != variant.params.get(p, defaults[p])]
+        return max((VARIANT_COST[_TIER_OF[p]] for p in changed), default=0.0)
 
     def run_batch(self, round: Round, configs: List[Config], fidelity: str = FULL) -> List[CallSet]:
         """One patched run: configs[0] is the main output, the rest are genotyping variants.

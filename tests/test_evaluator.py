@@ -91,3 +91,19 @@ class WorkersRuleTest(unittest.TestCase):
         from common.settings import default_workers
         with mock.patch.dict(os.environ, {"MINOS_WORKERS": ""}):
             self.assertEqual([default_workers(c) for c in (2, 8, 16, 32, 64, 128)], [1, 6, 14, 29, 59, 120])
+
+
+class VariantCostTest(unittest.TestCase):
+    def test_most_expensive_changed_stage_sets_the_cost(self):
+        from evaluator.gatk import VARIANT_COST
+        r = GatkRunner(patch_jar="/nonexistent.jar")
+        base = Config("gatk", {"min_pruning": 2})
+        self.assertEqual(r.variant_cost(base, base), 0.0)
+        gt = Config("gatk", {"min_pruning": 2, "standard_min_confidence_threshold_for_calling": 40.0})
+        self.assertEqual(r.variant_cost(base, gt), VARIANT_COST["genotyping"])
+        mixed = Config("gatk", {"min_pruning": 3, "pair_hmm_gap_continuation_penalty": 12})
+        self.assertEqual(r.variant_cost(base, mixed), max(VARIANT_COST["assembly"], VARIANT_COST["pairhmm"]))
+        self.assertEqual(r.variant_cost(base, Config("gatk", {"min_pruning": 2, "active_probability_threshold": 0.004})),
+                         VARIANT_COST["activity"])
+        self.assertIsNone(r.variant_cost(base, Config("gatk", {"min_pruning": 2, "assembly_region_padding": 50})))
+        self.assertIsNone(GatkRunner().variant_cost(base, gt))          # no patch jar: nothing batches

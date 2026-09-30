@@ -149,16 +149,19 @@ class LocalExecutor:
             self._cancelled.update(job_ids)
 
     def cost_hint(self, job: EvalJob) -> float:
-        """0 if done or in flight; ~0.01 if a queued job would carry it in the same batch; else 1."""
+        """0 if done or in flight; if a queued job would carry it in its batch, the runner's variant cost
+        (a fraction of a solo run, by the most expensive GATK stage it changes); else 1."""
         with self._lock:
             k = job_key(job)
             if k in self._done or k in self._inflight:
                 return 0.0
             bk = self._branch(job)
-            if bk is not None and any(self._branch(q[2]) == bk and q[2].round.round_id == job.round.round_id
-                                      for q in self._queue):
-                return 0.01
-            return 1.0
+            if bk is None:
+                return 1.0
+            costs = [self.runner.variant_cost(q[2].config, job.config, job.fidelity) for q in self._queue
+                     if q[2].round.round_id == job.round.round_id and self._branch(q[2]) == bk]
+            costs = [c for c in costs if c is not None]
+            return min(costs, default=1.0)
 
     def idle_slots(self) -> int:
         with self._lock:
