@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import urllib.request
@@ -51,7 +52,7 @@ def load(tag: str, reference: str = "") -> Round:
         meta = json.load(fh)
     chrom, start, end = Round.parse_region(meta["region"])
     return Round(meta["round_id"], chrom, start, end, bam=os.path.join(d, "input.bam"),
-                 reference=reference, released_dir=d)
+                 reference=reference, released_dir=d)   # n_targets stays None: unknown live, like here
 
 
 def field_scores(tag: str) -> List[float]:

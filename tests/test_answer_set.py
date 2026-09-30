@@ -68,3 +68,43 @@ class ProviderEndToEndTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyntheticClassifyTest(unittest.TestCase):
+    """Parent-based decisions: absent in the parent -> injected (p=1), present -> real donor variant (dropped)."""
+
+    class FakeParent:
+        def __init__(self, counts):
+            self.c = counts
+
+        def counts(self, pos, ref, alt):
+            return self.c.get(pos, (0, 0))
+
+    def test_rules(self):
+        from answer_set.synthetic import Candidate, classify
+        from common.types import Round, Variant
+        r = Round("2026-09-28T08:17:00+00:00", "chr1", 1, 1000, "", "")
+        cands = [Candidate(10, "A", "G", 10, 20),      # parent ref only -> injected
+                 Candidate(20, "C", "T", 10, 20),      # parent shows alt -> real donor variant
+                 Candidate(30, "G", "A", 10, 20),      # parent too thin -> uncertain
+                 Candidate(40, "T", "C", 1, 30),       # too weak in the round
+                 Candidate(50, "A", "AT", 19, 20),     # germline allele
+                 Candidate(60, "C", "A", 19, 20)]      # injected, hom
+        parent = self.FakeParent({10: (0, 25), 20: (12, 25), 30: (0, 3), 60: (0, 30)})
+        germ = [Variant("chr1", 50, "A", "AT,ATT", "1/2")]
+        out, stats = classify(r, cands, parent, germ)
+        got = {s.variant.pos: (s.p, s.variant.gt) for s in out}
+        self.assertEqual(got, {10: (1.0, "0/1"), 30: (0.5, "0/1"), 60: (1.0, "1/1")})
+        self.assertEqual((stats["donor_real"], stats["weak"], stats["germline"]), (1, 1, 1))
+        out, _ = classify(r, cands[:1], None, [])                      # no parent at all -> uncertain
+        self.assertEqual([s.p for s in out], [0.5])
+
+    def test_germline_keys_match_bcftools_norm(self):
+        from answer_set.synthetic import germline_keys
+        from common.types import Variant
+        self.assertEqual(germline_keys([Variant("chr1", 100, "TCA", "TCACA,T", "1/2")]),
+                         {(100, "T", "TCA"), (100, "TCA", "T")})
+
+    def test_canonical_gt(self):
+        from answer_set.giab import canonical_gt
+        self.assertEqual([canonical_gt(g) for g in ("1|0", "0/1", "2|1", "1/1")], ["0/1", "0/1", "1/2", "1/1"])

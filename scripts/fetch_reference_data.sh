@@ -76,4 +76,17 @@ export OUT RAW
 
 printf '%s\n' $CHROMS | xargs -P "$PARALLEL" -I{} bash -c 'fetch_raw {}'
 wait
+
+# 1000G 30x CRAM locations (answer_set.parent reads the donor's CRAM from the S3 mirror by region)
+KGHC=https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage
+mkdir -p "$OUT/cram_index"
+for f in 1000G_2504_high_coverage.sequence.index 1000G_698_related_high_coverage.sequence.index; do
+  fetch_plain "$KGHC/$f" "$OUT/cram_index/$f"
+done
+
+# GIAB NIST v4.2.1 calls must be indexed for region queries (answer_set.giab)
+GIAB_DIR="$(dirname "$OUT")/giab"
+if [ -d "$GIAB_DIR" ]; then
+  for v in "$GIAB_DIR"/HG00?.vcf.gz; do [ -f "$v.tbi" ] || bcftools index -t -f "$v"; done
+fi
 log "all done"

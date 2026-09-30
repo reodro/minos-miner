@@ -6,6 +6,7 @@ Fitted on 36 rounds (2026-09-26..28): 0 missing, 0 extra, 0 genotype disagreemen
 from __future__ import annotations
 
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, List, Tuple
 
 from common.settings import SETTINGS
@@ -42,16 +43,24 @@ def parse_query(chrom: str, lines: Iterable[str], rule: dict = KG_RULE) -> List[
     return out
 
 
-def kg_germline(round: Round, sample: str, rule: dict = KG_RULE) -> List[Variant]:
+def kg_germline(round: Round, sample: str, rule: dict = KG_RULE, chunks: int = 8) -> List[Variant]:
+    """The sample's raw calls in the region, filtered by the rule. Queried in parallel chunks (one query of a
+    3202-sample file takes ~30 s); records overlapping two chunks are kept once, so the result equals one query."""
     raw = f"{SETTINGS.kg_dir}/raw/{round.chrom}.vcf.gz"
-    txt = subprocess.run(
-        f"bcftools view -r {round.region} -s {sample} {raw} "
-        f"| bcftools query -f '%POS\\t%REF\\t%ALT\\t%FILTER[\\t%GT\\t%DP\\t%GQ]\\n'",
-        shell=True, capture_output=True, text=True, check=True).stdout
-    return parse_query(round.chrom, txt.splitlines(), rule)
+    step = (round.end - round.start) // chunks + 1
+    spans = [(a, min(a + step - 1, round.end)) for a in range(round.start, round.end + 1, step)]
 
+    def one(span):
+        return subprocess.run(
+            f"bcftools query -r {round.chrom}:{span[0]}-{span[1]} -s {sample} "
+            f"-f '%POS\\t%REF\\t%ALT\\t%FILTER[\\t%GT\\t%DP\\t%GQ]\\n' {raw}",
+            shell=True, capture_output=True, text=True, check=True).stdout.splitlines()
 
-def giab_germline(round: Round) -> Tuple[str, List[Variant]]:
-    """SMOKE ONLY. GIAB regime: germline = NIST v4.2.1 calls of one of HG001-HG007 (verified exact on
-    65 rounds, 2026-09-23..26). TODO: identify the donor against the 7 NIST sets and return its calls."""
-    return "", []
+    with ThreadPoolExecutor(len(spans)) as pool:
+        lines = [line for part in pool.map(one, spans) for line in part]
+    seen, uniq = set(), []
+    for line in lines:
+        k = line.split("\t", 3)[:3]
+        if tuple(k) not in seen:
+            seen.add(tuple(k)); uniq.append(line)
+    return parse_query(round.chrom, uniq, rule)
