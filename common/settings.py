@@ -10,7 +10,6 @@ class Settings:
     data_dir: str = "/minos/data"                      # rounds/, giab/, panel/, cache/ - never in git
     minos_subnet_dir: str = "/minos/minos_subnet"      # upstream repo (scoring formula, templates)
     platform_url: str = "https://api.theminos.ai"
-    files_url: str = "https://rounds.minosproxy.com"   # released round files
 
     @property
     def rounds_dir(self) -> str:
@@ -18,7 +17,7 @@ class Settings:
 
     @property
     def kg_dir(self) -> str:
-        """1000G data from scripts/fetch_reference_data.sh: raw/, phased/, mask/."""
+        """1000G data from scripts/fetch_reference_data.sh: raw/, phased/, cram_index/."""
         return os.path.join(self.data_dir, "1kg")
 
     @property

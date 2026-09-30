@@ -34,11 +34,17 @@ def sh(h: Host, cmd: str, timeout: int = 600) -> subprocess.CompletedProcess:
 
 
 def copy_repo(h: Host) -> None:
-    sh(h, f"mkdir -p {shlex.quote(h.repo)}")
-    p = subprocess.run(h.rsync([f"{REPO}/"], f"{h.repo}/", "--delete", *EXCLUDES), capture_output=True, text=True,
-                       timeout=1800)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr[-300:])
+    """This repo and main's copy of the upstream minos_subnet (score formula, templates), so a node can never run a
+    different upstream version than main."""
+    up = SETTINGS.minos_subnet_dir
+    sh(h, f"mkdir -p {shlex.quote(h.repo)} {shlex.quote(up)}")
+    for src, dst, extra in ((REPO, h.repo, EXCLUDES),
+                            (up, up, ["--exclude", ".git/", "--exclude", ".venv/", "--exclude", "datasets/",
+                                      "--exclude", "__pycache__/"])):
+        p = subprocess.run(h.rsync([f"{src}/"], f"{dst}/", "--delete", *extra), capture_output=True, text=True,
+                           timeout=1800)
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr[-300:])
 
 
 def status(h: Host) -> dict:

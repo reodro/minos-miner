@@ -73,13 +73,6 @@ class ScoringTest(unittest.TestCase):
         self.assertFalse(gate)
         self.assertEqual(score, 0.0)
 
-    def test_matches_platform_row(self):
-        # Round 2026-09-28T08:17 winner: fp_per_target 1.2920792 (783/606), score 89.29780172806021.
-        # Back-solved core from the published score must reproduce the published score.
-        germ = math.exp(-(783 / 606) / 8)
-        core = (89.29780172806021 / 100 - 0.30 * germ) / 0.70
-        self.assertAlmostEqual(100 * (0.70 * core + 0.30 * germ), 89.29780172806021, places=9)
-
 
 if __name__ == "__main__":
     unittest.main()

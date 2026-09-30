@@ -1,7 +1,9 @@
 # Replace @owner-a/@owner-b/@owner-c/@owner-d with GitHub handles once parts are assigned.
-/common/      @owner-a @owner-b @owner-c
+/common/      @owner-a @owner-b @owner-c @owner-d
 /answer_set/  @owner-a
 /evaluator/   @owner-b
 /search/      @owner-d
 /main/        @owner-c
-/backtest/    @owner-a @owner-b @owner-c
+/backtest/    @owner-a @owner-b @owner-c @owner-d
+/scripts/     @owner-a @owner-b
+/tests/       @owner-a @owner-b @owner-c @owner-d

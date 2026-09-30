@@ -60,10 +60,6 @@ class GatkEndToEndTest(unittest.TestCase):
         self.assertAlmostEqual(res.score / 100, 0.7665917881, places=10)   # a published validator score
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class VariantFileTest(unittest.TestCase):
     """The patch reads variant columns by position: 1-4 genotyping, 5-8 PairHMM, 9-14 assembly, 15-17 activity."""
 
@@ -138,3 +134,7 @@ class GvcfNotBatchedTest(unittest.TestCase):
         r = GatkRunner(patch_jar="/nonexistent.jar")
         self.assertIsNone(r.branch_key(Config("gatk", {"emit_ref_confidence": "GVCF"})))
         self.assertIsNotNone(r.branch_key(Config("gatk", {"emit_ref_confidence": "NONE"})))
+
+
+if __name__ == "__main__":
+    unittest.main()

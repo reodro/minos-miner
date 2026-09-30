@@ -107,7 +107,8 @@ class ScorerContractTest(unittest.TestCase):
         self.assertEqual(v1.sdf, "/r/chr1.sdf")
 
 
-@unittest.skipUnless(os.environ.get("RUN_SLOW") and os.path.exists(os.path.join(SETTINGS.rounds_dir, SLOW_TAG)),
+@unittest.skipUnless(os.environ.get("RUN_SLOW") and os.path.exists(os.path.join(SETTINGS.rounds_dir, SLOW_TAG))
+                     and os.path.isdir(BENCH),
                      f"set RUN_SLOW=1 (needs round {SLOW_TAG}, bench callsets, docker hap.py; ~2 min)")
 class DecisionCacheExactnessTest(unittest.TestCase):
     def test_equals_happy_scorer(self):

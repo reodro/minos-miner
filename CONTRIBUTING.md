@@ -35,8 +35,9 @@ Four parts, three people. These rules keep us from breaking each other - and, ab
 ## 4. How the parts may depend on each other
 
 - `common/types.py` is the **contract**. Changing it needs agreement from all owners (it breaks the others).
-- `answer_set`, `evaluator` and `search` do not import each other's internals. `main` wires them together through
-  their public APIs (`__init__.py`). `search` talks to evaluation only through `EvalClient`.
+- `answer_set`, `evaluator` and `search` do not import each other. `main` wires them together, importing only what
+  each part's README lists as its public API (package `__init__`, `base.py` protocols, and named modules such as
+  `evaluator.fleet`). `search` talks to evaluation only through `EvalClient`.
 - If you need something from another part, add it to that part's public API (ask its owner) instead of reaching in.
 
 ## 5. Git

@@ -5,7 +5,6 @@
 #                FORMAT reduced to GT:AD:DP:GQ (PL and AB dropped, ~53% of original).
 #                Streamed through bcftools: the ~395 GB original is never stored.
 #   1kg/phased/  2022 phased panel (donor fingerprinting)
-#   1kg/mask/    1000G StrictMask (synthetic sites fall 100% inside "P")
 #
 #   bash scripts/fetch_reference_data.sh                 # chr14-22
 #   CHROMS="1 2 3" bash scripts/fetch_reference_data.sh  # others
@@ -19,9 +18,8 @@ PARALLEL="${PARALLEL:-4}"
 KG=http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections
 RAW=$KG/1000G_2504_high_coverage/working/20201028_3202_raw_GT_with_annot
 PHASED=$KG/1000G_2504_high_coverage/working/20220422_3202_phased_SNV_INDEL_SV
-MASK=$KG/1000_genomes_project/working/20160622_genome_mask_GRCh38/StrictMask
 OUT="$DATA_DIR/1kg"
-mkdir -p "$OUT"/{raw,phased,mask,logs}
+mkdir -p "$OUT"/{raw,phased,logs}
 
 log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$OUT/logs/fetch.log"; }
 
@@ -69,9 +67,8 @@ export OUT RAW
     p="1kGP_high_coverage_Illumina.chr$c.filtered.SNV_INDEL_SV_phased_panel.vcf.gz"
     fetch_plain "$PHASED/$p" "$OUT/phased/chr$c.vcf.gz"
     fetch_plain "$PHASED/$p.tbi" "$OUT/phased/chr$c.vcf.gz.tbi"
-    fetch_plain "$MASK/20160622.chr$c.mask.fasta.gz" "$OUT/mask/chr$c.strict.fa.gz"
   done
-  log "panels and masks done"
+  log "panels done"
 ) &
 
 printf '%s\n' $CHROMS | xargs -P "$PARALLEL" -I{} bash -c 'fetch_raw {}'

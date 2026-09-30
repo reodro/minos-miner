@@ -1,8 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "minos-miner"
 version = "0.1.0"
 requires-python = ">=3.10"
 description = "Miner for Bittensor subnet 107 (Minos)"
 
-[tool.setuptools]
-packages = ["common", "answer_set", "evaluator", "search", "main", "backtest"]
+[tool.setuptools.packages.find]
+include = ["common*", "answer_set*", "evaluator*", "search*", "main*", "backtest*"]
+
+[tool.setuptools.package-data]
+"evaluator.fleet" = ["selftest.json"]

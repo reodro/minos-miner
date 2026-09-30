@@ -78,7 +78,7 @@ docker pull quay.io/biocontainers/samtools:1.20--h50ea8bc_0   # parent-read slic
 
 bash evaluator/gatk_patch/build.sh              # GATK batching patch -> evaluator/gatk_patch/build/minos-patch.jar
 bash scripts/fetch_genome.sh                    # GRCh38 chr1-22: FASTA, index, dict, SDF (validator's files)
-bash scripts/fetch_reference_data.sh            # 1000G callsets/panels/masks + CRAM indexes into $DATA_DIR
+bash scripts/fetch_reference_data.sh            # 1000G raw callset + panel + CRAM indexes (chr14-22 by default)
 .venv/bin/python -m backtest.data --last 20     # released rounds (BAM + truth) for backtests
 ```
 
@@ -88,7 +88,7 @@ Data never goes in git; it lives under `DATA_DIR` (default `/minos/data`). The G
 ## Everyday commands
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -t .              # unit tests (~7 s); RUN_SLOW=1 adds GATK tests
+.venv/bin/python -m unittest discover -s tests -t .              # unit tests (~20 s); RUN_SLOW=1 adds GATK tests
 .venv/bin/python -m main replay 20260928T092900Z --minutes 20     # whole miner on a stored round, dry-run
 .venv/bin/python -m main live --wallet W --hotkey H --demo        # live miner (untested; demo mode first)
 ```

@@ -177,7 +177,6 @@ class StoreTest(unittest.TestCase):
         s.add(res, Config("gatk", {"min_pruning": 3}), 12.0, "ga")
         self.assertEqual(s.results("r1"), [res])
         self.assertEqual(s.results("r1", answer_set_version=1), [])
-        self.assertEqual(s.configs("r1"), [Config("gatk", {"min_pruning": 3})])
 
 
 class KpiTest(unittest.TestCase):
@@ -197,10 +196,6 @@ class OracleTest(unittest.TestCase):
         a = OracleProvider().build(r)
         self.assertEqual((len(a.germline), len(a.synthetic), a.n_targets), (14744, 5056, 606))
         self.assertIs(OracleProvider().update(a, [CallSet(r.round_id, "k", "", "", 0)]), a)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class BatchingExecutorTest(unittest.TestCase):
@@ -406,3 +401,7 @@ class RoundSafetyTest(unittest.TestCase):
             client.deliver(other)                                # same job id, other round: must not resolve it
             return fut.done(), client.in_flight
         self.assertEqual(asyncio.run(go()), (False, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()

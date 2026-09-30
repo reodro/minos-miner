@@ -28,7 +28,7 @@ def fetch(round_id: str, platform: Optional[Platform] = None, with_bam: bool = T
     ver = p.verification(round_id)
     if "reveal" not in ver:
         raise RuntimeError(f"{round_id} not revealed yet")
-    tag = round_id[:19].replace("-", "").replace(":", "") + "Z"
+    tag = Round.tag_of(round_id)
     d = round_dir(tag)
     os.makedirs(d, exist_ok=True)
     for f in ver["reveal"]["files"]:
@@ -77,6 +77,8 @@ def discover(since: str, platform: Optional[Platform] = None, max_missing: int =
     import urllib.error
     p = platform or Platform()
     recent = [r for r in p.rounds(limit=100) if r.get("is_finalized")]
+    if not recent:
+        return []
     ids = [r["round_id"] for r in recent]
     t = dt.datetime.fromisoformat(recent[-1]["round_id"])
     stop = dt.datetime.fromisoformat(since)

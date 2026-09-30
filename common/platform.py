@@ -23,9 +23,6 @@ class Platform:
     def _rid(round_id: str) -> str:
         return urllib.parse.quote(round_id, safe="")
 
-    def network_config(self) -> dict:
-        return self._get("/scoring/network-config")
-
     def parameter_ranges(self) -> dict:
         return self._get("/scoring/parameter-ranges")
 

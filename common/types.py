@@ -1,6 +1,6 @@
-"""Shared contracts between answer_set, evaluator and main.
+"""Shared contracts between answer_set, evaluator, search and main.
 
-Changing anything in this file changes the interface for all three parts:
+Changing anything in this file changes the interface for every part:
 it goes through a PR reviewed by every owner.
 """
 from __future__ import annotations
@@ -41,7 +41,11 @@ class Round:
     @property
     def tag(self) -> str:
         """Directory-safe id used by the platform's file host: 20260928T081700Z."""
-        return self.round_id[:19].replace("-", "").replace(":", "") + "Z"
+        return Round.tag_of(self.round_id)
+
+    @staticmethod
+    def tag_of(round_id: str) -> str:
+        return round_id[:19].replace("-", "").replace(":", "") + "Z"
 
     @staticmethod
     def parse_region(region: str):

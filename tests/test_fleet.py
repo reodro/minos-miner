@@ -2,12 +2,15 @@
 a family is one group, a node that dies mid-work has its jobs re-queued, bad nodes are rejected."""
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from common.types import AnswerSet, Config, EvalJob, Regime, Round
+from common.settings import SETTINGS
+from evaluator.fleet import selftest
 from evaluator.fleet.coordinator import FleetExecutor
 from evaluator.fleet.inventory import REPO
 from tests.helpers import ranges
@@ -25,9 +28,14 @@ class Planner:
         return 0.01 if self.branch_key(main, fidelity) == self.branch_key(variant, fidelity) else None
 
 
+SELFTEST_SOURCE = Path(SETTINGS.rounds_dir) / selftest.spec()["tag"] / "input.bam"
+
+
+@unittest.skipUnless(SELFTEST_SOURCE.exists(), "needs main's stored round for the self-test bundle")
 class FleetTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
         main = self.tmp / "main"
         (main / "rounds" / "r").mkdir(parents=True)
         for f in ("input.bam", "input.bam.bai"):
@@ -58,7 +66,6 @@ class FleetTest(unittest.TestCase):
                         "workers": workers, "node_args": "--fake", "env": env})
         path = self.tmp / "fleet.json"
         path.write_text(json.dumps(inv))
-        os.environ.setdefault("DATA_DIR", "/minos/data")      # main's own data (self-test bundle source)
         self.ex = FleetExecutor(Planner(), inventory=path, reconnect_s=3600).start()
         self.ex.publish_round(self.round, self.aset)
         return self.ex
@@ -182,6 +189,7 @@ class PassphraseTest(unittest.TestCase):
         import subprocess
         from evaluator.fleet.inventory import ensure_agent, load
         d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
         key = d / "k"
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "pw-123", "-f", str(key)], check=True)
         inv = d / "fleet.json"

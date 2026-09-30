@@ -14,7 +14,8 @@ apt-get install -y -q docker.io curl git rsync ca-certificates
 apt-get install -y -q openjdk-17-jdk-headless || apt-get install -y -q default-jdk-headless   # javac --release 17
 systemctl enable --now docker
 
-# upstream repo: scoring formula and the validator's templates
+# upstream repo (scoring formula, the validator's templates): `control provision/sync` copies main's exact version;
+# cloned only when run by hand on a machine that has none
 [ -d /minos/minos_subnet ] || git clone -q https://github.com/minos-protocol/minos_subnet.git /minos/minos_subnet
 
 # python env: uv installs Python $PY (whatever the OS ships) and the exact pinned requirements

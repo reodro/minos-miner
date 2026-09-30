@@ -38,7 +38,3 @@ class ResultStore:
             q += " AND answer_set_version=?"
             args.append(answer_set_version)
         return [ScoreResult.from_dict(json.loads(r[0])) for r in self.db.execute(q, args)]
-
-    def configs(self, round_id: str) -> List[Config]:
-        rows = self.db.execute("SELECT DISTINCT config FROM results WHERE round_id=?", (round_id,))
-        return [Config.from_dict(json.loads(r[0])) for r in rows]

@@ -56,10 +56,6 @@ class ProviderEndToEndTest(unittest.TestCase):
         self.assertEqual({(v.pos, v.ref, v.alt, v.gt) for v in a.germline}, truth)       # whole records, as written
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SyntheticClassifyTest(unittest.TestCase):
     """Parent-based decisions: absent in the parent -> injected (p=1), present -> real donor variant (dropped)."""
 
@@ -98,3 +94,7 @@ class SyntheticClassifyTest(unittest.TestCase):
     def test_canonical_gt(self):
         from answer_set.giab import canonical_gt
         self.assertEqual([canonical_gt(g) for g in ("1|0", "0/1", "2|1", "1/1")], ["0/1", "0/1", "1/2", "1/1"])
+
+
+if __name__ == "__main__":
+    unittest.main()

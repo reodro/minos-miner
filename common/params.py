@@ -53,7 +53,6 @@ CROSS_CONSTRAINTS = {
 
 class ParamRanges:
     def __init__(self, raw: dict):
-        self.raw = raw
         self.tools: Dict[str, Dict[str, ParamSpec]] = {}
         for tool, spec in raw["tools"].items():
             self.tools[tool] = {

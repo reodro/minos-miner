@@ -132,7 +132,7 @@ class RoundSource(Protocol):
 def fetch_round(live: LiveRound, reference_for: Callable[[str], str], rounds_dir: Optional[str] = None) -> Round:
     """Download the round's BAM + index (presigned URLs) and describe it as a Round."""
     chrom, start, end = Round.parse_region(live.region)
-    tag = live.round_id[:19].replace("-", "").replace(":", "") + "Z"
+    tag = Round.tag_of(live.round_id)
     d = Path(rounds_dir or SETTINGS.rounds_dir) / tag
     d.mkdir(parents=True, exist_ok=True)
     for url, name in ((live.bam_url, "input.bam"), (live.bai_url, "input.bam.bai")):
