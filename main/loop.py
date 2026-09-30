@@ -54,6 +54,7 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
     out = RoundOutcome(client.answer_set.version)
     submitted: List[Optional[str]] = [None]
     last_submit = [float("-inf")]
+    last_refused = [float("-inf")]                # a refused submission (platform down, fee) is retried after 30 s
     since_update: List[CallSet] = []
 
     def maybe_submit(force: bool = False):
@@ -66,12 +67,16 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
             return
         if key is not None and not force and clock() - last_submit[0] < settings.resubmit_interval_s:
             return                            # the first submission is never delayed; later ones wait
+        if not force and clock() - last_refused[0] < 30.0:
+            return
         current = client.latest[(key, FULL)].score if key else None
         if current is None or best.score > current + settings.resubmit_margin:
             if submitter.submit(round, client.configs[best.config_key]):
                 submitted[0] = best.config_key
                 last_submit[0] = clock()
                 out.submissions.append((clock(), best.config_key, best.score))
+            else:
+                last_refused[0] = clock()
 
     def on_result(o: Outcome):
         if o.ok:
@@ -100,9 +105,10 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
     # keeps polling GATK and strategies keep proposing meanwhile. The virtual executor scores inline (deterministic).
     to_score: List[CallSet] = []
     scoring: List[Optional[asyncio.Task]] = [None]
+    stopping = [False]
 
     def start_scoring():
-        if scoring[0] is None and to_score:
+        if scoring[0] is None and to_score and not stopping[0]:
             batch = list(to_score)
             to_score.clear()
 
@@ -141,12 +147,15 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                 log.warning("strategies stalled with nothing in flight; ending round")
                 break
     finally:
+        stopping[0] = True                        # finish the batch in flight, start no new one
         if scoring[0] is not None:                # results already computed are worth submitting on
             try:
                 await scoring[0]
             except Exception:  # noqa: BLE001
                 pass
         maybe_submit(force=True)                  # last chance: the best found so far, whatever the interval
+        if client.in_flight:                      # nobody will read them: free the workers for the next round
+            executor.cancel(list(client._pending))
         task.cancel()
         try:
             await task

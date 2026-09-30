@@ -1,10 +1,12 @@
 """RF_UCB: random-forest surrogate + upper-confidence-bound picks, streaming, family-aware. Simple first version.
 
-Loop: keep every worker busy (the executor's idle_slots; `in_flight` configs if it cannot tell). Whenever one frees, refit the forest on every result the client
-has (all strategies share them), score `n_candidates` proposals - mostly local moves around the best configs so
+Loop: keep every worker busy (the executor's idle_slots; `in_flight` configs if it cannot tell). Whenever one frees,
+refit the forest (when results grew by >= 5% since the last fit) on every result the client has (all strategies share
+them), score `n_candidates` proposals - mostly local moves around the best configs so
 far, some uniform random - by mean + kappa * spread across trees, and propose the best one together with a small
 family of cheap variants of it (same config except parameters the evaluator can batch almost for free), so the
-executor runs them as one GATK job. Failed configs count as the worst score seen, so the model learns to avoid them.
+executor runs them as one GATK job. Configs this strategy proposed that failed count as the worst score seen, so the
+model learns to avoid them.
 The surrogate is scikit-learn's ExtraTreesRegressor; uncertainty is the spread of its trees' predictions.
 
 Tuning knobs are the arguments; nothing here is fitted to real rounds yet - that is the search part's work.

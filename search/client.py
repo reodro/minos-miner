@@ -3,7 +3,6 @@
     results = await client.propose_all(configs)         # wait for a batch (e.g. a GA generation)
     results = await client.propose_all(configs, quorum=0.9)  # barrier that tolerates stragglers
     fut = client.propose(config); outcome = await fut   # single config
-    async for o in client.as_completed(futures): ...    # streaming (e.g. RF_UCB refill)
 
 Many strategies run concurrently as asyncio tasks on one client, so while one waits at a barrier the others keep
 the executor busy. Failed configs come back as Outcome(ok=False); they are never raised.
@@ -82,7 +81,7 @@ class EvalClient:
             if cached is not None:
                 fut.set_result(Outcome(config, cached, None, tag))
                 continue
-            jobs.append((fut, EvalJob(f"j{next(self._ids)}", self.round, config, fidelity, priority, tag)))
+            jobs.append((fut, EvalJob(f"{self.round.tag}-j{next(self._ids)}", self.round, config, fidelity, priority, tag)))
         if not jobs:
             return futs
         hints = getattr(self.executor, "cost_hints", None)
@@ -119,10 +118,6 @@ class EvalClient:
         while len(futs) - len(pending) < need:
             _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         return [f.result() if f.done() else None for f in futs]
-
-    async def as_completed(self, futures: Iterable[asyncio.Future]):
-        for f in asyncio.as_completed(list(futures)):
-            yield await f
 
     def best(self, fidelity: str = FULL) -> Optional[ScoreResult]:
         ok = [r for (k, fid), r in self.latest.items()
@@ -162,6 +157,8 @@ class EvalClient:
 
     def complete(self, cs: CallSet, result: Optional[ScoreResult], error: Optional[str] = None) -> None:
         """Record a callset and its score (or failure), resolve the strategy's future, notify listeners."""
+        if cs.round_id != self.round.round_id or cs.config_key not in self.configs:
+            return                    # a late result of another round (a shared fleet executor outlives rounds)
         fut, config, tag = self._pending.pop(cs.job_id, (None, self.configs.get(cs.config_key), ""))
         outcome = Outcome(config, None, cs.error or error, tag)
         if cs.ok:
@@ -181,10 +178,17 @@ class EvalClient:
         return f() if f else None
 
     def rescore(self, answer_set: AnswerSet) -> None:
-        """New answer-set version: re-score every stored callset (milliseconds each), then notify strategies."""
+        """New answer-set version: re-score every stored callset that is on this machine (~0.6 s each; callsets
+        scored on fleet nodes stay there and keep their score), then notify strategies. Failures keep the old score."""
         self.answer_set = answer_set
         for (key, fid), cs in self.callsets.items():
-            r = self.scorer.score(cs, answer_set)
+            if cs.score is not None:                     # scored on a fleet node; its VCF is not here
+                continue
+            try:
+                r = self.scorer.score(cs, answer_set)
+            except Exception as e:  # noqa: BLE001
+                log.warning("rescoring %s failed: %s", key, e)
+                continue
             self.latest[(key, fid)] = r
             self.store.add(r, self.configs[key], cs.runtime_s, "rescore")
         for cb in self.on_rescore:

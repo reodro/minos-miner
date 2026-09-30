@@ -90,7 +90,9 @@ def replay(tag: str, minutes: float, strategy: str, workers: int, fleet=None) ->
         print(f"evaluated {out.evaluated}, failed {out.failed}, submissions {len(out.submissions)}; "
               f"local best {out.best.score if out.best else None}")
     final = sub.sent[-1][1]
-    cs = out.callsets.get(final) if out else None
+    if out is None:
+        print(f"static fallback submitted {final}: no search ran ({mined.note})"); return
+    cs = out.callsets.get(final)
     if cs is None or not os.path.exists(cs.vcf):
         print("final config's callset is not on this machine (fleet): rerun it locally to get its TRUE score"); return
     true = parts.scorer.score(cs, OracleProvider().build(rnd)).score
@@ -108,7 +110,8 @@ def main() -> None:
     b = sp.add_parser("live"); b.add_argument("--wallet", required=True); b.add_argument("--hotkey", required=True)
     b.add_argument("--demo", action="store_true"); b.add_argument("--workers", type=int, default=default_workers())
     for p in (a, b):
-        p.add_argument("--fleet", nargs="?", const="~/.minos/fleet.json", metavar="INVENTORY",
+        p.add_argument("--fleet", nargs="?", const=os.environ.get("MINOS_FLEET_INVENTORY", "~/.minos/fleet.json"),
+                       metavar="INVENTORY",
                        help="run GATK and scoring on the sub-VPSs in the inventory (over ssh) instead of here")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

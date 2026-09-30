@@ -32,7 +32,7 @@ class Round:
     reference: str              # local path to the chromosome FASTA (indexed)
     deadline: Optional[str] = None       # submission_end_time, ISO 8601
     released_dir: Optional[str] = None   # dir holding truth/mutations once revealed (backtest only)
-    n_targets: Optional[int] = None      # platform's num_mutations (fp_per_target denominator), known live
+    n_targets: Optional[int] = None      # platform's num_mutations if it ever reports it live (usually unknown: estimated)
 
     @property
     def region(self) -> str:

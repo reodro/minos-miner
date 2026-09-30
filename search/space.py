@@ -1,7 +1,7 @@
 """The config space as numbers: features for the surrogate model, random sampling, and local moves.
 
 Every tunable parameter maps to one feature in [0, 1]: numeric ranges linearly, or on a log scale when they span
-more than two orders of magnitude (rates, heterozygosities); bools 0/1; enums by position. Parameters with a
+two orders of magnitude or more (rates, heterozygosities); bools 0/1; enums by position. Parameters with a
 single allowed value are fixed and not features, and so are the values in PINNED: settings that can never score.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ class Space:
         return (s.allowed and len(s.allowed) == 1) or (s.type in ("int", "float") and s.min == s.max)
 
     def _log(self, s: ParamSpec) -> bool:
-        return s.type == "float" and s.min is not None and s.min > 0 and s.max / s.min > 100
+        return s.type == "float" and s.min is not None and s.min > 0 and s.max / s.min >= 100 - 1e-9
 
     # ---- config <-> features -------------------------------------------------------------------------------
     def encode(self, config: Config) -> List[float]:
@@ -68,11 +68,10 @@ class Space:
                 return c
         raise RuntimeError("could not sample a valid config")
 
-    def neighbour(self, config: Config, rng: random.Random, n_params: int = 2, scale: float = 0.15,
-                  only: Optional[List[str]] = None) -> Optional[Config]:
-        """Move 1..n_params parameters (from `only` if given): numeric by a Gaussian step of `scale` in unit space,
-        bool/enum to another value. None if no valid neighbour was found."""
-        pool = [n for n in (only or self.names) if n in self.names]
+    def neighbour(self, config: Config, rng: random.Random, n_params: int = 2, scale: float = 0.15) -> Optional[Config]:
+        """Move 1..n_params parameters: numeric by a Gaussian step of `scale` in unit space, bool/enum to a random
+        value (possibly the same). None if no valid, different neighbour was found."""
+        pool = list(self.names)
         if not pool:
             return None
         for _ in range(50):

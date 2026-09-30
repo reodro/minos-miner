@@ -15,6 +15,11 @@ from search import EvalClient, RandomSampler, random_stream, rf_ucb
 from tests.helpers import ranges
 
 ROUND_0817 = os.path.join(SETTINGS.rounds_dir, "20260928T081700Z")
+def jobno(job):
+    """The running number of an EvalClient job id ("<round tag>-j<n>")."""
+    return int(job.job_id.rsplit("-j", 1)[1])
+
+
 ROUND = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
 
 
@@ -82,7 +87,7 @@ class LoopTest(unittest.TestCase):
         self.assertEqual(out.best.answer_set_version, out.answer_set_version)
 
     def test_crashes_do_not_end_the_round(self):
-        ex = SimExecutor(self.runner, workers=8, crashes=lambda job: int(job.job_id[1:]) % 3 == 2)
+        ex = SimExecutor(self.runner, workers=8, crashes=lambda job: jobno(job) % 3 == 2)
         out, sub, _ = self.run_loop([random_stream(self.r, seed=1)], executor=ex)
         self.assertGreater(out.failed, 0)
         self.assertTrue(sub.sent)
@@ -96,7 +101,7 @@ class LoopTest(unittest.TestCase):
     def test_mixed_strategies_keep_workers_busy(self):
         # stragglers: 1 in 8 jobs takes 5x longer. A lone barrier strategy idles at every generation;
         # adding a streaming strategy fills the gaps.
-        dur = lambda job: 300.0 if int(job.job_id[1:]) % 8 == 0 else 60.0  # noqa: E731
+        dur = lambda job: 300.0 if jobno(job) % 8 == 0 else 60.0  # noqa: E731
         lone, _, _ = self.run_loop([barrier_strategy(self.r)], executor=SimExecutor(self.runner, 16, dur),
                                    max_evals=96, baselines=[])
         mixed, _, _ = self.run_loop([barrier_strategy(self.r), random_stream(self.r, in_flight=16, seed=3),
@@ -106,16 +111,19 @@ class LoopTest(unittest.TestCase):
         self.assertGreater(mixed.utilization, 0.85)
 
     def test_quorum_returns_early_and_stragglers_still_arrive(self):
-        dur = lambda job: 500.0 if job.job_id == "j0" else 60.0  # noqa: E731
+        dur = lambda job: 500.0 if jobno(job) == 0 else 60.0  # noqa: E731
         seen = []
+
+        got = []
 
         async def strategy(client):
             client.on_result.append(lambda o: seen.append(o.config.key))
-            res = await client.propose_all(RandomSampler(self.r, seed=5).sample(8), quorum=0.75)
-            self.assertIsNone(res[0])
-            self.assertEqual(sum(o is not None for o in res), 7)
+            got.append(await client.propose_all(RandomSampler(self.r, seed=5).sample(8), quorum=0.75))
 
         self.run_loop([strategy], executor=SimExecutor(self.runner, 8, dur), baselines=[])
+        # asserted out here: the round loop logs (does not raise) exceptions from a strategy
+        self.assertIsNone(got[0][0])                              # the straggler was not waited for
+        self.assertEqual(sum(o is not None for o in got[0]), 7)
         self.assertEqual(len(seen), 8)       # the straggler's result was still delivered after the barrier
 
     def test_duplicate_configs_run_once(self):
@@ -295,8 +303,8 @@ class RfUcbTest(unittest.TestCase):
             for name, strat in (("random", random_stream(r, in_flight=8, seed=seed)), ("rf", rf_ucb(r, seed=seed))):
                 runner = FakeRunner(r, seed=seed)
                 out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [strat],
-                                DryRunSubmitter(), r, LoopSettings(max_evals=120), baselines=[])
-                self.assertLessEqual(out.evaluated + out.failed, 120 + 8)     # in-flight ones may finish after
+                                DryRunSubmitter(), r, LoopSettings(max_evals=200), baselines=[])
+                self.assertLessEqual(out.evaluated + out.failed, 200 + 8)     # in-flight ones may finish after
                 best[name].append(out.best.score)
         self.assertGreater(sum(best["rf"]), sum(best["random"]))
 
@@ -362,3 +370,39 @@ class SpaceTest(unittest.TestCase):
         cs += [sp.neighbour(c, rng, n_params=4) for c in cs[:100]]
         self.assertEqual({c.params["emit_ref_confidence"] for c in cs if c}, {"NONE"})
         self.assertNotIn("emit_ref_confidence", sp.names)
+
+
+class RoundSafetyTest(unittest.TestCase):
+    def test_a_late_loop_failure_does_not_replace_a_submitted_config_with_the_baseline(self):
+        from main import Parts, mine_round
+        r = ranges(); runner = FakeRunner(r)
+
+        class Known(StubProvider):
+            def build(self, round):
+                return AnswerSet(round.round_id, 1, Regime.KG, "S", [Variant("chr20", 5, "A", "G", "0/1")], [], 600)
+
+        async def explode_later(client):
+            await client.propose_all(RandomSampler(r, seed=1).sample(8))
+            await asyncio.sleep(0)
+            raise RuntimeError("strategy bug")
+
+        sub = DryRunSubmitter()
+        base = r.defaults("gatk")
+        parts = Parts(Known(), SimExecutor(runner, 8), FakeScorer(runner), [explode_later], sub, r, [base],
+                      LoopSettings(max_evals=40))
+        m = mine_round(ROUND, parts, deadline_ts=None)
+        self.assertEqual(m.mode, "searched")
+        self.assertNotEqual(sub.sent[-1][1], base.key)          # the best config found, not the baseline again
+
+    def test_results_of_another_round_are_ignored(self):
+        r = ranges(); runner = FakeRunner(r)
+
+        async def go():
+            client = EvalClient(ROUND, SimExecutor(runner, 2), FakeScorer(runner), r, ResultStore(),
+                                StubProvider().build(ROUND))
+            fut = client.propose(r.defaults("gatk"))
+            job_id = next(iter(client._pending))
+            other = CallSet("another-round", r.defaults("gatk").key, "fake://x", "d", 0.0, job_id=job_id)
+            client.deliver(other)                                # same job id, other round: must not resolve it
+            return fut.done(), client.in_flight
+        self.assertEqual(asyncio.run(go()), (False, 1))

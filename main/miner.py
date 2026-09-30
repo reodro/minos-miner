@@ -1,6 +1,6 @@
 """The miner process: watch for a round, fetch it, build the answer set, search, submit. Owner: main.
 
-    run_forever(source, factory)      live: poll the platform, mine every new round (needs a registered wallet)
+    run_forever(source, make_parts, reference_for)   live: poll the platform, mine every new round (needs a wallet)
     mine_round(round, parts, ...)     one round with the fallback chain, used by live and replay
 
 Fallback chain (a round must never end without a valid submission):
@@ -21,11 +21,12 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional, Protocol
+from typing import Callable, List, Optional, Protocol, Tuple
 
 from answer_set.base import AnswerSetProvider
 from common.params import ParamRanges
@@ -75,7 +76,11 @@ def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url
         return _static(round, parts, "no donor identified: searching without a truth would be noise")
     publish = getattr(parts.executor, "publish_round", None)
     if publish:
-        publish(round, answer_set, bam_url, bai_url)
+        try:
+            publish(round, answer_set, bam_url, bai_url)
+        except Exception as e:  # noqa: BLE001 - no fleet for this round: still submit something
+            log.exception("publishing %s to the fleet failed", round.round_id)
+            return _static(round, parts, f"fleet publish failed: {e}")
 
     class Built:                                  # the loop builds once; hand it the answer set we already have
         def build(self, _round):
@@ -91,7 +96,13 @@ def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url
         return MinedRound(round.round_id, "searched", out)
     except Exception as e:  # noqa: BLE001
         log.exception("round loop failed for %s", round.round_id)
+        if _submitted(parts, round):              # a better config already went out: the baseline must not replace it
+            return MinedRound(round.round_id, "searched", note=f"round loop failed after submitting: {e}")
         return _static(round, parts, f"round loop failed: {e}")
+
+
+def _submitted(parts: Parts, round: Round) -> bool:
+    return any(rid == round.round_id for rid, _ in getattr(parts.submitter, "sent", []))
 
 
 def _static(round: Round, parts: Parts, why: str) -> MinedRound:
@@ -110,6 +121,7 @@ class LiveRound:
     deadline_ts: Optional[float]                  # submission_end_time as epoch seconds
     bam_url: str
     bai_url: str
+    num_mutations: Optional[int] = None           # N, if the platform ever reports it live (Optional upstream)
 
 
 class RoundSource(Protocol):
@@ -131,12 +143,13 @@ def fetch_round(live: LiveRound, reference_for: Callable[[str], str], rounds_dir
     (d / "round.json").write_text(json.dumps({"round_id": live.round_id, "region": live.region}))
     deadline = datetime.utcfromtimestamp(live.deadline_ts).isoformat() + "Z" if live.deadline_ts else None
     return Round(live.round_id, chrom, start, end, bam=str(d / "input.bam"), reference=reference_for(chrom),
-                 deadline=deadline)
+                 deadline=deadline, n_targets=live.num_mutations)
 
 
 def run_forever(source: RoundSource, make_parts: Callable[[Round], Parts], reference_for: Callable[[str], str],
-                poll_s: float = 20.0, record: Optional[Callable[[MinedRound], None]] = None) -> None:
-    """Live loop: every new open round is fetched and mined once."""
+                poll_s: float = 20.0) -> None:
+    """Live loop: every new open round is fetched and mined once. If the BAM cannot be fetched, the round still gets
+    the static baseline (submitting needs no BAM)."""
     done = set()
     while True:
         try:
@@ -148,13 +161,14 @@ def run_forever(source: RoundSource, make_parts: Callable[[Round], Parts], refer
             done.add(live.round_id)
             try:
                 rnd = fetch_round(live, reference_for)
-                mined = mine_round(rnd, make_parts(rnd), live.deadline_ts, live.bam_url, live.bai_url)
             except Exception as e:  # noqa: BLE001
-                log.exception("round %s failed", live.round_id)
-                mined = MinedRound(live.round_id, "failed", note=str(e))
+                log.exception("fetching round %s failed", live.round_id)
+                chrom, start, end = Round.parse_region(live.region)
+                rnd = Round(live.round_id, chrom, start, end, bam="", reference=reference_for(chrom))
+                mined = _static(rnd, make_parts(rnd), f"round download failed: {e}")
+            else:
+                mined = mine_round(rnd, make_parts(rnd), live.deadline_ts, live.bam_url, live.bai_url)
             log.info("round %s: %s %s", mined.round_id, mined.mode, mined.note)
-            if record:
-                record(mined)
         time.sleep(poll_s)
 
 
@@ -176,22 +190,31 @@ class UpstreamPlatform:
         self.wallet = bt.wallet(name=wallet_name, hotkey=hotkey)
         self.subtensor = None if demo else bt.subtensor(network=network)
         self.netuid, self.demo = netuid, demo
-        self.client = MinerPlatformClient(self.wallet.hotkey, PlatformConfig(), demo=demo)
+        self.client = MinerPlatformClient(self.wallet.hotkey, PlatformConfig(base_url=SETTINGS.platform_url), demo=demo)
         self.submits: dict = {}
+        # the upstream client is async and submit() is called from inside main's running event loop, so every
+        # platform call runs on this object's own loop in a helper thread
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop.run_forever, daemon=True, name="platform-loop").start()
+
+    def _call(self, coro, timeout: float = 120.0):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
 
     def current(self) -> Optional[LiveRound]:
-        s = asyncio.run(self.client.get_round_status())
+        s = self._call(self.client.get_round_status())
         if not s.get("has_active_round") or s.get("status") != "open":
             return None
         end = s.get("submission_end_time")
         deadline = datetime.fromisoformat(str(end).replace("Z", "+00:00")).timestamp() if end else None
-        return LiveRound(s["round_id"], s["region"], deadline, s["bam_presigned_url"], s["bam_index_presigned_url"])
+        return LiveRound(s["round_id"], s["region"], deadline, s["bam_presigned_url"], s["bam_index_presigned_url"],
+                         s.get("num_mutations"))
 
     def submit(self, round: Round, config: Config) -> bool:
         from utils import config_commit
-        net = asyncio.run(self.client.get_network_config()) or {}
+        net = self._call(self.client.get_network_config()) or {}
         used = self.submits.get(round.round_id, 0)
-        if net.get("resubmission_fee_enabled") is True and used >= int(net.get("free_submissions", 1) or 1):
+        free = net.get("free_submissions_per_round", 1)                # upstream submission_payment's key
+        if net.get("resubmission_fee_enabled") is True and used >= int(1 if free is None else free):
             log.warning("%s: resubmission would need a fee; not submitting (fees are never paid)", round.round_id)
             return False
         tool_config = dict(config.to_submission())        # {"tool", "<tool>_options"} like upstream, plus:
@@ -203,9 +226,9 @@ class UpstreamPlatform:
         commitment = block = nonce = None
         if net.get("config_commitment_enabled") is True and not self.demo:
             commitment, block, nonce = self._commit(round.round_id, config.tool, tool_config, config_commit)
-        res = asyncio.run(self.client.submit_config(round_id=round.round_id, tool_name=config.tool,
-                                                    tool_config=tool_config, config_commitment=commitment,
-                                                    commitment_block=block, config_nonce=nonce))
+        res = self._call(self.client.submit_config(round_id=round.round_id, tool_name=config.tool,
+                                                   tool_config=tool_config, config_commitment=commitment,
+                                                   commitment_block=block, config_nonce=nonce))
         ok = bool(res.get("success"))
         if ok:
             self.submits[round.round_id] = used + 1
@@ -237,10 +260,14 @@ class PlatformSubmitter:
 
     def __init__(self, platform):
         self.platform = platform
+        self.sent: List[Tuple[str, str]] = []             # (round_id, config_key) accepted, like DryRunSubmitter
 
     def submit(self, round: Round, config: Config) -> bool:
         try:
-            return self.platform.submit(round, config)
+            ok = self.platform.submit(round, config)
+            if ok:
+                self.sent.append((round.round_id, config.key))
+            return ok
         except Exception as e:  # noqa: BLE001 - a failed submission is reported, not raised into the loop
             log.warning("submission failed for %s: %s", round.round_id, e)
             return False
