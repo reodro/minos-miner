@@ -41,28 +41,30 @@ def copy_repo(h: Host) -> None:
 
 def status(h: Host) -> dict:
     py = f"{h.repo}/.venv/bin/python"
-    script = (f"nproc; free -g | awk '/Mem/{{print $2}}'; df -BG --output=avail {h.data_dir} 2>/dev/null | tail -1; "
-              f"docker image inspect broadinstitute/gatk:4.5.0.0 >/dev/null 2>&1 && echo gatk || echo no-gatk; "
-              f"test -f {h.repo}/evaluator/gatk_patch/build/minos-patch.jar && echo jar || echo no-jar; "
-              f"ls -d {h.data_dir}/reference/chr*/ 2>/dev/null | wc -l; "
+    script = (f"echo cores=$(nproc); echo ram_gb=$(free -g | awk '/Mem/{{print $2}}'); "
+              f"echo disk_free=$(df -BG --output=avail {h.data_dir} 2>/dev/null | tail -1 | tr -d ' '); "
+              f"echo gatk_image=$(docker image inspect broadinstitute/gatk:4.5.0.0 >/dev/null 2>&1 && echo yes || echo no); "
+              f"echo patch_jar=$(test -f {h.repo}/evaluator/gatk_patch/build/minos-patch.jar && echo yes || echo no); "
+              f"echo genomes=$(ls -d {h.data_dir}/reference/chr*/ 2>/dev/null | wc -l); "
               f"cd {h.repo} 2>/dev/null && {py} -c 'from evaluator.fleet.inventory import code_digest; "
-              f"from common.settings import default_workers; print(code_digest()); print(default_workers())' 2>/dev/null")
+              f"from common.settings import default_workers; print(\"code=\" + code_digest()); "
+              f"print(\"workers=\" + str(default_workers()))' 2>/dev/null; true")
     p = sh(h, script, timeout=60)
-    if p.returncode not in (0, 1) and not p.stdout:
-        return {"host": h.name, "reachable": False, "error": p.stderr.strip()[-120:]}
-    v = p.stdout.split("\n")
-    get = lambda i: v[i].strip() if len(v) > i else "?"  # noqa: E731
-    return {"host": h.name, "reachable": True, "cores": get(0), "ram_gb": get(1), "disk_free": get(2),
-            "gatk_image": get(3) == "gatk", "patch_jar": get(4) == "jar", "genomes": get(5),
-            "code_same_as_main": get(6) == code_digest(), "workers": h.workers or get(7)}
+    if "cores=" not in p.stdout:
+        return {"host": h.name, "reachable": False, "error": p.stderr.strip()[-160:]}
+    v = dict(line.split("=", 1) for line in p.stdout.splitlines() if "=" in line)
+    return {"host": h.name, "reachable": True, "cores": v.get("cores"), "ram_gb": v.get("ram_gb"),
+            "disk_free": v.get("disk_free") or "?", "gatk_image": v.get("gatk_image") == "yes",
+            "patch_jar": v.get("patch_jar") == "yes", "genomes": v.get("genomes"),
+            "code_same_as_main": v.get("code") == code_digest(), "workers": h.workers or v.get("workers", "?")}
 
 
 def push_genomes(h: Host) -> None:
     """Main's reference genomes (FASTA, index, dict, SDF) to the host, every chromosome main has; the node's setup
     then downloads only what is still missing. No dependence on the platform's endpoint for what main already has."""
-    ref = f"{SETTINGS.data_dir}/reference/"
     sh(h, f"mkdir -p {h.data_dir}/reference")
-    p = subprocess.run(h.rsync([ref], f"{h.data_dir}/reference/"), capture_output=True, text=True, timeout=7200)
+    p = subprocess.run(h.rsync([f"{SETTINGS.data_dir}/reference/"], f"{h.data_dir}/reference/"), capture_output=True,
+                       text=True, timeout=7200)
     if p.returncode != 0:
         raise RuntimeError(f"pushing genomes: {p.stderr[-300:]}")
 

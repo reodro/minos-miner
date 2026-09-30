@@ -7,16 +7,20 @@ cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 DATA_DIR="${DATA_DIR:-/minos/data}"
 
+PY="${PY_VERSION:-3.10}"          # main's Python: every node runs the same interpreter and pinned libraries
+export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io openjdk-17-jdk-headless python3-venv python3-pip \
-  bcftools curl git rsync
+apt-get install -y -q docker.io curl git rsync ca-certificates
+apt-get install -y -q openjdk-17-jdk-headless || apt-get install -y -q default-jdk-headless   # javac --release 17
 systemctl enable --now docker
 
 # upstream repo: scoring formula and the validator's templates
 [ -d /minos/minos_subnet ] || git clone -q https://github.com/minos-protocol/minos_subnet.git /minos/minos_subnet
 
-# python env
-python3 -m venv .venv && .venv/bin/pip install -q --upgrade pip && .venv/bin/pip install -q -r requirements.txt
+# python env: uv installs Python $PY (whatever the OS ships) and the exact pinned requirements
+command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+uv venv -q --python "$PY" --allow-existing .venv
+uv pip install -q --python .venv/bin/python -r requirements.txt
 
 # images: the validator's GATK, and hap.py at the exact digest upstream pins (pulled now: pulling it on first use
 # would stall the node's first scoring for minutes)
