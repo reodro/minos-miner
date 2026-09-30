@@ -43,12 +43,15 @@ def call_candidates(round: Round, chunk_bp: int = 500_000, workers: int = 14) ->
 
     def one(span):
         a, b = span
-        cmd = (f"bcftools mpileup -f {round.reference} -r {round.chrom}:{a}-{b} -q 20 -Q 13 -a AD,DP -d 1000 "
-               f"{round.bam} 2>/dev/null | bcftools call -mv 2>/dev/null | "
+        cmd = (f"set -o pipefail; bcftools mpileup -f {round.reference} -r {round.chrom}:{a}-{b} -q 20 -Q 13 "
+               f"-a AD,DP -d 1000 {round.bam} 2>/dev/null | bcftools call -mv 2>/dev/null | "
                f"bcftools norm -f {round.reference} -m -both 2>/dev/null | "
                f"bcftools query -f '%POS\\t%REF\\t%ALT[\\t%AD]\\n'")
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, executable="/bin/bash")
+        if p.returncode != 0:                              # a lost chunk would silently drop its synthetic truth
+            raise RuntimeError(f"candidate calling failed on {round.chrom}:{a}-{b} (rc={p.returncode})")
         out = []
-        for line in subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.splitlines():
+        for line in p.stdout.splitlines():
             pos, ref, alt, ad = line.split("\t")
             if alt == "*" or "," in alt:
                 continue

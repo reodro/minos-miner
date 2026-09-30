@@ -1,13 +1,13 @@
 """Germline truth lookup.
 
-1000G regime: the platform's germline truth is the donor's NYGC raw calls filtered by KG_RULE.
-Fitted on 36 rounds (2026-09-26..28): 0 missing, 0 extra, 0 genotype disagreements.
+1000G regime: the platform's germline truth is the donor's NYGC raw calls filtered by KG_RULE, record by record.
+Checked on the 36 stored 1000G rounds: every record identical (REF, all ALTs, genotype) to the released truth.
 """
 from __future__ import annotations
 
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, List, Tuple
+from typing import Iterable, List
 
 from common.settings import SETTINGS
 from common.types import Round, Variant
@@ -21,25 +21,23 @@ def keep(filter_: str, alts: List[str], gq: int, dp: int, rule: dict = KG_RULE) 
             and gq >= rule["min_gq"] and dp >= rule["min_dp"])
 
 
-def alleles(chrom: str, pos: int, ref: str, alts: List[str], gt: str) -> List[Variant]:
-    """One Variant per called non-ref allele; gt is relative to that allele ("0/1" or "1/1")."""
-    calls = gt.replace("|", "/").split("/")
-    out = []
-    for i, alt in enumerate(alts, 1):
-        n = sum(1 for c in calls if c == str(i))
-        if n and alt != "*":
-            out.append(Variant(chrom, pos, ref, alt, "1/1" if n == 2 else "0/1"))
-    return out
+def canonical_gt(gt: str) -> str:
+    """Unphased, allele indices sorted: "1|0" -> "0/1", "3|1" -> "1/3"."""
+    return "/".join(sorted(gt.replace("|", "/").split("/"), key=lambda a: (a == ".", a)))
 
 
 def parse_query(chrom: str, lines: Iterable[str], rule: dict = KG_RULE) -> List[Variant]:
-    """Lines of `bcftools query -f '%POS\\t%REF\\t%ALT\\t%FILTER[\\t%GT\\t%DP\\t%GQ]\\n'` -> germline truth."""
+    """Lines of `bcftools query -f '%POS\\t%REF\\t%ALT\\t%FILTER[\\t%GT\\t%DP\\t%GQ]\\n'` -> germline truth.
+
+    Each kept record stays ONE record with every ALT as written (the platform's truth keeps multi-allelic records
+    whole, e.g. TA -> TAA,T,TAAA,TAAAA 0/1): the score classifies truth records by their REF/ALT as written."""
     out = []
     for line in lines:
         pos, ref, alt, flt, gt, dp, gq = line.rstrip("\n").split("\t")
         alts = alt.split(",")
-        if keep(flt, alts, int(gq) if gq.isdigit() else -1, int(dp) if dp.isdigit() else -1, rule):
-            out.extend(alleles(chrom, int(pos), ref, alts, gt))
+        called = [c for c in gt.replace("|", "/").split("/") if c not in ("0", ".")]
+        if called and keep(flt, alts, int(gq) if gq.isdigit() else -1, int(dp) if dp.isdigit() else -1, rule):
+            out.append(Variant(chrom, int(pos), ref, alt, canonical_gt(gt)))
     return out
 
 

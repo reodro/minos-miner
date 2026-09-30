@@ -1,7 +1,7 @@
 """Oracle provider: the platform's released truth, as an AnswerSet.
 
-Two uses: (1) lets main and evaluator develop before the real builder exists;
-(2) is the upper bound in answer-set backtests (oracle gap = 0 by definition).
+The upper bound in answer-set backtests (oracle gap = 0 by definition), and the reference for true scores in
+replays. Not a live provider: its regime is UNKNOWN, so mine_round would go static with it.
 Only valid for rounds whose files have been released.
 """
 from __future__ import annotations

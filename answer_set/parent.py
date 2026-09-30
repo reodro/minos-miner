@@ -126,13 +126,18 @@ def fetch(round: Round, url: str, out_dir: Optional[str] = None, chunk_bp: int =
             cmd = ["docker", "run", "--rm", "-v", f"{d}:/out", "-v", f"{ref.parent}:/ref:ro", SAMTOOLS_IMAGE, "sh", "-c",
                    f"samtools view -T /ref/{ref.name} -b -o /out/{tmp.name} '{url}' {round.chrom}:{a}-{b} "
                    f"&& samtools index /out/{tmp.name}"]
-            for attempt in range(4):                       # remote servers drop connections now and then
-                p = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-                if p.returncode == 0:
-                    break
+            err = ""
+            for attempt in range(4):                       # remote servers drop connections or stall now and then
+                try:
+                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+                    if p.returncode == 0:
+                        break
+                    err = p.stderr[-300:]
+                except subprocess.TimeoutExpired:
+                    err = "timed out"
                 time.sleep(2 * (attempt + 1))
             else:
-                raise RuntimeError(f"parent fetch {round.chrom}:{a}-{b} failed: {p.stderr[-300:]}")
+                raise RuntimeError(f"parent fetch {round.chrom}:{a}-{b} failed: {err}")
             tmp.rename(path)
             Path(str(tmp) + ".bai").rename(str(path) + ".bai")
         return a, b, str(path)

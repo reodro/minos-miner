@@ -1,7 +1,8 @@
 """GIAB regime: which of HG001-HG007 is the donor, and its germline truth.
 
 Germline truth = the donor's NIST v4.2.1 benchmark calls in the round region, every record, no BED filter
-(checked on 65 rounds 2026-09-23..27: truth minus SYNTHETIC records == NIST calls in region, both ways).
+(truth minus SYNTHETIC records == the donor's NIST records in the region, both ways: 65 released truths 09-23..27,
+and all 24 stored GIAB rounds with BAMs).
 Donor: genotype the round BAM at SNPs where the seven NIST call sets disagree and take the best-matching donor.
 A donor's genotype at a site is known only inside its confident BED (absent there = hom-ref).
 """
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from answer_set.fingerprint import genotype_sites
+from answer_set.germline import canonical_gt  # noqa: F401  (re-exported: giab.canonical_gt)
 from common.settings import SETTINGS
 from common.types import Round, Variant
 
@@ -43,11 +45,6 @@ def _query(donor: str, round: Round) -> List[Tuple[int, str, str, str]]:
     return [tuple(line.split("\t")) for line in txt.splitlines()]
 
 
-def canonical_gt(gt: str) -> str:
-    """Unphased, allele indices sorted: "1|0" -> "0/1", "2/1" -> "1/2"."""
-    return "/".join(sorted(gt.replace("|", "/").split("/"), key=lambda a: (a == ".", a)))
-
-
 def nist_germline(round: Round, donor: str) -> List[Variant]:
     """The donor's NIST records in the region exactly as written (multi-allelic records stay one record)."""
     return [Variant(round.chrom, int(pos), ref, alt, canonical_gt(gt)) for pos, ref, alt, gt in _query(donor, round)]
@@ -65,10 +62,14 @@ def _confident(donor: str, round: Round) -> Tuple[List[int], List[int]]:
 
 def discriminating_sites(round: Round, max_sites: int = 1500) -> Dict[int, tuple]:
     """pos -> (ref, alt, [alt-allele count per donor, -1 if unknown]) for biallelic SNPs where donors differ."""
-    calls = {d: {int(p): (r, a, g) for p, r, a, g in _query(d, round) if len(r) == 1 and len(a) == 1} for d in DONORS}
+    raw = {d: _query(d, round) for d in DONORS}
+    calls = {d: {int(p): (r, a, g) for p, r, a, g in raw[d] if len(r) == 1 and len(a) == 1} for d in DONORS}
+    other = {d: {int(p) for p, r, a, g in raw[d] if not (len(r) == 1 and len(a) == 1)} for d in DONORS}
     beds = {d: _confident(d, round) for d in DONORS}
 
     def count(d, pos, ref, alt):
+        if pos in other[d]:                                # an indel / multi-allelic record there: not a clean SNP
+            return -1
         c = calls[d].get(pos)
         if c is not None:
             if (c[0], c[1]) != (ref, alt):

@@ -15,7 +15,7 @@ record, so both halves matter equally. `mutations.vcf` (the targets) only provid
 | Step | Code | Method | Measured |
 |---|---|---|---|
 | Donor | `fingerprint.py`, `giab.py` | 1000G: genotype ~1.5K panel SNPs from the BAM, best-matching sample. GIAB: genotype SNPs where the 7 NIST sets disagree | 1000G: right donor >= 0.991 vs <= 0.776; GIAB 24/24, 0.99+ vs <= 0.72 |
-| Germline | `germline.py`, `giab.py` | 1000G: the sample's NYGC raw calls + `KG_RULE` (PASS, no `*`, GQ >= 20, DP >= 10). GIAB: the donor's NIST records as written | exact: 1000G 36/36 rounds, GIAB 24/24 |
+| Germline | `germline.py`, `giab.py` | 1000G: the sample's NYGC raw calls + `KG_RULE` (PASS, no `*`, GQ >= 20, DP >= 10). GIAB: the donor's NIST records. Both **as whole records** (multi-allelic records keep every ALT, like the platform's truth) | record-identical to the released truth: 1000G 36/36 rounds, GIAB 24/24 |
 | Parent reads | `parent.py` | the donor's own sequencing over the region: 1000G 30x CRAM (S3), GIAB NIST 100-300x BAM (NCBI), parallel chunks + retries | 1000G ~10 s, GIAB ~30-60 s |
 | Synthetic pool | `synthetic.py` | bcftools candidates on the round BAM, germline alleles dropped, kept if the **parent shows reference** | 1000G: SNP ~0.998/0.997, indel ~0.99/0.985 recall/precision; GIAB HG005: SNP 0.995/0.985, indel 0.96/0.95 |
 | N | `provider.py` | `0.1069 x` confident synthetic count (unknown live) | median error 13% |
@@ -29,8 +29,9 @@ Regime (GIAB vs 1000G) is decided by genotype, in this order: 1000G fingerprint 
 1000G; else GIAB match >= 0.95 -> GIAB; else UNKNOWN. On a 1000G round every GIAB donor scores ~0.52; on a GIAB round
 every 1000G sample scores <= ~0.69 (HG002-HG007 are not in 1000G). All 60 stored rounds got the right regime.
 
-Fallbacks (never raise): no parent -> synthetic at p=0.5 (left out of the truth); no donor -> `Regime.UNKNOWN`,
-and main submits a static baseline without searching.
+Degraded paths: no donor -> `Regime.UNKNOWN` (nothing else is built; main submits a static baseline without
+searching); no parent reads -> every candidate goes into the truth unfiltered (real donor variants included -
+degraded but scorable). `build()` can still raise on missing data; main then falls back to the static baseline.
 
 **Known risk - NA12878**: it is GIAB's HG001 and is also in 1000G. Every NA12878 round seen so far used the NIST truth,
 so it is sent the GIAB way. That is a rule from past rounds, not something checked live: if the platform ever uses
@@ -49,7 +50,8 @@ NA12878's 1000G calls instead, we would build the wrong germline for that donor 
 | 224100Z | GIAB HG005 | 0.995 | 0 (17 similar callsets) |
 
 GIAB rounds score ~1.2 points lower across the board under ours (constant offset: rankings unaffected).
-These KPIs used the true N; rerun them with the estimate.
+These KPIs were measured before the 1000G germline was written as whole records (it was split per allele, which
+changes how the score classifies ~2000 multi-allelic records per round) and with the true N: rerun them.
 
 ## Open work
 
