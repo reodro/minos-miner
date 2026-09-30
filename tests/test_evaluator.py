@@ -107,3 +107,27 @@ class VariantCostTest(unittest.TestCase):
                          VARIANT_COST["activity"])
         self.assertIsNone(r.variant_cost(base, Config("gatk", {"min_pruning": 2, "assembly_region_padding": 50})))
         self.assertIsNone(GatkRunner().variant_cost(base, gt))          # no patch jar: nothing batches
+
+
+class SpliceRepairTest(unittest.TestCase):
+    """Repaired callset = repair run's records (computed regions) + batch records of the regions it skipped."""
+
+    def test_keeps_batch_records_only_in_skipped_regions(self):
+        import gzip, tempfile
+        from evaluator.gatk import splice_repair
+        hdr = "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=1000>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        rec = lambda pos, tag: f"chr1\t{pos}\t.\tA\tG\t50\t.\t{tag}\n"
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            with gzip.open(d / "batch.vcf.gz", "wt") as f:
+                f.write(hdr + rec(15, "batch") + rec(150, "batch-wrong") + rec(420, "batch"))
+            with gzip.open(d / "repair.vcf.gz", "wt") as f:
+                f.write(hdr + rec(160, "repair"))
+            (d / "regions").write_text("chr1:1-100|true|3|a\t0\t0\t0\t0\nchr1:101-300|true|9|b\t0\t1\t0\t0\n"
+                                       "chr1:301-500|true|4|c\t1\t0\t0\t0\n")
+            (d / "repair.log").write_text("S\tchr1:1-100|true|3|a\nC\tchr1:101-300|true|9|z\nS\tchr1:301-500|true|4|c\n")
+            splice_repair(d / "batch.vcf.gz", d / "regions", d / "repair.vcf.gz", d / "repair.log", d / "out.vcf.gz")
+            with gzip.open(d / "out.vcf.gz", "rt") as f:
+                body = [l.split("\t")[1] + ":" + l.split("\t")[7].strip() for l in f if not l.startswith("#")]
+            self.assertEqual(body, ["15:batch", "160:repair", "420:batch"])
+            self.assertTrue((d / "out.vcf.gz.tbi").exists())

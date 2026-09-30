@@ -300,6 +300,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         defaultGenotypingEngine = new HaplotypeCallerGenotypingEngine(hcArgs, samplesList, ! hcArgs.doNotRunPhysicalPhasing, hcArgs.applyBQD);
         defaultGenotypingEngine.setAnnotationEngine(annotationEngine);
         minosInitGenotypingVariants();
+        minosInitRepair();
 
         // Create other custom genotyping engines if user provided ploidyRegions
         for (final int ploidy : this.allCustomPloidies) {
@@ -739,6 +740,33 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
      * @return List of variants discovered in the region (may be empty)
      */
     public List<VariantContext> callRegion(final AssemblyRegion region, final FeatureContext features, final ReferenceContext referenceContext) {
+        if (minosRepairLog != null) {
+            return minosRepairRegion(region, features, referenceContext);
+        }
+        if (minosGenotypingVariants.isEmpty()) {
+            return minosCallRegion(region, features, referenceContext);
+        }
+        // minos: log what every main-region variant did in this region (read fingerprint + random draws), so a
+        // diverged variant can later be repaired region by region
+        final String key = minosRegionKey(region);
+        final List<MinosGenotypingVariant> logged = new ArrayList<>();
+        final List<long[]> before = new ArrayList<>();
+        for (final MinosGenotypingVariant v : minosGenotypingVariants) {
+            if (v.stream < 0) {
+                logged.add(v);
+                before.add(new long[]{v.rng.gaussians(), v.well.steps()});
+            }
+        }
+        try {
+            return minosCallRegion(region, features, referenceContext);
+        } finally {
+            for (int i = 0; i < logged.size(); i++) {
+                logged.get(i).logRegion(key, before.get(i));
+            }
+        }
+    }
+
+    private List<VariantContext> minosCallRegion(final AssemblyRegion region, final FeatureContext features, final ReferenceContext referenceContext) {
         final HaplotypeCallerGenotypingEngine localGenotypingEngine = getLocalGenotypingEngine(region);
 
         if ( hcArgs.justDetermineActiveRegions ) {
@@ -1157,12 +1185,18 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
      */
     public void shutdown() {
         minosSyncRandom();
+        if (minosRepairOut != null) {
+            minosRepairOut.close();
+        }
         minosLikelihoodEngines.values().forEach(ReadLikelihoodCalculationEngine::close);
         for (final MinosGenotypingVariant v : minosGenotypingVariants) {
             if (v.writer != null) {
                 v.writer.close();
             }
             try {
+                if (v.diverged) {
+                    Files.write(Paths.get(v.output + ".minos.regions"), v.regionLog);
+                }
                 Files.write(Paths.get(v.output + ".minos"), (v.diverged ? "diverged\n" : "exact\n").getBytes());
             } catch (final IOException e) {
                 throw new UserException("cannot write status for " + v.output, e);
@@ -1256,6 +1290,13 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
                 new org.apache.commons.math3.random.RandomDataGenerator(well);
         VariantContextWriter writer;
         boolean diverged = false;
+        final List<String> regionLog = new ArrayList<>();
+
+        /** One line per region: key, then this variant's draw positions before it and its draws in it. */
+        void logRegion(final String key, final long[] before) {
+            regionLog.add(key + "\t" + before[0] + "\t" + (rng.gaussians() - before[0]) + "\t" + before[1] + "\t"
+                    + (well.steps() - before[1]));
+        }
 
         MinosGenotypingVariant(final String output, final HaplotypeCallerGenotypingEngine engine, final String likelihoodKey,
                                final String assemblyKey, final HaplotypeCallerArgumentCollection args) {
@@ -1700,6 +1741,23 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
     @Override
     public void minosProcessRegion(final int stream, final AssemblyRegion region, final ReferenceContext referenceContext,
                                    final FeatureContext features) {
+        final String key = minosRegionKey(region);
+        final List<MinosGenotypingVariant> members = minosStreamMembers.get(stream);
+        final List<long[]> before = new ArrayList<>();
+        for (final MinosGenotypingVariant v : members) {
+            before.add(new long[]{v.rng.gaussians(), v.well.steps()});
+        }
+        try {
+            minosProcessStreamRegion(stream, region, referenceContext, features);
+        } finally {
+            for (int i = 0; i < members.size(); i++) {
+                members.get(i).logRegion(key, before.get(i));
+            }
+        }
+    }
+
+    private void minosProcessStreamRegion(final int stream, final AssemblyRegion region, final ReferenceContext referenceContext,
+                                          final FeatureContext features) {
         if (haplotypeBAMWriter.isPresent()) {
             throw new UserException("minos.gt.variants: --bam-output is not supported with activity variants");
         }
@@ -1734,5 +1792,71 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
                 Utils.minosGlobalWell().setRecording(true);
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // minos: repair of a diverged batch variant. The variant's own run (own random draws, so its read pass keeps exactly
+    // the reads its real run keeps) with -Dminos.repair.log=<the batch's region log for it>. A region whose span,
+    // activity and reads equal a logged region gives the same calls as in the batch, so it is skipped: no assembly,
+    // likelihoods or genotyping, the generators are advanced by the draws the batch logged for it. That is only valid
+    // while the generators sit exactly where the batch's did before the region; the first time they do not, every
+    // later region is computed. -Dminos.repair.out=<file> lists each region as S(kipped) or C(omputed) for the splice.
+    // ---------------------------------------------------------------------------------------------------------------
+    private Map<String, long[]> minosRepairLog = null;
+    private java.io.PrintWriter minosRepairOut = null;
+    private boolean minosRepairComputeAll = false;
+
+    private void minosInitRepair() {
+        final String spec = System.getProperty("minos.repair.log");
+        if (spec == null) {
+            return;
+        }
+        if (System.getProperty("minos.gt.variants") != null) {
+            throw new UserException("minos.repair.log and minos.gt.variants cannot be combined");
+        }
+        minosRepairLog = new HashMap<>();
+        try {
+            for (final String line : Files.readAllLines(Paths.get(spec))) {
+                final String[] f = line.split("\t");
+                minosRepairLog.put(f[0], new long[]{Long.parseLong(f[1]), Long.parseLong(f[2]), Long.parseLong(f[3]), Long.parseLong(f[4])});
+            }
+            minosRepairOut = new java.io.PrintWriter(Files.newBufferedWriter(Paths.get(System.getProperty("minos.repair.out"))));
+        } catch (final IOException e) {
+            throw new UserException("cannot read repair log " + spec, e);
+        }
+    }
+
+    private List<VariantContext> minosRepairRegion(final AssemblyRegion region, final FeatureContext features,
+                                                   final ReferenceContext referenceContext) {
+        final String key = minosRegionKey(region);
+        final long[] logged = minosRepairLog.get(key);
+        if (logged != null && !minosRepairComputeAll) {
+            if (Utils.minosGlobalRandom().gaussians() == logged[0] && Utils.minosGlobalWell().steps() == logged[2]) {
+                Utils.minosGlobalRandom().skipGaussians(logged[1]);
+                Utils.minosGlobalWell().skipSteps(logged[3]);
+                minosRepairOut.println("S\t" + key);
+                return NO_CALLS;
+            }
+            minosRepairComputeAll = true;        // draw positions differ from here on: compute every later region
+        }
+        minosRepairOut.println("C\t" + key);
+        return minosCallRegion(region, features, referenceContext);
+    }
+
+    /** Span, activity and a fingerprint of the region's reads, taken before anything touches the region. */
+    private static String minosRegionKey(final AssemblyRegion region) {
+        long h = 1125899906842597L;
+        for (final GATKRead r : region.getReads()) {
+            h = 31 * h + r.getName().hashCode();
+            h = 31 * h + r.getStart();
+            h = 31 * h + r.getEnd();
+            h = 31 * h + r.getCigar().toString().hashCode();
+            h = 31 * h + r.getMappingQuality();
+            h = 31 * h + (r.isReverseStrand() ? 1 : 0) + (r.isFirstOfPair() ? 2 : 0) + (r.isSecondOfPair() ? 4 : 0);
+            h = 31 * h + Arrays.hashCode(r.getBasesNoCopy());
+            h = 31 * h + Arrays.hashCode(r.getBaseQualitiesNoCopy());
+        }
+        return region.getSpan().getContig() + ":" + region.getSpan().getStart() + "-" + region.getSpan().getEnd() + "|"
+                + region.isActive() + "|" + region.getReads().size() + "|" + Long.toHexString(h);
     }
 }

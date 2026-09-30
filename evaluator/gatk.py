@@ -105,6 +105,51 @@ def records_digest(vcf: Path) -> str:
     return h.hexdigest()
 
 
+def splice_repair(batch_vcf: Path, regions: Path, repair_vcf: Path, repair_log: Path, out: Path) -> None:
+    """Final VCF of a repaired variant: the repair run's header and records (its computed regions) plus the batch
+    records of every region the repair run skipped. Regions are GATK assembly regions; each record belongs to the
+    region whose span contains its POS."""
+    import bisect
+    import pysam
+    spans = []                                        # (contig, start, end, key) of the batch's regions
+    for line in regions.read_text().splitlines():
+        key = line.split("\t", 1)[0]
+        contig, rng = key.split("|", 1)[0].rsplit(":", 1)
+        a, b = rng.split("-")
+        spans.append((contig, int(a), int(b), key))
+    spans.sort()
+    starts = [(c, a) for c, a, _, _ in spans]
+    skipped = {l.split("\t", 1)[1] for l in repair_log.read_text().splitlines() if l.startswith("S\t")}
+
+    def region_of(contig, pos):
+        i = bisect.bisect_right(starts, (contig, pos)) - 1
+        if i < 0 or spans[i][0] != contig or not spans[i][1] <= pos <= spans[i][2]:
+            raise ValueError(f"batch record {contig}:{pos} lies in no logged region")
+        return spans[i][3]
+
+    header, records = [], []
+    with gzip.open(repair_vcf, "rt") as f:
+        for line in f:
+            (header if line.startswith("#") else records).append(line)
+    contig_order = {}
+    for line in header:
+        if line.startswith("##contig=<ID="):
+            contig_order[line[13:].split(",", 1)[0].rstrip(">\n")] = len(contig_order)
+    with gzip.open(batch_vcf, "rt") as f:
+        for line in f:
+            if not line.startswith("#"):
+                c, pos = line.split("\t", 2)[:2]
+                if region_of(c, int(pos)) in skipped:
+                    records.append(line)
+    records.sort(key=lambda l: (contig_order.get(l.split("\t", 1)[0], 1 << 30), int(l.split("\t", 2)[1])))
+    plain = out.with_name(out.name[:-3])              # .vcf
+    plain.write_text("".join(header + records))
+    out.unlink(missing_ok=True)
+    pysam.tabix_compress(str(plain), str(out), force=True)
+    plain.unlink()
+    pysam.tabix_index(str(out), preset="vcf", force=True)
+
+
 class GatkRunner:
     """The validator's HaplotypeCaller command (minos_subnet/templates/gatk.py) plus the verified speed-ups."""
 
@@ -213,12 +258,48 @@ class GatkRunner:
             status.unlink(missing_ok=True)
             if state == "exact" and o.exists():
                 out.append(CallSet(round.round_id, c.key, str(o), records_digest(o), dt, fidelity=fidelity))
+            elif state == "diverged" and o.exists() and Path(str(o) + ".minos.regions").exists():
+                # kept for repair(): the batch output is right everywhere except near deep spots
+                kept = o.with_name(o.name.replace(".vcf.gz", ".batch.vcf.gz"))
+                o.rename(kept)
+                Path(str(o) + ".minos.regions").rename(str(kept) + ".minos.regions")
+                Path(str(o) + ".tbi").unlink(missing_ok=True)
+                out.append(CallSet(round.round_id, c.key, str(kept), "", dt, ok=False, error=DIVERGED, fidelity=fidelity))
             else:
                 o.unlink(missing_ok=True)
                 out.append(CallSet(round.round_id, c.key, "", "", dt, ok=False,
                                    error=DIVERGED if state == "diverged" else f"variant status {state}",
                                    fidelity=fidelity))
         return out
+
+    def repair(self, round: Round, config: Config, diverged: CallSet, fidelity: str = FULL) -> CallSet:
+        """Exact callset for a diverged batch variant, from its batch output plus a repair run.
+
+        The repair run is the variant's own run, so its read pass keeps exactly the reads its real run keeps; every
+        region whose reads equal the batch's is skipped (no assembly/likelihoods/genotyping) and taken from the batch
+        output. Only regions touched by deep-spot read selection are computed. Falls back to a plain run if the
+        batch files are missing.
+        """
+        batch = Path(diverged.vcf) if diverged.vcf else None
+        regions = Path(str(batch) + ".minos.regions") if batch else None
+        if batch is None or not batch.exists() or not regions.exists():
+            return self.run(round, config, fidelity)
+        out = self._out(round, config, fidelity)
+        rep_vcf = out.with_name(out.name.replace(".vcf.gz", ".repair.vcf.gz"))
+        rep_log = Path(str(rep_vcf) + ".minos.repair")
+        t0 = time.time()
+        p = subprocess.run(self.command(round, config, fidelity, rep_vcf,
+                                        jvm_props={"minos.repair.log": f"/data/output/{regions.name}",
+                                                   "minos.repair.out": f"/data/output/{rep_log.name}"}),
+                           capture_output=True, text=True, timeout=self.timeout_s)
+        dt = time.time() - t0
+        if p.returncode != 0 or not rep_vcf.exists() or not rep_log.exists():
+            return CallSet(round.round_id, config.key, "", "", dt, ok=False, fidelity=fidelity,
+                           error=f"repair rc={p.returncode} {gatk_error(p.stderr)}")
+        splice_repair(batch, regions, rep_vcf, rep_log, out)
+        for f in (batch, regions, rep_vcf, Path(str(rep_vcf) + ".tbi"), rep_log):
+            f.unlink(missing_ok=True)
+        return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
 
 
 class HappyScorer:

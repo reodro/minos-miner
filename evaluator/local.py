@@ -50,6 +50,7 @@ class LocalExecutor:
         self._ready: List[CallSet] = []
         self._cancelled = set()
         self._solo = set()                         # job ids that must not be batched again
+        self._repair: Dict[str, CallSet] = {}      # job id -> its diverged batch output, for runner.repair
         self._lock = threading.Lock()
         self.batches_run = 0
         self.batched_jobs = 0
@@ -62,7 +63,10 @@ class LocalExecutor:
 
     def _run(self, jobs: List[EvalJob]) -> List[CallSet]:
         try:
-            if len(jobs) == 1:
+            if len(jobs) == 1 and jobs[0].job_id in self._repair:
+                j = jobs[0]
+                out = [self.runner.repair(j.round, j.config, self._repair.pop(j.job_id), j.fidelity)]
+            elif len(jobs) == 1:
                 out = [self.runner.run(jobs[0].round, jobs[0].config, jobs[0].fidelity)]
             else:
                 out = self.runner.run_batch(jobs[0].round, [j.config for j in jobs], jobs[0].fidelity)
@@ -130,8 +134,11 @@ class LocalExecutor:
                 for job, cs in zip(jobs, f.result()):
                     k = job_key(job)
                     if not cs.ok and cs.error == DIVERGED:
-                        # its batch output was not exact: run it alone (still counts as in flight)
+                        # its batch output was not exact: repair it if the runner can, else run it alone
+                        # (still counts as in flight)
                         self._solo.add(job.job_id)
+                        if hasattr(self.runner, "repair") and cs.vcf:
+                            self._repair[job.job_id] = cs
                         heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
                         continue
                     self._inflight.pop(k, None)

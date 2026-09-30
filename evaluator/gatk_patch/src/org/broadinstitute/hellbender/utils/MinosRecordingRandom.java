@@ -28,6 +28,25 @@ public final class MinosRecordingRandom extends Random {
 
     public void setRecording(final boolean on) { recording = on; }
 
+    // minos repair: QD jitter is the only Random use in genotyping, and it goes through nextGaussian. Counting those
+    // calls lets a repair run skip a region and still leave this generator exactly where the region would have left it
+    // (replaying whole nextGaussian calls also reproduces Random's cached second gaussian).
+    private transient long gaussians = 0;
+
+    @Override
+    public synchronized double nextGaussian() {
+        gaussians++;
+        return super.nextGaussian();
+    }
+
+    public long gaussians() { return gaussians; }
+
+    public void skipGaussians(final long n) {
+        for (long i = 0; i < n; i++) {
+            nextGaussian();
+        }
+    }
+
     /** Draws recorded since the last call, then cleared. */
     public List<int[]> takeDraws() {
         final List<int[]> out = draws;

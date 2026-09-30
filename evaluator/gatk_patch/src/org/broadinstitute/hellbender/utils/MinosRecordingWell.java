@@ -19,6 +19,7 @@ public final class MinosRecordingWell extends Well19937c {
     @Override
     protected int next(final int bits) {
         final int v = super.next(bits);
+        steps++;
         if (recording) {
             draws.add(new int[]{bits, v});
         }
@@ -34,7 +35,19 @@ public final class MinosRecordingWell extends Well19937c {
     }
 
     public boolean replay(final int[] draw) {
+        steps++;
         return super.next(draw[0]) == draw[1];
+    }
+
+    // minos repair: every next() is one state step of the generator, so a step count is enough to skip a region's draws
+    private transient long steps = 0;
+
+    public long steps() { return steps; }
+
+    public void skipSteps(final long n) {
+        for (long i = 0; i < n; i++) {
+            next(32);
+        }
     }
 
     public MinosRecordingWell copyState() {
