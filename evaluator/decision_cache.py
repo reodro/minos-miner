@@ -103,6 +103,20 @@ def make_clusters(truth_spans: Sequence[Tuple[int, int]], query: Sequence[Record
     return out
 
 
+def pack_clusters(clusters: Sequence[Cluster], gap: int = GAP) -> List[List[Cluster]]:
+    """Bins of clusters that can share one hap.py run: inside a bin, spans are disjoint and >= gap apart, the same
+    independence the cache relies on. First-fit over clusters sorted by start; order of the result is stable."""
+    bins: List[List[Cluster]] = []
+    for c in sorted(clusters, key=lambda c: (c.start, c.end)):
+        for b in bins:
+            if c.start - b[-1].end >= gap:
+                b.append(c)
+                break
+        else:
+            bins.append([c])
+    return bins
+
+
 def window_pad(gap: int = GAP) -> int:
     """Padding around a cluster's span when taking its hap.py lines: windows of distinct clusters never overlap."""
     return gap // 2 - 1
@@ -211,6 +225,41 @@ class _RoundCache:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def fill_packed(self, items: Dict[tuple, Tuple[Cluster, List[str]]], header: str, workers: int = 4) -> int:
+        """Cache many clusters (from any callsets) with as few hap.py runs as possible. `items` maps cluster key ->
+        (cluster, its query lines). Clusters >= gap apart share a run. Returns hap.py runs; raises if any run fails."""
+        bins = pack_clusters([c for c, _ in items.values()], self.gap)
+        pad = window_pad(self.gap)
+
+        def run_bin(i_bin):
+            i, b = i_bin
+            tmp = self.work_dir / f"pack_{uuid.uuid4().hex[:12]}"
+            tmp.mkdir(parents=True)
+            try:
+                q = tmp / "q.vcf"
+                body = sorted((l for c in b for l in items[c.key][1]), key=_line_pos)
+                q.write_text(header + "".join(body))
+                happy_vcf = self.run_happy(_bgzip_index(q))
+                if not happy_vcf:
+                    raise RuntimeError("hap.py produced no result for a packed run")
+                hdr, lines = [], []
+                with gzip.open(happy_vcf, "rt") as f:
+                    for line in f:
+                        (hdr if line[0] == "#" else lines).append(line if line[0] == "#" else (_line_pos(line), line))
+                lines.sort(key=lambda x: x[0])
+                return "".join(hdr), {c.key: lines_in_window(lines, c.start - pad, c.end + pad) for c in b}
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max(1, min(workers, len(bins)))) as pool:
+            results = list(pool.map(run_bin, enumerate(bins)))
+        for hdr, got in results:           # only after every run succeeded: all or nothing
+            if self.header is None:
+                self.header = hdr
+            self.lines.update(got)
+        return len(bins)
+
     def assemble(self, clusters: Sequence[Cluster], out: Path) -> Path:
         """The annotated VCF for these (all cached) clusters, bgzipped."""
         body = sorted((l for c in clusters for l in self.lines[c.key]), key=_line_pos)
@@ -234,7 +283,7 @@ class DecisionCacheScorer:
         self._caches: Dict[tuple, _RoundCache] = {}
         self._lock = threading.Lock()
         self._stats = {"callsets": 0, "cached_callsets": 0, "hits": 0, "misses": 0, "happy_runs": 0,
-                       "full_fallbacks": 0}
+                       "full_fallbacks": 0, "packed_runs": 0, "packed_failures": 0}
 
     # ---- public ----
     @property
@@ -277,6 +326,52 @@ class DecisionCacheScorer:
                              {k: ClassCounts(**cc[k]) for k in CLASSES}, int(metrics.get("region_fp_total", 0)),
                              answer_set.n_targets or 1, ratios, fidelity=callset.fidelity, job_id=callset.job_id)
         return finalize(result)
+
+    def score_many(self, callsets: Sequence[CallSet], answer_set: AnswerSet, workers: int = 4) -> List[ScoreResult]:
+        """Score a batch: new clusters of all callsets are deduplicated and packed into as few hap.py runs as
+        possible (run in parallel), then each callset is scored from the cache. Results equal score() per callset.
+        If a packed run fails, falls back to per-callset fills so one bad callset cannot fail the others."""
+        cache = self._cache_for(answer_set)
+        items: Dict[tuple, Tuple[Cluster, List[str]]] = {}
+        header = None
+        for cs in callsets:
+            if cs.fidelity != FULL or not cs.vcf:
+                continue
+            query = read_records(cs.vcf, cache.chrom, cache.start, cache.end)
+            missing = [c for c in cache.clusters(query) if c.key not in cache.lines and c.key not in items]
+            if not missing:
+                continue
+            spans = sorted((c.start, c.end) for c in missing)
+            by_span: Dict[Tuple[int, int], List[str]] = {sp: [] for sp in spans}
+            with _open(cs.vcf) as f:
+                for line in f:
+                    if line[0] == "#":
+                        continue
+                    p = line.split("\t", 2)
+                    if p[0] != cache.chrom:
+                        continue
+                    pos = int(p[1])
+                    i = bisect.bisect_right(spans, (pos, float("inf"))) - 1
+                    if i >= 0 and spans[i][0] <= pos <= spans[i][1]:
+                        by_span[spans[i]].append(line)
+            if header is None:
+                with _open(cs.vcf) as f:
+                    header = "".join(l for l in f if l[0] == "#")
+            for c in missing:
+                items[c.key] = (c, by_span[(c.start, c.end)])
+        if items:
+            with cache.lock:
+                items = {k: v for k, v in items.items() if k not in cache.lines}
+                if items:
+                    try:
+                        runs = cache.fill_packed(items, header, workers)
+                        self._count(happy_runs=runs, packed_runs=runs)
+                    except RuntimeError:
+                        self._count(packed_failures=1)     # per-callset fills below isolate the bad callset
+        out = []
+        for cs in callsets:
+            out.append(self.score(cs, answer_set))
+        return out
 
     # ---- internals ----
     def _count(self, **inc: int) -> None:
