@@ -40,7 +40,7 @@ def barrier_strategy(r, pop=16, quorum=1.0, generations=6, seed=1):
         for _ in range(generations):
             if client.exhausted:
                 return
-            await client.map(sampler.sample(pop), quorum=quorum, tag="ga")
+            await client.propose_all(sampler.sample(pop), quorum=quorum, tag="ga")
     return run
 
 
@@ -50,7 +50,7 @@ def sequential_strategy(r, seed=2):
 
     async def run(client):
         while not client.exhausted:
-            await client.submit(sampler.sample(1)[0], tag="cd")
+            await client.propose(sampler.sample(1)[0], tag="cd")
     return run
 
 
@@ -111,7 +111,7 @@ class LoopTest(unittest.TestCase):
 
         async def strategy(client):
             client.on_result.append(lambda o: seen.append(o.config.key))
-            res = await client.map(RandomSampler(self.r, seed=5).sample(8), quorum=0.75)
+            res = await client.propose_all(RandomSampler(self.r, seed=5).sample(8), quorum=0.75)
             self.assertIsNone(res[0])
             self.assertEqual(sum(o is not None for o in res), 7)
 
@@ -122,7 +122,7 @@ class LoopTest(unittest.TestCase):
         cfg = RandomSampler(self.r, seed=9).sample(1)[0]
 
         async def twice(client):
-            await asyncio.gather(client.map([cfg]), client.map([cfg]))
+            await asyncio.gather(client.propose_all([cfg]), client.propose_all([cfg]))
 
         _, _, ex = self.run_loop([twice], baselines=[])
         self.assertAlmostEqual(ex.busy, 60.0)
@@ -262,7 +262,7 @@ class BatchingExecutorTest(unittest.TestCase):
 
 
 class FamilySubmitTest(unittest.TestCase):
-    """submit_many: a family reaches the executor in one call, runs as one batch, and is charged as a family."""
+    """propose_many: a family reaches the executor in one call, runs as one batch, and is charged as a family."""
 
     def test_family_is_one_batch_and_cheap(self):
         r = ranges(); d = r.defaults("gatk").params
@@ -275,7 +275,7 @@ class FamilySubmitTest(unittest.TestCase):
 
         async def go():
             client = EvalClient(ROUND, ex, FakeScorer(runner), r, ResultStore(), StubProvider().build(ROUND), budget=10)
-            futs = client.submit_many(fam)
+            futs = client.propose_many(fam)
             while client.in_flight:
                 for cs in await asyncio.to_thread(ex.poll, 0.2):
                     client.deliver(cs)

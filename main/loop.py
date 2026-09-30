@@ -90,7 +90,7 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
     async def search():
         # Baselines first, in order: the first one that runs is submitted, so the round never ends empty.
         for c in baselines:
-            await client.submit(c, priority=10, tag="baseline")
+            await client.propose(c, priority=10, tag="baseline")
             if submitted[0] is not None:
                 break
         await asyncio.gather(*(s(client) for s in strategies))
@@ -137,7 +137,7 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                     out.answer_set_version = new.version
             maybe_submit()                        # an improvement held back by the interval goes out when it ends
             idle_spins = idle_spins + 1 if (virtual and not batch and client.in_flight == 0) else 0
-            if idle_spins > 1000:                 # strategies alive but submitting nothing: a strategy bug
+            if idle_spins > 1000:                 # strategies alive but proposing nothing: a strategy bug
                 log.warning("strategies stalled with nothing in flight; ending round")
                 break
     finally:

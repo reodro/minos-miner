@@ -49,7 +49,7 @@ def random_stream(ranges: ParamRanges, in_flight: int = 8, seed: int = 0, tag: s
         running = set()
         while True:
             while len(running) < in_flight and not client.exhausted:
-                running.add(client.submit(sampler.sample(1)[0], tag=tag))
+                running.add(client.propose(sampler.sample(1)[0], tag=tag))
             if not running:
                 return
             _, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)

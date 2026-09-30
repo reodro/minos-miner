@@ -2,7 +2,7 @@
 
 Loop: keep every worker busy (the executor's idle_slots; `in_flight` configs if it cannot tell). Whenever one frees, refit the forest on every result the client
 has (all strategies share them), score `n_candidates` proposals - mostly local moves around the best configs so
-far, some uniform random - by mean + kappa * spread across trees, and submit the best one together with a small
+far, some uniform random - by mean + kappa * spread across trees, and propose the best one together with a small
 family of cheap variants of it (same config except parameters the evaluator can batch almost for free), so the
 executor runs them as one GATK job. Failed configs count as the worst score seen, so the model learns to avoid them.
 The surrogate is scikit-learn's ExtraTreesRegressor; uncertainty is the spread of its trees' predictions.
@@ -66,7 +66,7 @@ def rf_ucb(ranges: ParamRanges, *, tool: str = "gatk", n_init: int = 16, in_flig
         def fresh(c: Optional[Config]) -> bool:
             return c is not None and c.key not in proposed and (c.key, FULL) not in client.latest and c.key not in failed
 
-        def propose() -> List[Config]:
+        def choose() -> List[Config]:
             if model[0] is None:
                 c = space.random(rng)
                 return [c] if fresh(c) else []
@@ -114,15 +114,15 @@ def rf_ucb(ranges: ParamRanges, *, tool: str = "gatk", n_init: int = 16, in_flig
             if fresh(c) and c.key not in {x.key for x in init}:
                 init.append(c)
         proposed.update(c.key for c in init)
-        pending |= set(client.submit_many(init, tag=tag))
+        pending |= set(client.propose_many(init, tag=tag))
         while True:
             while not client.exhausted and room():
                 refit_if_due()
-                batch = propose()
+                batch = choose()
                 if not batch:
                     break
                 proposed.update(c.key for c in batch)
-                pending |= set(client.submit_many(batch, tag=tag))
+                pending |= set(client.propose_many(batch, tag=tag))
             if not pending:
                 return
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)

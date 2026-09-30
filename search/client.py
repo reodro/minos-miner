@@ -1,8 +1,8 @@
 """EvalClient: lets search strategies read like direct calls while the executor runs asynchronously.
 
-    results = await client.map(configs)                 # wait for a batch (e.g. a GA generation)
-    results = await client.map(configs, quorum=0.9)     # barrier that tolerates stragglers
-    fut = client.submit(config); outcome = await fut    # single job
+    results = await client.propose_all(configs)         # wait for a batch (e.g. a GA generation)
+    results = await client.propose_all(configs, quorum=0.9)  # barrier that tolerates stragglers
+    fut = client.propose(config); outcome = await fut   # single config
     async for o in client.as_completed(futures): ...    # streaming (e.g. RF_UCB refill)
 
 Many strategies run concurrently as asyncio tasks on one client, so while one waits at a barrier the others keep
@@ -61,10 +61,10 @@ class EvalClient:
     def exhausted(self) -> bool:
         return self.budget is not None and self.spent >= self.budget
 
-    def submit(self, config: Config, *, fidelity: str = FULL, priority: int = 0, tag: str = "") -> asyncio.Future:
-        return self.submit_many([config], fidelity=fidelity, priority=priority, tag=tag)[0]
+    def propose(self, config: Config, *, fidelity: str = FULL, priority: int = 0, tag: str = "") -> asyncio.Future:
+        return self.propose_many([config], fidelity=fidelity, priority=priority, tag=tag)[0]
 
-    def submit_many(self, configs: Iterable[Config], *, fidelity: str = FULL, priority: int = 0,
+    def propose_many(self, configs: Iterable[Config], *, fidelity: str = FULL, priority: int = 0,
                     tag: str = "") -> List[asyncio.Future]:
         """Several configs in ONE executor call, so related ones (a family: same config except cheap
         parameters) are queued together and can share one GATK run. Budget: each is charged the executor's
@@ -109,11 +109,11 @@ class EvalClient:
         c = f(main, variant, fidelity) if f else None
         return 1.0 if c is None else c
 
-    async def map(self, configs: Iterable[Config], *, quorum: float = 1.0, fidelity: str = FULL, priority: int = 0,
+    async def propose_all(self, configs: Iterable[Config], *, quorum: float = 1.0, fidelity: str = FULL, priority: int = 0,
                   tag: str = "") -> List[Optional[Outcome]]:
         """Outcomes in input order. Returns once ceil(quorum * n) are done; the rest are None here but keep
         running, and their results still reach the store and every listener."""
-        futs = self.submit_many(configs, fidelity=fidelity, priority=priority, tag=tag)
+        futs = self.propose_many(configs, fidelity=fidelity, priority=priority, tag=tag)
         need = math.ceil(quorum * len(futs))
         pending = set(futs)
         while len(futs) - len(pending) < need:
