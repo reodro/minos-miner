@@ -154,12 +154,13 @@ class GatkRunner:
     """The validator's HaplotypeCaller command (minos_subnet/templates/gatk.py) plus the verified speed-ups."""
 
     def __init__(self, work_dir: Optional[str] = None, threads: int = 1, memory_gb: int = 4, timeout_s: int = 1800,
-                 patch_jar: Optional[str] = None):
+                 patch_jar: Optional[str] = None, container_prefix: str = "minos-run"):
         """patch_jar: our patched GATK classes (evaluator/gatk_patch), put before the GATK jar on the classpath,
         still inside the validator's image. None = the stock `gatk` wrapper."""
         self.work_dir = Path(work_dir or os.path.join(SETTINGS.cache_dir, "callsets"))
         self.threads, self.memory_gb, self.timeout_s = threads, memory_gb, timeout_s
         self.patch_jar = Path(patch_jar).resolve() if patch_jar else None
+        self.container_prefix = container_prefix     # names this runner's containers, so its owner can stop them
 
     def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path, jvm_props: Optional[dict] = None) -> list:
         from templates.tool_params import validate_and_build_flags   # upstream
@@ -168,7 +169,7 @@ class GatkRunner:
             raise ValueError("; ".join(flags["errors"]))
         bam, ref = Path(round.bam).resolve(), Path(round.reference).resolve()
         heap = f"-Xmx{max(512, int(self.memory_gb * 1024 * 0.8))}m"
-        cmd = ["docker", "run", "--rm", "--name", f"minos-run-{uuid.uuid4().hex[:10]}",
+        cmd = ["docker", "run", "--rm", "--name", f"{self.container_prefix}-{uuid.uuid4().hex[:10]}",
                f"--cpus={self.threads}", f"--memory={self.memory_gb}g",
                "-v", f"{bam.parent}:/data/bams:ro", "-v", f"{ref.parent}:/data/reference:ro",
                "-v", f"{out_vcf.parent}:/data/output"]

@@ -39,8 +39,8 @@ round opens ─▶ main: download BAM, announce round
 
 - Strategies never know where jobs run; the executor never knows why a job was chosen.
 - Running and scoring are separate steps: if the answer set changes, callsets are re-scored, never re-run.
-  On one machine scoring runs in a background thread; with a fleet (`--fleet`) the sub-VPS nodes run GATK **and**
-  score, and main only proposes and submits (see evaluator/README.md).
+  On one machine scoring runs in a background thread; with a fleet (`--fleet`) main controls the sub-VPSs over SSH,
+  they run GATK **and** score, and main only proposes and submits (see evaluator/README.md).
 - Related configs (a *family*: same config except cheap parameters) go to the executor together and run as **one**
   GATK job; each still gets its own exact result.
 

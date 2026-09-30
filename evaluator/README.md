@@ -79,27 +79,41 @@ Tests (all bit-identical to separate stock runs): genotyping 54/54, PairHMM 62/6
 
 ## Fleet (`evaluator/fleet/`)
 
+Main controls every sub-VPS over SSH; the sub-VPSs run GATK **and** score; main only builds the answer set, proposes
+configs and submits.
+
 ```
-main:   python -m main replay|live ... --fleet 0.0.0.0:8707 --cert fleet.crt --key fleet.key
-node:   python -m evaluator.fleet.node --main https://MAIN:8707 --cacert fleet.crt
-both:   MINOS_FLEET_TOKEN=<shared secret>   (env only - never in the repo or a config file)
+~/.minos/fleet.json on main (the inventory; re-read at every round start):
+  [{"host": "1.2.3.4", "user": "root", "port": 22, "key_filename": "~/.ssh/id_ed25519",
+    "workers": null, "enabled": true}]
+
+python -m evaluator.fleet.control provision            # fresh machines: copy repo, run scripts/setup_node.sh
+python -m evaluator.fleet.control status | sync | selftest | reap
+python -m main replay|live ... --fleet                 # mine with the fleet (main starts the node agents)
 ```
 
-- **`FleetExecutor`** (main) implements the same Executor protocol, so search and main do not change. Jobs wait in a
-  queue (dedup + result cache); a node asks for as many groups as it has free workers; a **family is always one
-  group** (one GATK run). Every hand-out is a **lease**: a node that stops heartbeating loses it after `lease_s`
-  and its unfinished jobs go back to the queue; a late result from an expired lease still counts, duplicates are
-  ignored. Main serves each round's truth files (and the BAM when no presigned URL is given).
-- **Node agent** (sub-VPS): before joining, a **self-test** runs a fixed config on a 3.6 MB BAM slice and must
-  reproduce `fleet/selftest.json`'s digest exactly (~11 s); then it pulls work, runs it with `LocalExecutor`
-  (batching, divergence repair, dedup), **scores every callset on the node** (DecisionCacheScorer, 2 threads) and
-  returns callsets carrying their score. VCFs stay on the node (~1 KB per result over the network).
-- **Security**: every request carries the token; off localhost main refuses to start without TLS
-  (`scripts/make_fleet_cert.sh`) and nodes refuse plain http.
-- **Setup a node**: `scripts/setup_node.sh` (docker, JDK, venv, images, patch jar, reference genomes).
-- Tested (`tests/test_fleet.py`, `test/fleet_local.py`): 2 node processes on one machine, 8 configs incl. a family
-  of 6 - 8/8 scores identical to the single-machine path; a node killed while holding work had its 7 jobs re-queued
-  and finished by the other; results in 130 s. **Not yet run on real separate VPSs.**
+- **Inventory**: `workers: null` = the node's own rule floor(cores x 0.95 - 1); `port` lets several machines share
+  one IP; optional `repo` / `data_dir`. No passphrase field: unlock keys with `ssh-agent`.
+- **`FleetExecutor`** (main) implements the same Executor protocol, so search and main do not change. For every
+  enabled host it keeps one SSH session running the node agent (`python -m evaluator.fleet.node --stdio`); jobs go
+  down and scored callsets come back as JSON lines on that session. One queue with dedup and a result cache; a
+  **family is always one group** (one GATK run); a node gets groups while it has fewer open groups than workers.
+- **Joining**: main pushes the self-test bundle and starts the agent; the node is used only if its **self-test**
+  (a fixed config on a 3.6 MB BAM slice, ~11 s) reproduces `fleet/selftest.json`'s digest exactly **and** its code
+  digest equals main's (`control sync` fixes a mismatch).
+- **Rounds**: main pushes each round's truth files with rsync (and the BAM in replays); on live rounds each node
+  downloads the BAM from the presigned URL itself.
+- **Failure**: when a session ends (node died, network dropped), that node's unfinished jobs go straight back to the
+  queue; main reconnects later. When main stops, every node stops and kills the GATK containers it started.
+- **Node side**: `LocalExecutor` (batching, divergence repair, dedup) + `DecisionCacheScorer` threads; only scores
+  travel back (~1 KB per result), VCFs stay on the node.
+- **Setup a node**: `control provision` runs `scripts/setup_node.sh` over SSH (docker, JDK, venv, images, patch
+  jar, reference genomes).
+- Tested: `tests/test_fleet.py` runs the real node agent as subprocesses (fake GATK): scored results, families as
+  one group, a killed node's jobs re-queued to the other, nodes with a failing self-test or other code rejected.
+  `test/fleet_local.py` (real GATK, 2 nodes from an inventory, no ssh hop): 8 configs incl. a family of 6, the node
+  holding all 8 jobs killed at 61 s - all re-queued, finished by the other node, **8/8 scores identical** to the
+  single-machine path in 188 s, no agent or container left behind. **Not yet run over real ssh / separate VPSs.**
 - Trap found: `LocalExecutor.poll` used to return at once when idle; callers poll in loops, and the spin starved the
   scoring threads of the GIL (scoring 20x slower). An idle poll now waits for a submit.
 

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Turn a fresh Ubuntu sub-VPS into a fleet node (GATK + scoring). Run as root, from a clone of this repo.
-#   bash scripts/setup_node.sh
-# Then:  MINOS_FLEET_TOKEN=... .venv/bin/python -m evaluator.fleet.node --main https://MAIN:8707 --cacert fleet.crt
-# The token is never written to disk by this script; put it in the service environment yourself.
+# Turn a fresh Ubuntu sub-VPS into a fleet node (GATK + scoring). Normally run by main, not by hand:
+#   python -m evaluator.fleet.control provision <host>     (copies the repo, runs this script, pushes the self-test)
+# Main then starts the node agent itself over ssh whenever it mines with --fleet.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
@@ -10,11 +9,11 @@ DATA_DIR="${DATA_DIR:-/minos/data}"
 
 apt-get update -q
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io openjdk-17-jdk-headless python3-venv python3-pip \
-  bcftools curl git
+  bcftools curl git rsync
 systemctl enable --now docker
 
 # upstream repo: scoring formula and the validator's templates
-[ -d /minos/minos_subnet ] || git clone https://github.com/minos-protocol/minos_subnet.git /minos/minos_subnet
+[ -d /minos/minos_subnet ] || git clone -q https://github.com/minos-protocol/minos_subnet.git /minos/minos_subnet
 
 # python env
 python3 -m venv .venv && .venv/bin/pip install -q --upgrade pip && .venv/bin/pip install -q -r requirements.txt
@@ -35,4 +34,4 @@ bash evaluator/gatk_patch/build.sh
 DATA_DIR="$DATA_DIR" bash scripts/fetch_genome.sh
 
 echo "node ready. workers: $(.venv/bin/python -c 'from common.settings import default_workers; print(default_workers())')"
-echo "next: copy main's fleet.crt here, set MINOS_FLEET_TOKEN, start: .venv/bin/python -m evaluator.fleet.node --main https://MAIN:8707 --cacert fleet.crt"
+echo "done: main starts the node agent over ssh (python -m main ... --fleet)"

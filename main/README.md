@@ -33,11 +33,12 @@ Try `python -m main live --wallet W --hotkey H --demo` first.
 .venv/bin/python -m main replay <round_tag> --minutes 20 [--strategy rf_ucb|random]
 .venv/bin/python -m main live --wallet W --hotkey H [--demo]
 # either one with a fleet: main only proposes, sub-VPS nodes run GATK and score (see evaluator/README.md)
-MINOS_FLEET_TOKEN=... .venv/bin/python -m main replay <tag> --fleet 0.0.0.0:8707 --cert fleet.crt --key fleet.key
+.venv/bin/python -m main replay <tag> --fleet            # sub-VPSs from ~/.minos/fleet.json, controlled over ssh
 ```
 
 With `--fleet`, `mine_round` publishes each round (truth files, BAM location) to the nodes once the answer set
-exists; replay cannot print the TRUE score then (the final VCF is on a node).
+exists; when main stops, every node agent stops. Replay cannot print the TRUE score then (the final VCF is on a
+node).
 
 ## Open work
 

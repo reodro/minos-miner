@@ -6,8 +6,8 @@ replay  the whole miner on a stored round, as if live: real answer set, real GAT
         submitted, that config's TRUE score (released truth) and its rank among the real submissions.
 live    the real miner (needs bittensor, httpx and a registered wallet; untested - try --demo first).
 
---fleet HOST:PORT (both commands): main only proposes; GATK and scoring run on sub-VPS node agents
-        (python -m evaluator.fleet.node). Set MINOS_FLEET_TOKEN on main and every node.
+--fleet [INVENTORY] (both commands): main only proposes; GATK and scoring run on the sub-VPSs listed in the
+        inventory (default ~/.minos/fleet.json), which main starts and controls over ssh.
 """
 from __future__ import annotations
 
@@ -38,15 +38,15 @@ def reference_for(chrom: str) -> str:
 _FLEET = {}
 
 
-def fleet_executor(listen: str, certfile=None, keyfile=None):
+def fleet_executor(inventory: str):
     """One coordinator per process, started on first use: main only proposes; sub-VPS nodes run and score."""
     if "ex" not in _FLEET:
+        from pathlib import Path
         from evaluator.fleet.coordinator import FleetExecutor
         from evaluator.gatk import DEFAULT_PATCH_JAR, GatkRunner
-        host, port = listen.rsplit(":", 1)
         planner = GatkRunner(patch_jar=DEFAULT_PATCH_JAR)          # only groups and prices families; never runs
-        _FLEET["ex"] = FleetExecutor(planner, host=host, port=int(port), certfile=certfile, keyfile=keyfile).start()
-        logging.info("fleet coordinator listening on %s (%s)", listen, "https" if certfile else "http")
+        _FLEET["ex"] = FleetExecutor(planner, inventory=Path(inventory).expanduser()).start()
+        logging.info("fleet: nodes from %s", inventory)
     return _FLEET["ex"]
 
 
@@ -108,25 +108,23 @@ def main() -> None:
     b = sp.add_parser("live"); b.add_argument("--wallet", required=True); b.add_argument("--hotkey", required=True)
     b.add_argument("--demo", action="store_true"); b.add_argument("--workers", type=int, default=default_workers())
     for p in (a, b):
-        p.add_argument("--fleet", metavar="HOST:PORT", help="serve jobs to sub-VPS nodes instead of running GATK here "
-                                                        "(token: MINOS_FLEET_TOKEN)")
-        p.add_argument("--cert", help="TLS certificate for the fleet API (required unless it listens on 127.0.0.1)")
-        p.add_argument("--key", help="TLS key for the fleet API")
+        p.add_argument("--fleet", nargs="?", const="~/.minos/fleet.json", metavar="INVENTORY",
+                       help="run GATK and scoring on the sub-VPSs in the inventory (over ssh) instead of here")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    fleet = None
-    if args.fleet:
-        if not args.cert and not args.fleet.startswith("127.0.0.1:"):
-            raise SystemExit("--fleet off localhost needs --cert/--key: the token must not travel in plain http")
-        fleet = fleet_executor(args.fleet, args.cert, args.key)
-    if args.cmd == "replay":
-        replay(args.tag, args.minutes, args.strategy, args.workers, fleet)
-    else:
-        from main.miner import PlatformSubmitter, UpstreamPlatform, run_forever
-        platform = UpstreamPlatform(args.wallet, args.hotkey, demo=args.demo)
-        r = ranges()
-        run_forever(platform, lambda rnd: make_parts(rnd, r, "rf_ucb", PlatformSubmitter(platform), args.workers,
-                                                     fleet), reference_for)
+    fleet = fleet_executor(args.fleet) if args.fleet else None
+    try:
+        if args.cmd == "replay":
+            replay(args.tag, args.minutes, args.strategy, args.workers, fleet)
+        else:
+            from main.miner import PlatformSubmitter, UpstreamPlatform, run_forever
+            platform = UpstreamPlatform(args.wallet, args.hotkey, demo=args.demo)
+            r = ranges()
+            run_forever(platform, lambda rnd: make_parts(rnd, r, "rf_ucb", PlatformSubmitter(platform), args.workers,
+                                                         fleet), reference_for)
+    finally:
+        if fleet is not None:
+            fleet.close()                         # every node agent stops and kills its GATK containers
 
 
 if __name__ == "__main__":

@@ -1,7 +1,4 @@
-fastapi==0.142.2
-httpx==0.28.1
 numpy==2.2.6
 pysam==0.24.1
 scikit-learn==1.7.2
 scipy==1.15.3
-uvicorn==0.54.0
