@@ -62,3 +62,32 @@ class GatkEndToEndTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VariantFileTest(unittest.TestCase):
+    """The patch reads variant columns by position: 1-4 genotyping, 5-8 PairHMM, 9-14 assembly, 15-17 activity."""
+
+    def test_columns_and_defaults(self):
+        from evaluator.gatk import variant_line
+        f = variant_line(Config("gatk", {"min_pruning": 3, "recover_all_dangling_branches": True,
+                                         "max_assembly_region_size": 450}), "/data/output/v.vcf.gz").rstrip("\n").split("\t")
+        self.assertEqual(len(f), 18)
+        self.assertEqual(f[0], "/data/output/v.vcf.gz")
+        self.assertEqual(f[1:5], ["30.0", "0.000125", "6", "0.0"])
+        self.assertEqual(f[5:9], ["18", "CONSERVATIVE", "10", "45"])
+        self.assertEqual(f[9:15], ["3", "4", "true", "128", "0.001", "2.302585"])
+        self.assertEqual(f[15:18], ["0.002", "50", "450"])
+
+    def test_activity_params_batch_together_but_padding_does_not(self):
+        r = GatkRunner(patch_jar="/nonexistent.jar")
+        base = Config("gatk", {"min_pruning": 2})
+        self.assertEqual(r.branch_key(base), r.branch_key(Config("gatk", {"min_pruning": 2, "active_probability_threshold": 0.005,
+                                                                         "min_assembly_region_size": 30})))
+        self.assertNotEqual(r.branch_key(base), r.branch_key(Config("gatk", {"min_pruning": 2, "assembly_region_padding": 50})))
+
+
+class WorkersRuleTest(unittest.TestCase):
+    def test_floor_of_95_percent_minus_one(self):
+        from common.settings import default_workers
+        with mock.patch.dict(os.environ, {"MINOS_WORKERS": ""}):
+            self.assertEqual([default_workers(c) for c in (2, 8, 16, 32, 64, 128)], [1, 6, 14, 29, 59, 120])

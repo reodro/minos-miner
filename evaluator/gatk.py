@@ -57,7 +57,20 @@ ASSEMBLY_BRANCH_PARAMS = ("min_pruning", "min_dangling_branch_length", "recover_
 ASSEMBLY_DEFAULTS = {"min_pruning": 2, "min_dangling_branch_length": 4, "recover_all_dangling_branches": False,
                      "max_num_haplotypes_in_population": 128, "adaptive_pruning_initial_error_rate": 0.001,
                      "pruning_lod_threshold": 2.302585}
-BRANCH_PARAMS = GENOTYPING_BRANCH_PARAMS + PAIRHMM_BRANCH_PARAMS + ASSEMBLY_BRANCH_PARAMS
+# Read only when the traversal cuts the activity profile into regions (assembly_region_padding is not: it also sets
+# how far each read shard reaches): variants differing in these get their own region stream from the shared per-locus
+# activity states and reads, then assembly and everything after it.
+ACTIVITY_BRANCH_PARAMS = ("active_probability_threshold", "min_assembly_region_size", "max_assembly_region_size")
+ACTIVITY_DEFAULTS = {"active_probability_threshold": 0.002, "min_assembly_region_size": 50, "max_assembly_region_size": 300}
+BRANCH_PARAMS = GENOTYPING_BRANCH_PARAMS + PAIRHMM_BRANCH_PARAMS + ASSEMBLY_BRANCH_PARAMS + ACTIVITY_BRANCH_PARAMS
+def variant_line(config: Config, output: str) -> str:
+    """One line of the patch's variants file: output path, then every branch parameter (config value or default)."""
+    def fmt(v):
+        return str(v).lower() if isinstance(v, bool) else str(v)
+    defaults = {**GENOTYPING_DEFAULTS, **PAIRHMM_DEFAULTS, **ASSEMBLY_DEFAULTS, **ACTIVITY_DEFAULTS}
+    return "\t".join([output] + [fmt(config.params.get(p, defaults[p])) for p in BRANCH_PARAMS]) + "\n"
+
+
 DIVERGED = "minos:diverged"      # batch variant whose own run would differ; the executor re-runs it alone
 DEFAULT_PATCH_JAR = os.path.join(os.path.dirname(__file__), "gatk_patch", "build", "minos-patch.jar")
 
@@ -167,13 +180,7 @@ class GatkRunner:
         main = self._out(round, configs[0], fidelity)
         outs = [self._out(round, c, fidelity) for c in configs[1:]]
         spec = main.parent / f"variants_{uuid.uuid4().hex[:10]}.tsv"
-        spec.write_text("".join(
-            "\t".join([f"/data/output/{o.name}"]
-                      + [str(c.params.get(p, GENOTYPING_DEFAULTS[p])) for p in GENOTYPING_BRANCH_PARAMS]
-                      + [str(c.params.get(p, PAIRHMM_DEFAULTS[p])) for p in PAIRHMM_BRANCH_PARAMS]
-                      + [str(c.params.get(p, ASSEMBLY_DEFAULTS[p])).lower() if isinstance(c.params.get(p, ASSEMBLY_DEFAULTS[p]), bool)
-                         else str(c.params.get(p, ASSEMBLY_DEFAULTS[p])) for p in ASSEMBLY_BRANCH_PARAMS]) + "\n"
-            for c, o in zip(configs[1:], outs)))
+        spec.write_text("".join(variant_line(c, f"/data/output/{o.name}") for c, o in zip(configs[1:], outs)))
         t0 = time.time()
         try:
             p = subprocess.run(self.command(round, configs[0], fidelity, main,

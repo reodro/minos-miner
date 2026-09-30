@@ -26,6 +26,16 @@ class Settings:
         return os.path.join(self.data_dir, "cache")
 
 
+def default_workers(cores: int = 0) -> int:
+    """GATK workers per machine (1 thread each): floor(cores * 0.95 - 1), leaving room for scoring and the system.
+    Same rule on every fleet machine; override with MINOS_WORKERS."""
+    env = os.environ.get("MINOS_WORKERS")
+    if env:
+        return int(env)
+    cores = cores or os.cpu_count() or 1
+    return max(1, int(cores * 0.95 - 1))
+
+
 def _load() -> Settings:
     kw = {}
     for f in fields(Settings):

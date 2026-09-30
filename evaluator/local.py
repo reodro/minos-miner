@@ -9,6 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from common.settings import default_workers
 from common.types import CallSet, EvalJob
 from evaluator.base import Runner
 
@@ -33,8 +34,9 @@ class LocalExecutor:
     batched - only jobs already queued ride along. A variant that comes back DIVERGED is re-queued to run alone.
     """
 
-    def __init__(self, runner: Runner, workers: int = 4, max_batch: int = 32):
+    def __init__(self, runner: Runner, workers: Optional[int] = None, max_batch: int = 32):
         self.runner = runner
+        workers = workers or default_workers()
         self.workers = workers
         self.max_batch = max_batch
         self._batching = hasattr(runner, "run_batch") and hasattr(runner, "branch_key")

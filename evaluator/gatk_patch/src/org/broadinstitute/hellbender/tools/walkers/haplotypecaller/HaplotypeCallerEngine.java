@@ -77,7 +77,7 @@ import java.util.stream.Collectors;
  * -Repeatedly call {@link #callRegion} to call variants in each region, and add them to your writer
  * -When done, call {@link #shutdown}. Close the writer you got from {@link #makeVCFWriter} yourself.
  */
-public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
+public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyRegionIterator.MinosActivityHook {
 
     private static final Logger logger = LogManager.getLogger(HaplotypeCallerEngine.class);
 
@@ -1007,8 +1007,8 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         // own genotyping engine and random streams.
         final Map<String, AlleleLikelihoods<GATKRead, Haplotype>> minosLikelihoods = new HashMap<>();
         for (final MinosGenotypingVariant v : minosGenotypingVariants) {
-            if (v.assemblyKey != null) {
-                continue;                          // handled right after the main assembly
+            if (v.assemblyKey != null || v.stream >= 0) {
+                continue;                          // handled right after the main assembly / by its activity stream
             }
             AlleleLikelihoods<GATKRead, Haplotype> rl = subsettedReadLikelihoodsFinal;
             AlleleLikelihoods<GATKRead, Haplotype> preFilter = readLikelihoods;
@@ -1246,6 +1246,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         final HaplotypeCallerGenotypingEngine engine;
         final String likelihoodKey;          // null = same PairHMM parameters as the main config
         final String assemblyKey;            // null = same assembly parameters as the main config
+        final HaplotypeCallerArgumentCollection args;
+        double[] activity = null;            // {threshold, min size, max size}; null = the main config's
+        int stream = -1;                     // activity stream, -1 = the main config's regions
         final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng =
                 Utils.minosGlobalRandom().copyState();   // same state as the global at start, like a fresh run
         final org.broadinstitute.hellbender.utils.MinosRecordingWell well = Utils.minosGlobalWell().copyState();
@@ -1255,7 +1258,8 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         boolean diverged = false;
 
         MinosGenotypingVariant(final String output, final HaplotypeCallerGenotypingEngine engine, final String likelihoodKey,
-                               final String assemblyKey) {
+                               final String assemblyKey, final HaplotypeCallerArgumentCollection args) {
+            this.args = args;
             this.output = output;
             this.engine = engine;
             this.likelihoodKey = likelihoodKey;
@@ -1277,7 +1281,8 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         }
         if (hcArgs.stepwiseFiltering || hcArgs.filterAlleles || hcArgs.dontGenotype
                 || hcArgs.pileupDetectionArgs.usePileupDetection
-                || assemblyDebugOutStream != null || hcArgs.likelihoodArgs.likelihoodEngineImplementation != ReadLikelihoodCalculationEngine.Implementation.PairHMM) {
+                || assemblyDebugOutStream != null || hcArgs.justDetermineActiveRegions || hcArgs.sampleNameToUse != null
+                || hcArgs.likelihoodArgs.likelihoodEngineImplementation != ReadLikelihoodCalculationEngine.Implementation.PairHMM) {
             throw new UserException("minos.gt.variants: a HaplotypeCaller mode the batch path does not replicate is enabled");
         }
         final List<String> lines;
@@ -1329,7 +1334,12 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
             final HaplotypeCallerGenotypingEngine engine =
                     new HaplotypeCallerGenotypingEngine(args, samplesList, !hcArgs.doNotRunPhysicalPhasing, hcArgs.applyBQD);
             engine.setAnnotationEngine(annotationEngine);
-            minosGenotypingVariants.add(new MinosGenotypingVariant(f[0], engine, likelihoodKey, assemblyKey));
+            final MinosGenotypingVariant variant = new MinosGenotypingVariant(f[0], engine, likelihoodKey, assemblyKey, args);
+            if (f.length > 15) {                   // optional activity columns: threshold, min size, max size
+                variant.activity = new double[]{Double.parseDouble(f[15]), Integer.parseInt(f[16]), Integer.parseInt(f[17])};
+                AssemblyRegionIterator.minosHook = this;
+            }
+            minosGenotypingVariants.add(variant);
         }
         logger.info("minos: " + minosGenotypingVariants.size() + " variants, " + minosLikelihoodEngines.size()
                 + " extra likelihood engines");
@@ -1561,9 +1571,12 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         for (final Map.Entry<String, ReadThreadingAssembler> group : minosAssemblyEngines.entrySet()) {
             final List<MinosGenotypingVariant> members = new ArrayList<>();
             for (final MinosGenotypingVariant v : minosGenotypingVariants) {
-                if (group.getKey().equals(v.assemblyKey)) {
+                if (group.getKey().equals(v.assemblyKey) && v.stream < 0) {
                     members.add(v);
                 }
+            }
+            if (members.isEmpty()) {
+                continue;                          // all its variants have their own activity streams
             }
             // assembly and later steps draw no random numbers, but route any to the group's first variant anyway
             Utils.minosSetRandomOverride(members.get(0).rng);
@@ -1641,6 +1654,85 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
                     regionForGenotyping.getSpan(), features, givenAlleles, emitReferenceConfidence(), hcArgs.maxMnpDistance,
                     readsHeader, false, new HashSet<>(), rl)
                 .getCalls().stream().map(RMSMappingQuality.getInstance()::finalizeRawMQ).forEach(v.writer::add);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // minos: activity streams (see AssemblyRegionIterator). A stream's regions come straight from the traversal, so
+    // each is called from scratch like callRegion does: the same early exits, then assembly and everything after it
+    // per distinct assembly setting of the stream's variants.
+    // ---------------------------------------------------------------------------------------------------------------
+    private double[] minosMainActivity = null;
+    private final List<List<MinosGenotypingVariant>> minosStreamMembers = new ArrayList<>();
+    private final Map<String, ReadThreadingAssembler> minosStreamAssemblers = new LinkedHashMap<>();
+
+    @Override
+    public List<double[]> minosActivityStreams(final double activeProbThreshold, final int minRegionSize, final int maxRegionSize) {
+        final double[] main = {activeProbThreshold, minRegionSize, maxRegionSize};
+        if (minosMainActivity != null) {
+            if (!Arrays.equals(minosMainActivity, main)) {
+                throw new UserException("minos: activity settings changed between shards");
+            }
+        } else {
+            minosMainActivity = main;
+            final Map<String, Integer> index = new LinkedHashMap<>();
+            for (final MinosGenotypingVariant v : minosGenotypingVariants) {
+                if (v.activity == null || Arrays.equals(v.activity, main)) {
+                    continue;
+                }
+                final String key = v.activity[0] + "|" + v.activity[1] + "|" + v.activity[2];
+                v.stream = index.computeIfAbsent(key, k -> {
+                    minosStreamMembers.add(new ArrayList<>());
+                    return minosStreamMembers.size() - 1;
+                });
+                minosStreamMembers.get(v.stream).add(v);
+                minosStreamAssemblers.computeIfAbsent(minosAssemblyKey(v.args), k -> v.args.createReadThreadingAssembler());
+            }
+            logger.info("minos: " + minosStreamMembers.size() + " activity streams");
+        }
+        final List<double[]> specs = new ArrayList<>();
+        for (final List<MinosGenotypingVariant> members : minosStreamMembers) {
+            specs.add(members.get(0).activity);
+        }
+        return specs;
+    }
+
+    @Override
+    public void minosProcessRegion(final int stream, final AssemblyRegion region, final ReferenceContext referenceContext,
+                                   final FeatureContext features) {
+        if (haplotypeBAMWriter.isPresent()) {
+            throw new UserException("minos.gt.variants: --bam-output is not supported with activity variants");
+        }
+        if (!region.isActive()) {
+            return;
+        }
+        final List<Event> givenAlleles = features.getValues(hcArgs.alleles).stream()
+                .filter(vc -> hcArgs.forceCallFiltered || vc.isNotFiltered())
+                .flatMap(vc -> GATKVariantContextUtils.splitVariantContextToEvents(vc, false, GenotypeAssignmentMethod.BEST_MATCH_TO_ORIGINAL, false).stream())
+                .collect(Collectors.toList());
+        if (givenAlleles.isEmpty() && region.size() == 0) {
+            return;
+        }
+        minosSyncRandom();
+        final Map<String, List<MinosGenotypingVariant>> groups = new LinkedHashMap<>();
+        for (final MinosGenotypingVariant v : minosStreamMembers.get(stream)) {
+            groups.computeIfAbsent(minosAssemblyKey(v.args), k -> new ArrayList<>()).add(v);
+        }
+        for (final Map.Entry<String, List<MinosGenotypingVariant>> group : groups.entrySet()) {
+            final List<MinosGenotypingVariant> members = group.getValue();
+            Utils.minosSetRandomOverride(members.get(0).rng);
+            Utils.minosSetRandomDataOverride(members.get(0).rdg);
+            Utils.minosGlobalRandom().setRecording(false);
+            Utils.minosGlobalWell().setRecording(false);
+            try {
+                minosCallAssemblyGroup(region, features, referenceContext, givenAlleles,
+                        minosStreamAssemblers.get(group.getKey()), members);
+            } finally {
+                Utils.minosSetRandomOverride(null);
+                Utils.minosSetRandomDataOverride(null);
+                Utils.minosGlobalRandom().setRecording(true);
+                Utils.minosGlobalWell().setRecording(true);
+            }
         }
     }
 }
