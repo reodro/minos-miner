@@ -135,22 +135,47 @@ class EvalClient:
         return len(self._pending)
 
     def deliver(self, cs: CallSet) -> None:
-        fut, config, tag = self._pending.pop(cs.job_id, (None, self.configs.get(cs.config_key), ""))
-        outcome = Outcome(config, None, cs.error, tag)
-        if cs.ok:
-            self.callsets[(cs.config_key, cs.fidelity)] = cs
+        """Score one callset now and hand its outcome to the waiting strategy (synchronous path)."""
+        result, error = (self.score_batch([cs])[0] if cs.ok else (None, None))
+        self.complete(cs, result, error)
+
+    def score_batch(self, callsets: List[CallSet]) -> List[Tuple[Optional[ScoreResult], Optional[str]]]:
+        """(result, error) per callset against the current answer set. Safe to run in a worker thread; packs the
+        batch into shared hap.py runs when the scorer supports it (score_many)."""
+        many = getattr(self.scorer, "score_many", None)
+        if many and len(callsets) > 1:
             try:
-                r = self.scorer.score(cs, self.answer_set)
-                self.latest[(cs.config_key, cs.fidelity)] = r
-                self.store.add(r, config, cs.runtime_s, tag)
-                outcome.result = r
+                return [(r, None) for r in many(callsets, self.answer_set)]
+            except Exception as e:  # noqa: BLE001 - one bad callset must not sink the batch: fall back one by one
+                log.warning("packed scoring failed (%s); scoring one by one", e)
+        out = []
+        for cs in callsets:
+            try:
+                out.append((self.scorer.score(cs, self.answer_set), None))
             except Exception as e:  # a scorer failure is that config's failure, not the round's
                 log.warning("scoring failed for %s: %s", cs.config_key, e)
-                outcome.error = f"scoring failed: {e}"
+                out.append((None, f"scoring failed: {e}"))
+        return out
+
+    def complete(self, cs: CallSet, result: Optional[ScoreResult], error: Optional[str] = None) -> None:
+        """Record a callset and its score (or failure), resolve the strategy's future, notify listeners."""
+        fut, config, tag = self._pending.pop(cs.job_id, (None, self.configs.get(cs.config_key), ""))
+        outcome = Outcome(config, None, cs.error or error, tag)
+        if cs.ok:
+            self.callsets[(cs.config_key, cs.fidelity)] = cs
+            if result is not None:
+                self.latest[(cs.config_key, cs.fidelity)] = result
+                self.store.add(result, config, cs.runtime_s, tag)
+                outcome.result = result
         if fut is not None and not fut.done():
             fut.set_result(outcome)
         for cb in self.on_result:
             cb(outcome)
+
+    def idle_slots(self) -> Optional[int]:
+        """Executor capacity free right now (None if the executor cannot tell)."""
+        f = getattr(self.executor, "idle_slots", None)
+        return f() if f else None
 
     def rescore(self, answer_set: AnswerSet) -> None:
         """New answer-set version: re-score every stored callset (milliseconds each), then notify strategies."""

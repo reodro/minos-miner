@@ -12,6 +12,7 @@ from typing import Awaitable, Callable, List
 
 from common.params import ParamRanges
 from common.types import Config
+from search.space import PINNED
 from search.client import EvalClient
 
 Strategy = Callable[[EvalClient], Awaitable[None]]
@@ -34,7 +35,7 @@ class RandomSampler:
         """n configs that pass ParamRanges.errors, including the cross-parameter constraints GATK enforces."""
         out = []
         while len(out) < n:
-            c = Config(self.tool, {k: self._value(s) for k, s in self.specs.items()})
+            c = Config(self.tool, {k: PINNED.get(self.tool, {}).get(k, self._value(s)) for k, s in self.specs.items()})
             if not self.ranges.errors(c):
                 out.append(c)
         return out

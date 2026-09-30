@@ -2,7 +2,7 @@
 
 Every tunable parameter maps to one feature in [0, 1]: numeric ranges linearly, or on a log scale when they span
 more than two orders of magnitude (rates, heterozygosities); bools 0/1; enums by position. Parameters with a
-single allowed value are fixed and not features.
+single allowed value are fixed and not features, and so are the values in PINNED: settings that can never score.
 """
 from __future__ import annotations
 
@@ -14,11 +14,17 @@ from common.params import ParamRanges, ParamSpec
 from common.types import Config
 
 
+# GVCF / BP_RESOLUTION make GATK write reference blocks (one record per position); hap.py rejects that output on the
+# validator too, so such a config scores nothing (checked on 20260928T092900Z with the validator-exact path).
+PINNED = {"gatk": {"emit_ref_confidence": "NONE"}}
+
+
 class Space:
-    def __init__(self, ranges: ParamRanges, tool: str = "gatk"):
+    def __init__(self, ranges: ParamRanges, tool: str = "gatk", pinned: Optional[Dict[str, object]] = None):
         self.ranges, self.tool = ranges, tool
         self.specs: Dict[str, ParamSpec] = ranges.tools[tool]
-        self.names: List[str] = [n for n, s in sorted(self.specs.items()) if not self._fixed(s)]
+        self.pinned = dict(PINNED.get(tool, {}) if pinned is None else pinned)
+        self.names: List[str] = [n for n, s in sorted(self.specs.items()) if not self._fixed(s) and n not in self.pinned]
 
     @staticmethod
     def _fixed(s: ParamSpec) -> bool:
@@ -55,8 +61,8 @@ class Space:
     def random(self, rng: random.Random) -> Config:
         """A uniform random config that passes the platform's ranges and cross-parameter constraints."""
         for _ in range(1000):
-            params = {n: self._from_unit(s, rng.random()) if n in self.names else (s.allowed[0] if s.allowed else s.default)
-                      for n, s in self.specs.items()}
+            params = {n: self._from_unit(s, rng.random()) if n in self.names
+                      else self.pinned.get(n, s.allowed[0] if s.allowed else s.default) for n, s in self.specs.items()}
             c = Config(self.tool, params)
             if not self.ranges.errors(c):
                 return c

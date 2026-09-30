@@ -26,12 +26,4 @@ class DryRunSubmitter:
         return True
 
 
-class PlatformSubmitter:
-    """Real submission through the upstream miner's platform client. Not implemented yet.
-
-    Must: sign with the hotkey, send config.to_submission(), never send a fee
-    (resubmission_fee_enabled is false), and treat a 402/4xx as not accepted.
-    """
-
-    def submit(self, round: Round, config: Config) -> bool:
-        raise NotImplementedError("main.PlatformSubmitter.submit")
+# The live submitter is main.miner.PlatformSubmitter (over main.miner.UpstreamPlatform).

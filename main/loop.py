@@ -5,7 +5,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from answer_set.base import AnswerSetProvider
 from common.params import ParamRanges
@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 class LoopSettings:
     update_every: int = 50              # new callsets between answer_set.update() calls
     resubmit_margin: float = 0.0        # score points a new best must gain before resubmitting
+    resubmit_interval_s: float = 0.0    # min seconds between submissions (chain commitments are rate-limited);
+                                        # a better config found meanwhile is submitted when the interval ends
+                                        # and, at the latest, just before the loop stops
     stop_before_deadline_s: float = 120.0
     max_evals: Optional[int] = None     # budget by count (backtests must match config count, not wall time)
     poll_timeout: float = 1.0
@@ -36,6 +39,7 @@ class RoundOutcome:
     best: Optional[ScoreResult] = None
     submissions: List[Tuple[float, str, float]] = field(default_factory=list)   # (t, config_key, score)
     utilization: Optional[float] = None                                        # SimExecutor only
+    callsets: Dict[str, CallSet] = field(default_factory=dict)                 # config_key -> full-fidelity callset
 
 
 async def run_round_async(round: Round, provider: AnswerSetProvider, executor: Executor, scorer: Scorer,
@@ -49,9 +53,10 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                         budget=settings.max_evals)
     out = RoundOutcome(client.answer_set.version)
     submitted: List[Optional[str]] = [None]
+    last_submit = [float("-inf")]
     since_update: List[CallSet] = []
 
-    def maybe_submit():
+    def maybe_submit(force: bool = False):
         best = client.best(FULL)
         if best is None:
             return
@@ -59,10 +64,13 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         key = submitted[0]
         if best.config_key == key:
             return
+        if key is not None and not force and clock() - last_submit[0] < settings.resubmit_interval_s:
+            return                            # the first submission is never delayed; later ones wait
         current = client.latest[(key, FULL)].score if key else None
         if current is None or best.score > current + settings.resubmit_margin:
             if submitter.submit(round, client.configs[best.config_key]):
                 submitted[0] = best.config_key
+                last_submit[0] = clock()
                 out.submissions.append((clock(), best.config_key, best.score))
 
     def on_result(o: Outcome):
@@ -88,6 +96,24 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         await asyncio.gather(*(s(client) for s in strategies))
 
     task = asyncio.create_task(search())
+    # Live executors: scoring (hap.py, seconds per callset) runs in a worker thread, in packed batches, so the loop
+    # keeps polling GATK and strategies keep proposing meanwhile. The virtual executor scores inline (deterministic).
+    to_score: List[CallSet] = []
+    scoring: List[Optional[asyncio.Task]] = [None]
+
+    def start_scoring():
+        if scoring[0] is None and to_score:
+            batch = list(to_score)
+            to_score.clear()
+
+            async def run():
+                results = await asyncio.to_thread(client.score_batch, batch)
+                for cs, (res, err) in zip(batch, results):
+                    client.complete(cs, res, err)
+                scoring[0] = None
+                start_scoring()
+            scoring[0] = asyncio.create_task(run())
+
     idle_spins = 0
     try:
         while time_left():
@@ -97,18 +123,30 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                 break
             batch = executor.poll(0) if virtual else await asyncio.to_thread(executor.poll, settings.poll_timeout)
             for cs in batch:
-                client.deliver(cs)
-            if len(since_update) >= settings.update_every:
+                if virtual or not cs.ok:
+                    client.deliver(cs)
+                else:
+                    to_score.append(cs)
+            if not virtual:
+                start_scoring()
+            if len(since_update) >= settings.update_every and scoring[0] is None:   # never rescore mid-batch
                 new = provider.update(client.answer_set, list(since_update))
                 since_update.clear()
                 if new.version != client.answer_set.version:
                     client.rescore(new)
                     out.answer_set_version = new.version
+            maybe_submit()                        # an improvement held back by the interval goes out when it ends
             idle_spins = idle_spins + 1 if (virtual and not batch and client.in_flight == 0) else 0
             if idle_spins > 1000:                 # strategies alive but submitting nothing: a strategy bug
                 log.warning("strategies stalled with nothing in flight; ending round")
                 break
     finally:
+        if scoring[0] is not None:                # results already computed are worth submitting on
+            try:
+                await scoring[0]
+            except Exception:  # noqa: BLE001
+                pass
+        maybe_submit(force=True)                  # last chance: the best found so far, whatever the interval
         task.cancel()
         try:
             await task
@@ -117,6 +155,7 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                 log.warning("search task ended with %r", e)
     if hasattr(executor, "utilization"):
         out.utilization = executor.utilization()
+    out.callsets = {k: cs for (k, fid), cs in client.callsets.items() if fid == FULL}
     return out
 
 

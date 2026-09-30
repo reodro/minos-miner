@@ -8,7 +8,7 @@ from answer_set import OracleProvider
 from backtest.kpi import oracle_gap, rank_in_field, would_win
 from common.settings import SETTINGS
 from common.store import ResultStore
-from common.types import FULL, AnswerSet, CallSet, ClassCounts, Config, EvalJob, Regime, Round, ScoreResult
+from common.types import FULL, AnswerSet, CallSet, ClassCounts, Config, EvalJob, Regime, Round, ScoreResult, Variant
 from evaluator import FakeRunner, FakeScorer, LocalExecutor, SimExecutor
 from main import DryRunSubmitter, LoopSettings, run_round
 from search import EvalClient, RandomSampler, random_stream, rf_ucb
@@ -299,3 +299,66 @@ class RfUcbTest(unittest.TestCase):
                 self.assertLessEqual(out.evaluated + out.failed, 120 + 8)     # in-flight ones may finish after
                 best[name].append(out.best.score)
         self.assertGreater(sum(best["rf"]), sum(best["random"]))
+
+
+class ResubmitIntervalTest(unittest.TestCase):
+    def test_interval_limits_submissions_and_the_best_still_goes_out_last(self):
+        r = ranges(); runner = FakeRunner(r)
+        sub = DryRunSubmitter()
+        out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [random_stream(r, seed=1)],
+                        sub, r, LoopSettings(max_evals=120, resubmit_interval_s=600.0), baselines=[r.defaults("gatk")])
+        times = [t for t, _, _ in out.submissions]
+        self.assertTrue(all(b - a >= 600.0 for a, b in zip(times[:-2], times[1:-1])))    # the final one may be forced
+        self.assertEqual(sub.sent[-1][1], out.best.config_key)
+
+
+class FallbackChainTest(unittest.TestCase):
+    """mine_round never ends a round without a submission, and never searches without a truth."""
+
+    def parts(self, provider):
+        from main import Parts
+        r = ranges(); runner = FakeRunner(r)
+        return Parts(provider, SimExecutor(runner, 8), FakeScorer(runner), [random_stream(r, seed=1)],
+                     DryRunSubmitter(), r, [Config("gatk", {"min_pruning": 99}), r.defaults("gatk")],
+                     LoopSettings(max_evals=40))
+
+    def test_answer_set_failure_submits_the_first_valid_baseline(self):
+        from main import mine_round
+
+        class Broken:
+            def build(self, round):
+                raise RuntimeError("parent fetch down")
+
+        p = self.parts(Broken())
+        m = mine_round(ROUND, p, deadline_ts=None)
+        self.assertEqual((m.mode, p.submitter.sent), ("static", [(ROUND.round_id, ranges().defaults("gatk").key)]))
+
+    def test_no_donor_means_no_search(self):
+        from main import mine_round
+        p = self.parts(StubProvider())                  # Regime.UNKNOWN, no germline
+        self.assertEqual(mine_round(ROUND, p, deadline_ts=None).mode, "static")
+
+    def test_known_donor_searches(self):
+        from main import mine_round
+
+        class Known(StubProvider):
+            def build(self, round):
+                return AnswerSet(round.round_id, 1, Regime.KG, "NA00001",
+                                 [Variant("chr20", 5, "A", "G", "0/1")], [], 600)
+
+        p = self.parts(Known())
+        m = mine_round(ROUND, p, deadline_ts=None)
+        self.assertEqual(m.mode, "searched")
+        self.assertGreater(m.outcome.evaluated, 10)
+        self.assertEqual(p.submitter.sent[-1][1], m.outcome.best.config_key)
+
+
+class SpaceTest(unittest.TestCase):
+    def test_unscorable_settings_are_never_proposed(self):
+        import random as _r
+        from search.space import Space
+        sp, rng = Space(ranges()), _r.Random(0)
+        cs = [sp.random(rng) for _ in range(200)] + RandomSampler(ranges(), seed=0).sample(200)
+        cs += [sp.neighbour(c, rng, n_params=4) for c in cs[:100]]
+        self.assertEqual({c.params["emit_ref_confidence"] for c in cs if c}, {"NONE"})
+        self.assertNotIn("emit_ref_confidence", sp.names)
