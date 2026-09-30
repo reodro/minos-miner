@@ -786,6 +786,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
 
         // run the local assembler, getting back a collection of information on how we should proceed
         final AssemblyResultSet untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader, samplesList, logger, referenceReader, assemblyEngine, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities, hcArgs.fbargs, false);
+        minosCallAssemblyVariants(region, features, referenceContext, givenAlleles);
         ReadThreadingAssembler.addAssembledVariantsToEventMapOutput(untrimmedAssemblyResult, assembledEventMapVariants, hcArgs.maxMnpDistance, assembledEventMapVcfOutputWriter);
 
         if (assemblyDebugOutStream != null) {
@@ -1006,6 +1007,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         // own genotyping engine and random streams.
         final Map<String, AlleleLikelihoods<GATKRead, Haplotype>> minosLikelihoods = new HashMap<>();
         for (final MinosGenotypingVariant v : minosGenotypingVariants) {
+            if (v.assemblyKey != null) {
+                continue;                          // handled right after the main assembly
+            }
             AlleleLikelihoods<GATKRead, Haplotype> rl = subsettedReadLikelihoodsFinal;
             AlleleLikelihoods<GATKRead, Haplotype> preFilter = readLikelihoods;
             if (v.likelihoodKey != null) {
@@ -1241,6 +1245,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         final String output;
         final HaplotypeCallerGenotypingEngine engine;
         final String likelihoodKey;          // null = same PairHMM parameters as the main config
+        final String assemblyKey;            // null = same assembly parameters as the main config
         final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng =
                 Utils.minosGlobalRandom().copyState();   // same state as the global at start, like a fresh run
         final org.broadinstitute.hellbender.utils.MinosRecordingWell well = Utils.minosGlobalWell().copyState();
@@ -1249,15 +1254,18 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         VariantContextWriter writer;
         boolean diverged = false;
 
-        MinosGenotypingVariant(final String output, final HaplotypeCallerGenotypingEngine engine, final String likelihoodKey) {
+        MinosGenotypingVariant(final String output, final HaplotypeCallerGenotypingEngine engine, final String likelihoodKey,
+                               final String assemblyKey) {
             this.output = output;
             this.engine = engine;
             this.likelihoodKey = likelihoodKey;
+            this.assemblyKey = assemblyKey;
         }
     }
 
     private final List<MinosGenotypingVariant> minosGenotypingVariants = new ArrayList<>();
     private final Map<String, ReadLikelihoodCalculationEngine> minosLikelihoodEngines = new LinkedHashMap<>();
+    private final Map<String, ReadThreadingAssembler> minosAssemblyEngines = new LinkedHashMap<>();
 
     private void minosInitGenotypingVariants() {
         final String spec = System.getProperty("minos.gt.variants");
@@ -1266,6 +1274,11 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         }
         if (!allCustomPloidies.isEmpty() || emitReferenceConfidence() || hcArgs.pileupDetectionArgs.generatePDHaplotypes) {
             throw new UserException("minos.gt.variants supports plain single-ploidy VCF mode only");
+        }
+        if (hcArgs.stepwiseFiltering || hcArgs.filterAlleles || hcArgs.dontGenotype
+                || hcArgs.pileupDetectionArgs.usePileupDetection
+                || assemblyDebugOutStream != null || hcArgs.likelihoodArgs.likelihoodEngineImplementation != ReadLikelihoodCalculationEngine.Implementation.PairHMM) {
+            throw new UserException("minos.gt.variants: a HaplotypeCaller mode the batch path does not replicate is enabled");
         }
         final List<String> lines;
         try {
@@ -1278,7 +1291,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
                 continue;
             }
             final String[] f = line.split("\t");
-            final HaplotypeCallerArgumentCollection args = org.apache.commons.lang3.SerializationUtils.clone(hcArgs);
+            final HaplotypeCallerArgumentCollection args = minosCloneArgs(hcArgs);
             args.standardArgs.genotypeArgs.standardConfidenceForCalling = Double.parseDouble(f[1]);
             args.standardArgs.genotypeArgs.indelHeterozygosity = Double.parseDouble(f[2]);
             args.standardArgs.genotypeArgs.maxAlternateAlleles = Integer.parseInt(f[3]);
@@ -1299,10 +1312,24 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
                             args.likelihoodArgs, args.fbargs, !args.softClipLowQualityEnds, args.likelihoodArgs.likelihoodEngineImplementation));
                 }
             }
+            String assemblyKey = null;
+            if (f.length > 9) {                    // optional assembly columns
+                args.assemblerArgs.minPruneFactor = Integer.parseInt(f[9]);
+                args.assemblerArgs.minDanglingBranchLength = Integer.parseInt(f[10]);
+                args.assemblerArgs.recoverAllDanglingBranches = Boolean.parseBoolean(f[11]);
+                args.assemblerArgs.maxNumHaplotypesInPopulation = Integer.parseInt(f[12]);
+                args.assemblerArgs.initialErrorRateForPruning = Double.parseDouble(f[13]);
+                args.assemblerArgs.pruningLogOddsThreshold = Double.parseDouble(f[14]);
+                final String key = minosAssemblyKey(args);
+                if (!key.equals(minosAssemblyKey(hcArgs))) {
+                    assemblyKey = key;
+                    minosAssemblyEngines.computeIfAbsent(key, k -> args.createReadThreadingAssembler());
+                }
+            }
             final HaplotypeCallerGenotypingEngine engine =
                     new HaplotypeCallerGenotypingEngine(args, samplesList, !hcArgs.doNotRunPhysicalPhasing, hcArgs.applyBQD);
             engine.setAnnotationEngine(annotationEngine);
-            minosGenotypingVariants.add(new MinosGenotypingVariant(f[0], engine, likelihoodKey));
+            minosGenotypingVariants.add(new MinosGenotypingVariant(f[0], engine, likelihoodKey, assemblyKey));
         }
         logger.info("minos: " + minosGenotypingVariants.size() + " variants, " + minosLikelihoodEngines.size()
                 + " extra likelihood engines");
@@ -1350,6 +1377,270 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator {
         if (!minosGenotypingVariants.isEmpty()) {
             Utils.minosGlobalRandom().setRecording(true);
             Utils.minosGlobalWell().setRecording(true);
+        }
+    }
+
+    /**
+     * Deep copy of the argument collection, then a structural self-check against the original.
+     * Java serialization cannot be used: the parent class AssemblyBasedCallerArgumentCollection is not Serializable
+     * (its fields - minBaseQualityScore, assemblerArgs, likelihoodArgs, ... - would silently reset to defaults) and
+     * LikelihoodEngineArgumentCollection holds a non-serializable PairHMMNativeArgumentCollection. GATK objects are
+     * rebuilt field by field through their no-arg constructors; containers get new copies; everything else
+     * (immutable values, feature inputs, paths) is shared, and never modified by the variant code.
+     */
+    static HaplotypeCallerArgumentCollection minosCloneArgs(final HaplotypeCallerArgumentCollection original) {
+        final HaplotypeCallerArgumentCollection copy =
+                (HaplotypeCallerArgumentCollection) minosDeepCopy(original, new java.util.IdentityHashMap<>());
+        if (!minosDeepEquals(original, copy, new java.util.IdentityHashMap<>())) {
+            throw new UserException("minos: HaplotypeCaller argument copy is not identical to the original");
+        }
+        return copy;
+    }
+
+    private static boolean minosIsValue(final Object o) {
+        return o == null || o instanceof String || o instanceof Number || o instanceof Boolean || o instanceof Character
+                || o instanceof Enum || o instanceof Class;
+    }
+
+    private static boolean minosIsGatkObject(final Object o) {
+        return o.getClass().getName().startsWith("org.broadinstitute.hellbender.")
+                && !(o instanceof org.broadinstitute.hellbender.engine.FeatureInput);
+    }
+
+    private static java.util.List<java.lang.reflect.Field> minosFields(final Class<?> cls) {
+        final java.util.List<java.lang.reflect.Field> out = new ArrayList<>();
+        for (Class<?> c = cls; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (final java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    f.setAccessible(true);
+                    out.add(f);
+                }
+            }
+        }
+        return out;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Object minosDeepCopy(final Object o, final java.util.IdentityHashMap<Object, Object> seen) {
+        if (minosIsValue(o)) {
+            return o;
+        }
+        if (seen.containsKey(o)) {
+            return seen.get(o);
+        }
+        try {
+            final Class<?> cls = o.getClass();
+            if (cls.isArray()) {
+                final int n = java.lang.reflect.Array.getLength(o);
+                final Object a = java.lang.reflect.Array.newInstance(cls.getComponentType(), n);
+                seen.put(o, a);
+                for (int i = 0; i < n; i++) {
+                    java.lang.reflect.Array.set(a, i, minosDeepCopy(java.lang.reflect.Array.get(o, i), seen));
+                }
+                return a;
+            }
+            if (o instanceof java.util.List) {
+                final java.util.List l = new ArrayList();
+                seen.put(o, l);
+                for (final Object e : (java.util.List) o) {
+                    l.add(minosDeepCopy(e, seen));
+                }
+                return l;
+            }
+            if (o instanceof java.util.Set) {
+                final java.util.Set st = o instanceof java.util.SortedSet
+                        ? new TreeSet(((java.util.SortedSet) o).comparator()) : new LinkedHashSet();
+                seen.put(o, st);
+                for (final Object e : (java.util.Set) o) {
+                    st.add(minosDeepCopy(e, seen));
+                }
+                return st;
+            }
+            if (o instanceof java.util.Map) {
+                final java.util.Map m = new LinkedHashMap();
+                seen.put(o, m);
+                for (final Object e : ((java.util.Map) o).entrySet()) {
+                    final java.util.Map.Entry en = (java.util.Map.Entry) e;
+                    m.put(minosDeepCopy(en.getKey(), seen), minosDeepCopy(en.getValue(), seen));
+                }
+                return m;
+            }
+            if (!minosIsGatkObject(o)) {
+                return o;                              // shared (paths, feature inputs, ...): never modified
+            }
+            final java.lang.reflect.Constructor<?> ctor = cls.getDeclaredConstructor();
+            ctor.setAccessible(true);
+            final Object c = ctor.newInstance();
+            seen.put(o, c);
+            for (final java.lang.reflect.Field f : minosFields(cls)) {
+                f.set(c, minosDeepCopy(f.get(o), seen));
+            }
+            return c;
+        } catch (final ReflectiveOperationException e) {
+            throw new UserException("minos: cannot copy " + o.getClass().getName(), e);
+        }
+    }
+
+    @SuppressWarnings("rawtypes")
+    private static boolean minosDeepEquals(final Object a, final Object b, final java.util.IdentityHashMap<Object, Object> seen) {
+        if (minosIsValue(a) || minosIsValue(b)) {
+            return java.util.Objects.equals(a, b);
+        }
+        if (seen.containsKey(a)) {
+            return seen.get(a) == b;
+        }
+        seen.put(a, b);
+        if (a.getClass() != b.getClass() && !(a instanceof java.util.Collection && b instanceof java.util.Collection)
+                && !(a instanceof java.util.Map && b instanceof java.util.Map)) {
+            return false;
+        }
+        try {
+            if (a.getClass().isArray()) {
+                final int n = java.lang.reflect.Array.getLength(a);
+                if (n != java.lang.reflect.Array.getLength(b)) {
+                    return false;
+                }
+                for (int i = 0; i < n; i++) {
+                    if (!minosDeepEquals(java.lang.reflect.Array.get(a, i), java.lang.reflect.Array.get(b, i), seen)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (a instanceof java.util.Collection) {
+                final java.util.Iterator ia = ((java.util.Collection) a).iterator(), ib = ((java.util.Collection) b).iterator();
+                while (ia.hasNext() && ib.hasNext()) {
+                    if (!minosDeepEquals(ia.next(), ib.next(), seen)) {
+                        return false;
+                    }
+                }
+                return !ia.hasNext() && !ib.hasNext();
+            }
+            if (a instanceof java.util.Map) {
+                return minosDeepEquals(new ArrayList(((java.util.Map) a).entrySet()).stream().map(e -> ((java.util.Map.Entry) e).getKey()).toArray(),
+                        new ArrayList(((java.util.Map) b).entrySet()).stream().map(e -> ((java.util.Map.Entry) e).getKey()).toArray(), seen)
+                    && minosDeepEquals(((java.util.Map) a).values().toArray(), ((java.util.Map) b).values().toArray(), seen);
+            }
+            if (!minosIsGatkObject(a)) {
+                return a == b;
+            }
+            for (final java.lang.reflect.Field f : minosFields(a.getClass())) {
+                if (!minosDeepEquals(f.get(a), f.get(b), seen)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (final IllegalAccessException e) {
+            throw new UserException("minos: cannot compare arguments", e);
+        }
+    }
+
+    private static String minosAssemblyKey(final HaplotypeCallerArgumentCollection a) {
+        return a.assemblerArgs.minPruneFactor + "|" + a.assemblerArgs.minDanglingBranchLength + "|"
+                + a.assemblerArgs.recoverAllDanglingBranches + "|" + a.assemblerArgs.maxNumHaplotypesInPopulation + "|"
+                + a.assemblerArgs.initialErrorRateForPruning + "|" + a.assemblerArgs.pruningLogOddsThreshold;
+    }
+
+    /**
+     * Variants with their own assembly parameters. Called right after the main assembly, when `region` is
+     * finalized (finalization depends only on traversal-level settings, and assembleReads skips it for a finalized
+     * region) and not yet touched by anything else (trimming works on copies). For each distinct assembly setting:
+     * assemble, then replicate the main path step by step (pileup events, trimming, read filtering, likelihoods per
+     * PairHMM setting, realignment to the best haplotype, genotyping per variant). All random draws of a variant go
+     * to its own generators; traversal draws so far are synced into them first.
+     */
+    private void minosCallAssemblyVariants(final AssemblyRegion region, final FeatureContext features,
+                                           final ReferenceContext referenceContext, final List<Event> givenAlleles) {
+        if (minosAssemblyEngines.isEmpty()) {
+            return;
+        }
+        if (haplotypeBAMWriter.isPresent()) {      // created after initialize(), so checked here
+            throw new UserException("minos.gt.variants: --bam-output is not supported with assembly variants");
+        }
+        minosSyncRandom();
+        for (final Map.Entry<String, ReadThreadingAssembler> group : minosAssemblyEngines.entrySet()) {
+            final List<MinosGenotypingVariant> members = new ArrayList<>();
+            for (final MinosGenotypingVariant v : minosGenotypingVariants) {
+                if (group.getKey().equals(v.assemblyKey)) {
+                    members.add(v);
+                }
+            }
+            // assembly and later steps draw no random numbers, but route any to the group's first variant anyway
+            Utils.minosSetRandomOverride(members.get(0).rng);
+            Utils.minosSetRandomDataOverride(members.get(0).rdg);
+            final boolean recording = true;
+            Utils.minosGlobalRandom().setRecording(false);
+            Utils.minosGlobalWell().setRecording(false);
+            try {
+                minosCallAssemblyGroup(region, features, referenceContext, givenAlleles, group.getValue(), members);
+            } finally {
+                Utils.minosSetRandomOverride(null);
+                Utils.minosSetRandomDataOverride(null);
+                Utils.minosGlobalRandom().setRecording(recording);
+                Utils.minosGlobalWell().setRecording(recording);
+            }
+        }
+    }
+
+    private void minosCallAssemblyGroup(final AssemblyRegion region, final FeatureContext features,
+                                        final ReferenceContext referenceContext, final List<Event> givenAlleles,
+                                        final ReadThreadingAssembler groupAssembler,
+                                        final List<MinosGenotypingVariant> members) {
+        final AssemblyResultSet untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader,
+                samplesList, logger, referenceReader, groupAssembler, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities,
+                hcArgs.fbargs, false);
+        final Pair<Set<Event>, Set<Event>> goodAndBadPileupEvents =
+                PileupBasedAlleles.goodAndBadPileupEvents(region.getAlignmentData(), hcArgs.pileupDetectionArgs, readsHeader, hcArgs.minBaseQualityScore);
+        final Set<Event> goodPileupEvents = goodAndBadPileupEvents.getLeft();
+        final Set<Event> badPileupEvents = goodAndBadPileupEvents.getRight();
+        final SortedSet<Event> allVariationEvents = untrimmedAssemblyResult.getVariationEvents(hcArgs.maxMnpDistance).stream()
+                .filter(event -> !badPileupEvents.contains(event))
+                .collect(Collectors.toCollection(() -> new TreeSet<>(AssemblyResultSet.HAPLOTYPE_EVENT_COMPARATOR)));
+        goodPileupEvents.forEach(allVariationEvents::add);
+        givenAlleles.forEach(allVariationEvents::add);
+        final AssemblyRegionTrimmer.Result trimmingResult = trimmer.trim(region, allVariationEvents, referenceContext);
+        if (!trimmingResult.isVariationPresent() && !hcArgs.disableOptimizations) {
+            return;
+        }
+        final AssemblyResultSet assemblyResult = untrimmedAssemblyResult.trimTo(trimmingResult.getVariantRegion());
+        assemblyResult.addGivenAlleles(givenAlleles, hcArgs.maxMnpDistance, aligner, hcArgs.getHaplotypeToReferenceSWParameters());
+        assemblyResult.removeHaplotypesWithBadAlleles(hcArgs, badPileupEvents);
+        assemblyResult.injectPileupEvents(region, hcArgs, aligner, goodPileupEvents);
+        final AssemblyRegion regionForGenotyping = assemblyResult.getRegionForGenotyping();
+        final List<GATKRead> readStubs = regionForGenotyping.getReads().stream()
+                .filter(r -> AlignmentUtils.unclippedReadLength(r) < AssemblyBasedCallerUtils.MINIMUM_READ_LENGTH_AFTER_TRIMMING).collect(Collectors.toList());
+        regionForGenotyping.removeAll(readStubs);
+        final Collection<GATKRead> filteredReads = filterNonPassingReads(regionForGenotyping);
+        final Map<String, List<GATKRead>> perSampleFilteredReadList = AssemblyBasedCallerUtils.splitReadsBySample(samplesList, readsHeader, filteredReads);
+        if (!assemblyResult.isVariationPresent() && !hcArgs.disableOptimizations) {
+            return;
+        }
+        if (regionForGenotyping.size() == 0 && !hcArgs.disableOptimizations) {
+            return;
+        }
+        final Map<String, List<GATKRead>> reads = AssemblyBasedCallerUtils.splitReadsBySample(samplesList, readsHeader, regionForGenotyping.getReads());
+        final SWParameters readToHaplotypeSWParameters = hcArgs.getReadToHaplotypeSWParameters();
+        final Map<String, AlleleLikelihoods<GATKRead, Haplotype>> byLikelihoodKey = new HashMap<>();
+        for (final MinosGenotypingVariant v : members) {
+            final String lk = v.likelihoodKey == null ? "" : v.likelihoodKey;
+            AlleleLikelihoods<GATKRead, Haplotype> rl = byLikelihoodKey.get(lk);
+            if (rl == null) {
+                final ReadLikelihoodCalculationEngine engine = v.likelihoodKey == null
+                        ? likelihoodCalculationEngine : minosLikelihoodEngines.get(v.likelihoodKey);
+                rl = possiblyUncollapseHaplotypesInReadLikelihoods(untrimmedAssemblyResult,
+                        engine.computeReadLikelihoods(assemblyResult, samplesList, reads, true));
+                rl.changeEvidence(AssemblyBasedCallerUtils.realignReadsToTheirBestHaplotype(rl,
+                        assemblyResult.getReferenceHaplotype(), assemblyResult.getPaddedReferenceLoc(), aligner,
+                        readToHaplotypeSWParameters));
+                byLikelihoodKey.put(lk, rl);
+            }
+            Utils.minosSetRandomOverride(v.rng);
+            Utils.minosSetRandomDataOverride(v.rdg);
+            v.engine.assignGenotypeLikelihoods(rl.alleles(), rl, perSampleFilteredReadList,
+                    assemblyResult.getFullReferenceWithPadding(), assemblyResult.getPaddedReferenceLoc(),
+                    regionForGenotyping.getSpan(), features, givenAlleles, emitReferenceConfidence(), hcArgs.maxMnpDistance,
+                    readsHeader, false, new HashSet<>(), rl)
+                .getCalls().stream().map(RMSMappingQuality.getInstance()::finalizeRawMQ).forEach(v.writer::add);
         }
     }
 }
