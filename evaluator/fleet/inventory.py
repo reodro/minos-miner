@@ -7,7 +7,8 @@
 - `port`: several machines may share one IP behind different ports (e.g. vast.ai).
 - optional `repo` / `data_dir`: where the code and data live on that host (default /minos/minos-miner, /minos/data).
 - `host: "local"`: run the node as a local subprocess instead of over SSH (tests, or this machine as a node).
-- an entry without `user` / `key_filename` / `key_passphrase` inherits them from the first entry that has them.
+- an entry without `key_filename` inherits `user`, `key_filename` and `key_passphrase` from the first entry that has a
+  key; an entry with its own key inherits only `user`.
 - `key_passphrase`: main starts its own ssh-agent and unlocks the key with it. Each entry may have its own key and
   passphrase; entries without them use the first entry's (like the legacy fleet.json).
 The file is re-read at every round start, so hosts can be added or disabled between rounds.
@@ -85,7 +86,8 @@ def load(path: Path = INVENTORY, enabled_only: bool = True) -> List[Host]:
     donor = next((e for e in entries if e.get("key_filename")), {})
     hosts = []
     for e in entries:
-        e = {**{k: donor[k] for k in ("user", "key_filename", "key_passphrase") if k in donor}, **e}
+        inherit = ("user",) if e.get("key_filename") else ("user", "key_filename", "key_passphrase")
+        e = {**{k: donor[k] for k in inherit if k in donor}, **e}      # a passphrase only goes with its own key
         known = {k: e[k] for k in ("host", "user", "port", "key_filename", "key_passphrase", "workers", "enabled",
                                    "repo", "data_dir") if k in e and e[k] is not None}
         h = Host(**known, extra={k: v for k, v in e.items() if k not in known})

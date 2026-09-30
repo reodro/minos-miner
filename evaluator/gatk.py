@@ -4,7 +4,7 @@ Verified in test/ (2026-09-28; 3 rounds x 3 configs against the validator-identi
   used     - SAFE_ANNOTATION_EXCLUSIONS (-AX): bit-identical calls, x1.135.
            - batching (gatk_patch): variants differing only in genotyping params cost ~0.8 s extra each; in PairHMM
              params ~13 s per distinct PairHMM set (vs ~73 s full). 54/54 + 62/62 bit-identical to stock runs;
-             variants whose own run would draw random numbers differently come back DIVERGED and are re-run.
+             variants whose own run would draw random numbers differently come back DIVERGED and are repaired.
            - assembly params: ~41 s extra per distinct assembly set (only traversal is shared), 86/86 bit-identical.
              Excluding QualByDepth or DepthPerAlleleBySample changes QUAL; RMSMappingQuality is required.
            - 1 thread per job: x2.06 throughput vs 4 threads per job on a saturated box; calls identical.
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import logging
 import os
 import subprocess
 import sys
@@ -28,6 +29,8 @@ from typing import List, Optional
 from common.scoring import finalize
 from common.settings import SETTINGS
 from common.types import CLASSES, FULL, AnswerSet, CallSet, ClassCounts, Config, Round, ScoreResult
+
+log = logging.getLogger(__name__)
 
 if SETTINGS.minos_subnet_dir not in sys.path:
     sys.path.insert(0, SETTINGS.minos_subnet_dir)
@@ -189,6 +192,14 @@ class GatkRunner:
             cmd += ["-AX", a]
         return cmd
 
+    def _docker(self, cmd: list) -> subprocess.CompletedProcess:
+        """Run a GATK container; on timeout also kill the container (killing the docker client leaves it running)."""
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout_s)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["docker", "kill", cmd[cmd.index("--name") + 1]], capture_output=True)
+            return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {self.timeout_s}s")
+
     def _out(self, round: Round, config: Config, fidelity: str) -> Path:
         fid = "full" if fidelity == FULL else hashlib.sha1(fidelity.encode()).hexdigest()[:8]
         out = self.work_dir / round.tag / f"{config.key}_{fid}.vcf.gz"
@@ -200,15 +211,14 @@ class GatkRunner:
             raise ValueError(f"GatkRunner cannot run {config.tool!r}")
         out = self._out(round, config, fidelity)
         t0 = time.time()
-        p = subprocess.run(self.command(round, config, fidelity, out), capture_output=True, text=True,
-                           timeout=self.timeout_s)
+        p = self._docker(self.command(round, config, fidelity, out))
         dt = time.time() - t0
         if p.returncode != 0 or not out.exists():
             return CallSet(round.round_id, config.key, "", "", dt, ok=False,
                            error=f"rc={p.returncode} {gatk_error(p.stderr)}", fidelity=fidelity)
         return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
 
-    # ---- batching: configs differing only in genotyping/PairHMM parameters share one run (needs patch_jar) ----
+    # ---- batching: configs differing only in branchable parameters (BRANCH_PARAMS) share one run (needs patch_jar) ----
     def branch_key(self, config: Config, fidelity: str = FULL) -> Optional[str]:
         """Configs with the same key can be evaluated in one run_batch. None = cannot be batched."""
         if self.patch_jar is None or config.tool != "gatk":
@@ -228,11 +238,11 @@ class GatkRunner:
         return max((VARIANT_COST[_TIER_OF[p]] for p in changed), default=0.0)
 
     def run_batch(self, round: Round, configs: List[Config], fidelity: str = FULL) -> List[CallSet]:
-        """One patched run: configs[0] is the main output, the rest are genotyping variants.
+        """One patched run: configs[0] is the main output, the rest are variants of it (BRANCH_PARAMS only).
 
         A variant whose own run would have downsampled reads differently (random-stream divergence, see
-        gatk_patch) comes back as CallSet(ok=False, error=DIVERGED): its output here is not exact and it must be
-        run on its own.
+        gatk_patch) comes back as CallSet(ok=False, error=DIVERGED, vcf=<kept batch output>): its output is not
+        exact everywhere; repair() fixes it.
         """
         if len(configs) == 1 or self.patch_jar is None:
             return [self.run(round, c, fidelity) for c in configs]
@@ -245,9 +255,8 @@ class GatkRunner:
         spec.write_text("".join(variant_line(c, f"/data/output/{o.name}") for c, o in zip(configs[1:], outs)))
         t0 = time.time()
         try:
-            p = subprocess.run(self.command(round, configs[0], fidelity, main,
-                                            jvm_props={"minos.gt.variants": f"/data/output/{spec.name}"}),
-                               capture_output=True, text=True, timeout=self.timeout_s)
+            p = self._docker(self.command(round, configs[0], fidelity, main,
+                                          jvm_props={"minos.gt.variants": f"/data/output/{spec.name}"}))
         finally:
             spec.unlink(missing_ok=True)
         dt = time.time() - t0
@@ -291,17 +300,21 @@ class GatkRunner:
         rep_vcf = out.with_name(out.name.replace(".vcf.gz", ".repair.vcf.gz"))
         rep_log = Path(str(rep_vcf) + ".minos.repair")
         t0 = time.time()
-        p = subprocess.run(self.command(round, config, fidelity, rep_vcf,
-                                        jvm_props={"minos.repair.log": f"/data/output/{regions.name}",
-                                                   "minos.repair.out": f"/data/output/{rep_log.name}"}),
-                           capture_output=True, text=True, timeout=self.timeout_s)
+        p = self._docker(self.command(round, config, fidelity, rep_vcf,
+                                      jvm_props={"minos.repair.log": f"/data/output/{regions.name}",
+                                                 "minos.repair.out": f"/data/output/{rep_log.name}"}))
         dt = time.time() - t0
-        if p.returncode != 0 or not rep_vcf.exists() or not rep_log.exists():
-            return CallSet(round.round_id, config.key, "", "", dt, ok=False, fidelity=fidelity,
-                           error=f"repair rc={p.returncode} {gatk_error(p.stderr)}")
-        splice_repair(batch, regions, rep_vcf, rep_log, out)
+        spliced = False
+        if p.returncode == 0 and rep_vcf.exists() and rep_log.exists():
+            try:
+                splice_repair(batch, regions, rep_vcf, rep_log, out)
+                spliced = True
+            except Exception as e:  # noqa: BLE001 - e.g. a record outside every logged region: run it plainly
+                log.warning("splicing the repair of %s failed (%s); running it on its own", config.key, e)
         for f in (batch, regions, rep_vcf, Path(str(rep_vcf) + ".tbi"), rep_log):
             f.unlink(missing_ok=True)
+        if not spliced:                           # still exact: a plain solo run
+            return self.run(round, config, fidelity)
         return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
 
 
@@ -309,8 +322,8 @@ class HappyScorer:
     """Exact: upstream HappyScorer.score_vcf + parse_happy_vcf, counts through common.scoring.finalize.
 
     Truth comes from the answer set: `notes['truth_vcf']` / `notes['mutations_vcf']` when the provider has files
-    (the oracle), otherwise a VCF written from its records. Slow (~8 s); to be replaced by the per-cluster
-    decision cache once that is proven identical to this.
+    (the oracle), otherwise a VCF written from its records. Slow (~8 s per callset): the reference implementation;
+    DecisionCacheScorer (identical results, cached per cluster) is what the miner uses.
     """
 
     def __init__(self, work_dir: Optional[str] = None):

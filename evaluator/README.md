@@ -3,7 +3,7 @@
 Turns configs into scores exactly like the validator does - as cheaply as possible.
 
 ```
-EvalJob ──▶ Executor (where/when: local cores, later a fleet) ──▶ Runner (GATK) ──▶ CallSet ──▶ Scorer (hap.py) ──▶ ScoreResult
+EvalJob ──▶ Executor (where/when: local cores or the fleet) ──▶ Runner (GATK) ──▶ CallSet ──▶ Scorer (hap.py) ──▶ ScoreResult
 ```
 
 Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `DecisionCacheScorer`, `LocalExecutor`,
@@ -127,12 +127,10 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
 
 ## Open work
 
-- **Real multi-VPS run**: rent 2 small nodes, run `setup_node.sh`, a replay with `--fleet`; watch per-node
-  throughput, scoring lag and bandwidth (BAM download per round per node).
+- **Scale**: more nodes (just `fleet.json` + `control provision`); watch whether 2 scoring threads per node keep up.
+  Nodes keep the last 3 rounds (`KEEP_ROUNDS`) and delete older rounds' BAMs and callsets.
 - **Randomized exactness test** - written, not run: `test/tip_random_exactness.py` (random base configs, random
   multi-parameter families, deep and non-deep rounds). All exactness tests so far used 3 base configs.
-- **Scoring threads per node**: 2 by default; at ~59 workers and families of 5, a node may produce ~2 callsets/s -
-  measure whether 2 threads keep up, raise if the scoring queue grows.
 - **Family cost cap / splitting**: a batch's time is solo + sum of variant costs; split families that would run
   longer than ~4-5 min and spread them over idle workers.
 

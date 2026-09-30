@@ -46,13 +46,14 @@ class FleetTest(unittest.TestCase):
         if self.ex:
             self.ex.close()
 
-    def fleet(self, *nodes):
+    def fleet(self, *nodes, reference=True):
         """nodes: (name, workers, env) -> local hosts running the real agent in --fake mode."""
         inv = []
         for name, workers, env in nodes:
             data = self.tmp / name
             (data / "reference" / "chr20").mkdir(parents=True, exist_ok=True)
-            (data / "reference" / "chr20" / "chr20.fa").write_text("x")
+            if reference:
+                (data / "reference" / "chr20" / "chr20.fa").write_text("x")
             inv.append({"host": "local", "port": 2200 + len(inv), "repo": str(REPO), "data_dir": str(data),
                         "workers": workers, "node_args": "--fake", "env": env})
         path = self.tmp / "fleet.json"
@@ -106,6 +107,16 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(len(got), len(jobs))
         self.assertTrue(all(cs.ok for cs in got.values()))
 
+    def test_a_round_no_node_can_prepare_fails_its_jobs(self):
+        ex = self.fleet(("noref", 2, {}), reference=False)          # the node lacks the round's reference genome
+        t0 = time.time()
+        while time.time() - t0 < 20 and not any(x["ready"] for x in ex.nodes()):
+            time.sleep(0.2)
+        ex.submit([EvalJob(f"j{i}", self.round, c) for i, c in enumerate(self.others)])
+        got = self.wait(len(self.others), timeout=20)
+        self.assertEqual(len(got), len(self.others))                 # they come back instead of waiting forever
+        self.assertTrue(all(not cs.ok for cs in got.values()))
+
     def test_bad_nodes_are_rejected(self):
         ex = self.fleet(("badtest", 1, {"MINOS_FAKE_SELFTEST": "fail"}), ("oldcode", 1, {"MINOS_FAKE_CODE": "0" * 16}))
         time.sleep(3)
@@ -153,6 +164,16 @@ class InventoryTest(unittest.TestCase):
         hosts = load(p)
         self.assertEqual([(h.name, h.user, h.key_filename) for h in hosts],
                          [("1.1.1.1", "ubuntu", "~/.ssh/k"), ("2.2.2.2:2222", "ubuntu", "~/.ssh/k")])
+
+    def test_a_host_with_its_own_key_does_not_get_another_keys_passphrase(self):
+        from evaluator.fleet.inventory import load
+        p = Path(tempfile.mkdtemp()) / "fleet.json"
+        p.write_text(json.dumps([{"host": "1.1.1.1", "key_filename": "~/.ssh/a", "key_passphrase": "pa"},
+                                 {"host": "2.2.2.2"},
+                                 {"host": "3.3.3.3", "key_filename": "~/.ssh/b"}]))
+        h = {x.host: x for x in load(p)}
+        self.assertEqual(h["2.2.2.2"].key_passphrase, "pa")
+        self.assertIsNone(h["3.3.3.3"].key_passphrase)
         self.assertEqual(len(load(p, enabled_only=False)), 3)
 
 

@@ -19,6 +19,8 @@ import heapq
 import itertools
 import json
 import logging
+import queue
+import shlex
 import subprocess
 import threading
 import time
@@ -31,10 +33,11 @@ from common.settings import SETTINGS
 from common.types import AnswerSet, CallSet, EvalJob, Round
 from evaluator.fleet import codec, selftest
 from evaluator.fleet.inventory import INVENTORY, Host, code_digest, ensure_agent, load
-from evaluator.local import job_key
+from evaluator.local import failed, job_key
 
 log = logging.getLogger(__name__)
 LOG_DIR = Path.home() / ".minos" / "fleet" / "logs"
+KEEP_ROUNDS = 3                                              # rounds kept on main and nodes (older ones are pruned)
 
 
 @dataclass
@@ -52,11 +55,13 @@ class _Session:
     workers: int = 0
     ready: bool = False
     rounds_ready: set = field(default_factory=set)
-    rounds_sent: set = field(default_factory=set)
+    rounds_sent: set = field(default_factory=set)            # (round_id, answer-set version) shipped to the node
+    rounds_failed: set = field(default_factory=set)          # round_ids the node could not prepare
     groups: List[set] = field(default_factory=list)          # job_ids per open group (one GATK run each)
     jobs: Dict[str, EvalJob] = field(default_factory=dict)   # outstanding job_id -> job
-    write_lock: threading.Lock = field(default_factory=threading.Lock)
+    outq: "queue.Queue[Optional[str]]" = field(default_factory=queue.Queue)
     closed: bool = False
+    finished: bool = False                                   # its session thread has ended
     rejected: str = ""
     logf: Optional[object] = None                            # the node's stderr, kept per host
 
@@ -64,13 +69,31 @@ class _Session:
         return sum(1 for g in self.groups if g)
 
     def send(self, msg: dict) -> bool:
-        with self.write_lock:
+        """Queue a message for the node. Writing happens on the session's writer thread, so a slow link never
+        blocks main's scheduler (which calls this while holding the executor lock)."""
+        if self.closed or self.proc is None:
+            return False
+        self.outq.put(json.dumps(msg) + "\n")
+        return True
+
+    def writer(self, proc: subprocess.Popen) -> None:
+        while True:
+            line = self.outq.get()
+            if line is None:
+                break
             try:
-                self.proc.stdin.write(json.dumps(msg) + "\n")
-                self.proc.stdin.flush()
-                return True
-            except (BrokenPipeError, ValueError, AttributeError, OSError):
-                return False
+                proc.stdin.write(line)
+                proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                break                                          # the reader sees the session end and re-queues
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    def hang_up(self) -> None:
+        """Close the node's stdin once the queued messages are written (the agent then exits)."""
+        self.outq.put(None)
 
 
 class FleetExecutor:
@@ -106,37 +129,50 @@ class FleetExecutor:
         with self._lock:
             for name, s in list(self._sessions.items()):
                 if name not in hosts:
-                    s.closed = True
                     self._drop(s, "disabled in the inventory")
+                    s.closed = True
                     del self._sessions[name]
             for name, h in hosts.items():
+                old = self._sessions.get(name)
+                if old is not None and old.rejected and old.finished:
+                    del self._sessions[name]                    # rejected earlier (old code?): try again now
                 if name not in self._sessions:
                     s = _Session(h)
                     self._sessions[name] = s
                     threading.Thread(target=self._run_session, args=(s,), daemon=True, name=f"fleet-{name}").start()
 
     def _run_session(self, s: _Session) -> None:
-        while not s.closed and not self._stopping:
-            try:
-                self._connect(s)
-                self._read(s)
-            except Exception as e:  # noqa: BLE001 - one host failing must not stop the fleet
-                log.warning("%s: session error: %s", s.host.name, e)
-            with self._lock:
-                self._drop(s, "session ended")
-            if s.rejected or s.closed or self._stopping:
-                return
-            time.sleep(self.reconnect_s)
+        try:
+            while not s.closed and not self._stopping:
+                try:
+                    self._connect(s)
+                    self._read(s)
+                except Exception as e:  # noqa: BLE001 - one host failing must not stop the fleet
+                    log.warning("%s: session error: %s", s.host.name, e)
+                with self._lock:
+                    self._drop(s, "session ended")
+                if s.rejected or s.closed or self._stopping:
+                    return
+                time.sleep(self.reconnect_s)
+        finally:
+            s.finished = True
 
     def _connect(self, s: _Session) -> None:
         h = s.host
         bundle = selftest.make_bundle(SETTINGS.data_dir, SETTINGS.rounds_dir)
         push(h, [bundle["bam"], bundle["bai"]], f"{h.data_dir}/selftest/")
-        args = h.extra.get("node_args", "") + (f" --workers {h.workers}" if h.workers else "")
-        env = " ".join(f"{k}={v}" for k, v in {"DATA_DIR": h.data_dir, **h.extra.get("env", {})}.items())
-        cmd = h.ssh(f"cd {h.repo} && {env} {h.repo}/.venv/bin/python -m evaluator.fleet.node --stdio {args}")
+        args = h.extra.get("node_args", "") + (f" --workers {int(h.workers)}" if h.workers else "")
+        env = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {"DATA_DIR": h.data_dir, **h.extra.get("env", {})}.items())
+        repo = shlex.quote(h.repo)
+        cmd = h.ssh(f"cd {repo} && {env} {repo}/.venv/bin/python -m evaluator.fleet.node --stdio {args}")
         s.logf = open(LOG_DIR / f"{h.name.replace(':', '_')}.log", "a")
-        s.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=s.logf, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=s.logf, text=True, bufsize=1)
+        s.outq = queue.Queue()
+        threading.Thread(target=s.writer, args=(proc,), daemon=True, name=f"fleet-w-{h.name}").start()
+        with self._lock:
+            s.proc = proc
+            if s.closed or self._stopping:                       # disabled/closed while we were connecting
+                s.hang_up()
         log.info("%s: session started", h.name)
 
     def _read(self, s: _Session) -> None:
@@ -154,6 +190,8 @@ class FleetExecutor:
 
     def _handle(self, s: _Session, msg: dict) -> None:
         t = msg["type"]
+        if s.closed:
+            return
         if t == "ready":
             if not msg.get("ok"):
                 s.rejected = f"self-test failed: {msg.get('digest')} != {msg.get('expected')}"
@@ -161,7 +199,7 @@ class FleetExecutor:
                 s.rejected = f"code differs from main ({msg.get('code')} != {self.code}): run control sync"
             if s.rejected:
                 log.error("%s: rejected - %s", s.host.name, s.rejected)
-                s.proc.stdin.close()
+                s.hang_up()
                 return
             s.workers, s.ready = int(msg["workers"]), True
             log.info("%s: ready, %d workers", s.host.name, s.workers)
@@ -171,6 +209,8 @@ class FleetExecutor:
             self._pump()
         elif t == "round_failed":
             log.error("%s: round %s unusable there: %s", s.host.name, msg["round_id"], msg.get("error"))
+            s.rounds_failed.add(msg["round_id"])
+            self._fail_if_unservable(msg["round_id"])
         elif t == "result":
             cs = codec.callset_from(msg["callset"])
             job = s.jobs.pop(cs.job_id, None)
@@ -188,37 +228,66 @@ class FleetExecutor:
         for job in s.jobs.values():
             if job_key(job) not in self._done:
                 heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
-        s.jobs, s.groups, s.ready, s.rounds_ready, s.rounds_sent = {}, [], False, set(), set()
+        s.jobs, s.groups, s.ready = {}, [], False
+        s.rounds_ready, s.rounds_sent, s.rounds_failed = set(), set(), set()
         if s.proc and s.proc.poll() is None:
-            try:
-                s.proc.stdin.close()
-            except OSError:
-                pass
+            s.hang_up()
         self._cv.notify_all()
         self._pump()
+
+    def _fail_if_unservable(self, rid: str) -> None:
+        """No ready node can prepare this round: its queued jobs fail now instead of waiting forever. Lock held."""
+        ready = [s for s in self._sessions.values() if s.ready]
+        if not ready or not all(rid in s.rounds_failed for s in ready):
+            return
+        keep, n = [], 0
+        for item in self._queue:
+            job = item[2]
+            if job.round.round_id == rid:
+                self._inflight.pop(job_key(job), None)
+                self._ready.append(failed(job, "no fleet node could prepare this round"))
+                self._ready += [failed(w, "no fleet node could prepare this round") for w in self._waiters.pop(job_key(job), [])]
+                n += 1
+            else:
+                keep.append(item)
+        self._queue = keep
+        heapq.heapify(self._queue)
+        if n:
+            log.error("round %s: no node can prepare it - %d queued jobs failed", rid, n)
+            self._cv.notify_all()
 
     # ---- rounds -------------------------------------------------------------------------------------------------------
     def publish_round(self, round: Round, answer_set: AnswerSet, bam_url: Optional[str] = None,
                       bai_url: Optional[str] = None) -> None:
         self.refresh_hosts()
         with self._lock:
+            self._rounds.pop(round.round_id, None)
             self._rounds[round.round_id] = _Published(round, answer_set, bam_url, bai_url)
+            while len(self._rounds) > KEEP_ROUNDS:              # oldest first (dicts keep insertion order)
+                self._rounds.pop(next(iter(self._rounds)))
             sessions = [s for s in self._sessions.values() if s.ready]
         for s in sessions:
             threading.Thread(target=self._send_rounds, args=(s,), daemon=True).start()
 
     def _send_rounds(self, s: _Session) -> None:
-        for rid, p in list(self._rounds.items()):
+        with self._lock:
+            rounds = list(self._rounds.items())
+        keep = [rid for rid, _ in rounds]
+        for rid, p in rounds:
+            key = (rid, p.answer_set.version)
             with self._lock:
-                if rid in s.rounds_sent or not s.ready:
+                if key in s.rounds_sent or not s.ready:
                     continue
-                s.rounds_sent.add(rid)
+                s.rounds_sent.add(key)
+                s.rounds_ready.discard(rid)                      # a new version: wait for the node to re-prepare
             try:
-                s.send(round_message(s.host, p.round, p.answer_set, p.bam_url, p.bai_url))
-            except Exception as e:  # noqa: BLE001
+                s.send({**round_message(s.host, p.round, p.answer_set, p.bam_url, p.bai_url), "keep": keep})
+            except Exception as e:  # noqa: BLE001 - e.g. rsync failed: this node cannot serve the round
                 log.error("%s: could not ship round %s: %s", s.host.name, rid, e)
                 with self._lock:
-                    s.rounds_sent.discard(rid)
+                    s.rounds_sent.discard(key)
+                    s.rounds_failed.add(rid)
+                    self._fail_if_unservable(rid)
 
     # ---- Executor protocol ----------------------------------------------------------------------------------------
     def _branch(self, job: EvalJob) -> Optional[str]:
@@ -289,10 +358,7 @@ class FleetExecutor:
             for s in self._sessions.values():
                 s.closed = True
                 if s.proc and s.proc.poll() is None:
-                    try:
-                        s.proc.stdin.close()
-                    except OSError:
-                        pass
+                    s.hang_up()
 
     # ---- scheduling -------------------------------------------------------------------------------------------------
     def _pump(self) -> None:
@@ -368,7 +434,7 @@ def push(h: Host, files: List[str], dest_dir: str) -> None:
     """Copy local files into dest_dir on the host (rsync over ssh; only what changed is sent)."""
     if h.local and all(str(Path(f).parent) == dest_dir.rstrip("/") for f in files):
         return                                                  # already there (this machine, same path)
-    mk = subprocess.run(h.ssh(f"mkdir -p {dest_dir}"), capture_output=True, text=True, timeout=120)
+    mk = subprocess.run(h.ssh(f"mkdir -p {shlex.quote(dest_dir)}"), capture_output=True, text=True, timeout=120)
     if mk.returncode != 0:
         raise RuntimeError(f"mkdir on {h.name}: {mk.stderr[-200:]}")
     p = subprocess.run(h.rsync(files, dest_dir), capture_output=True, text=True, timeout=3600)

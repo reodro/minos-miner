@@ -2,12 +2,12 @@
 
     main opens:  ssh host 'cd /minos/minos-miner && .venv/bin/python -m evaluator.fleet.node --stdio'
 
-main -> node   {"type": "round", "round": {...}, "answer_set": {...}, "bam_url": ..., "bai_url": ...}
+main -> node   {"type": "round", "round": {...}, "answer_set": {...}, "bam_url": ..., "bai_url": ..., "keep": [...]}
                {"type": "jobs", "groups": [[job, ...], ...]}          one group = one GATK run (a family)
 node -> main   {"type": "ready", "ok": bool, "digest", "expected", "code", "workers"}   after the self-test
                {"type": "round_ready", "round_id"} | {"type": "round_failed", "round_id", "error"}
-               {"type": "free", "slots": n}                           free workers (sent when it changes)
                {"type": "result", "callset": {...}}                   carries its score; the VCF stays here
+A round is prepared on its own thread (a live BAM download takes minutes); rounds not in `keep` are forgotten.
 
 The node lives exactly as long as the session: when stdin closes (main stopped or the connection dropped), it stops
 and kills the GATK containers it started. Logs go to stderr (main keeps them per host).
@@ -19,14 +19,14 @@ import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from dataclasses import replace
-from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 from common.settings import SETTINGS, default_workers
 from common.types import AnswerSet, CallSet, Regime
@@ -37,9 +37,9 @@ log = logging.getLogger("node")
 
 
 class Node:
-    def __init__(self, workers: int, data_dir: str, runner, scorer_factory, score_threads: int = 2):
+    def __init__(self, workers: int, runner, scorer_factory, score_threads: int = 2):
         from evaluator.local import LocalExecutor
-        self.workers, self.data_dir = workers, data_dir
+        self.workers = workers
         self.runner, self.scorer_factory = runner, scorer_factory
         self.executor = LocalExecutor(runner, workers=workers)
         self._rounds: Dict[str, tuple] = {}                  # round_id -> (local Round, AnswerSet)
@@ -48,6 +48,7 @@ class Node:
         self._out_lock = threading.Lock()
         self._stop = threading.Event()
         self.score_threads = score_threads
+        self._scorers: list = []
 
     # ---- messages -----------------------------------------------------------------------------------------------
     def send(self, msg: dict) -> None:
@@ -85,6 +86,20 @@ class Node:
             log.exception("round %s not usable here", rnd.round_id)
             self.send({"type": "round_failed", "round_id": rnd.round_id, "error": str(e)[:300]})
 
+    def forget_rounds(self, keep: set) -> None:
+        """Rounds main no longer keeps: drop their answer sets and scoring caches, and delete their BAM and callsets
+        (a node serves for days on a small disk)."""
+        for rid in [r for r in self._rounds if r not in keep]:
+            rnd, _ = self._rounds.pop(rid)
+            for sc in self._scorers:
+                drop = getattr(sc, "drop", None)
+                if drop:
+                    drop(rid)
+            for d in (os.path.dirname(rnd.bam), os.path.join(SETTINGS.cache_dir, "callsets", rnd.tag),
+                      os.path.join(SETTINGS.cache_dir, "fleet", rnd.tag)):
+                if os.path.isdir(d) and os.path.abspath(d).startswith(os.path.abspath(SETTINGS.data_dir)):
+                    shutil.rmtree(d, ignore_errors=True)
+
     def take_jobs(self, msg: dict) -> None:
         for group in msg["groups"]:
             jobs = [codec.job_from(d) for d in group]
@@ -94,6 +109,7 @@ class Node:
     # ---- scoring -------------------------------------------------------------------------------------------------
     def _scorer(self, i: int) -> None:
         scorer = self.scorer_factory(i)
+        self._scorers.append(scorer)
         while not self._stop.is_set():
             try:
                 batch = [self._to_score.get(timeout=1.0)]
@@ -106,6 +122,8 @@ class Node:
                     break
             for rid in {c.round_id for c in batch}:
                 css = [c for c in batch if c.round_id == rid]
+                if rid not in self._rounds:                     # the round was pruned meanwhile: nothing to report
+                    continue
                 aset = self._rounds[rid][1]
                 many = getattr(scorer, "score_many", None)
                 try:
@@ -126,7 +144,6 @@ class Node:
         threading.Thread(target=self._reader, daemon=True).start()
         for i in range(self.score_threads):
             threading.Thread(target=self._scorer, args=(i,), daemon=True).start()
-        last_free = None
         while not self._stop.is_set():
             while True:
                 try:
@@ -134,13 +151,10 @@ class Node:
                 except queue.Empty:
                     break
                 if msg["type"] == "round":
-                    self.prepare_round(msg)
+                    self.forget_rounds(set(msg.get("keep") or [msg["round"]["round_id"]]) | {msg["round"]["round_id"]})
+                    threading.Thread(target=self.prepare_round, args=(msg,), daemon=True).start()
                 elif msg["type"] == "jobs":
                     self.take_jobs(msg)
-            free = self.executor.idle_slots()
-            if free != last_free:
-                self.send({"type": "free", "slots": free})
-                last_free = free
             for cs in self.executor.poll(0.5):
                 if cs.ok:
                     self._to_score.put(cs)
@@ -189,7 +203,7 @@ def main() -> None:
         result = selftest.run(runner, SETTINGS.data_dir)
     if a.selftest_only:
         print(json.dumps(result)); return
-    node = Node(workers, SETTINGS.data_dir, runner, scorer_factory, a.score_threads)
+    node = Node(workers, runner, scorer_factory, a.score_threads)
     node.send({"type": "ready", "code": code, "workers": workers, **result})
     if not result["ok"]:
         log.error("self-test failed: %s != %s", result["digest"], result["expected"]); return

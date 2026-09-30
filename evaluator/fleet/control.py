@@ -4,7 +4,8 @@
     python -m evaluator.fleet.control provision [HOST..]  copy the repo + main's genomes, run scripts/setup_node.sh
     python -m evaluator.fleet.control sync [HOST..]       copy the repo + self-test bundle, rebuild the patch jar
     python -m evaluator.fleet.control selftest [HOST..]   run the node self-test everywhere
-    python -m evaluator.fleet.control reap [HOST..]       kill stray GATK containers left by a crashed node
+    python -m evaluator.fleet.control reap [HOST..]       kill GATK containers left by a crashed node (refuses while an
+                                                          agent is running there)
 
 Hosts run in parallel. Keys come from key_filename; a key_passphrase in the inventory is unlocked in a private
 ssh-agent (see inventory.ensure_agent).
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -32,7 +34,7 @@ def sh(h: Host, cmd: str, timeout: int = 600) -> subprocess.CompletedProcess:
 
 
 def copy_repo(h: Host) -> None:
-    sh(h, f"mkdir -p {h.repo}")
+    sh(h, f"mkdir -p {shlex.quote(h.repo)}")
     p = subprocess.run(h.rsync([f"{REPO}/"], f"{h.repo}/", "--delete", *EXCLUDES), capture_output=True, text=True,
                        timeout=1800)
     if p.returncode != 0:
@@ -62,7 +64,7 @@ def status(h: Host) -> dict:
 def push_genomes(h: Host) -> None:
     """Main's reference genomes (FASTA, index, dict, SDF) to the host, every chromosome main has; the node's setup
     then downloads only what is still missing. No dependence on the platform's endpoint for what main already has."""
-    sh(h, f"mkdir -p {h.data_dir}/reference")
+    sh(h, f"mkdir -p {shlex.quote(h.data_dir + '/reference')}")
     p = subprocess.run(h.rsync([f"{SETTINGS.data_dir}/reference/"], f"{h.data_dir}/reference/"), capture_output=True,
                        text=True, timeout=7200)
     if p.returncode != 0:
@@ -72,22 +74,24 @@ def push_genomes(h: Host) -> None:
 def provision(h: Host) -> dict:
     copy_repo(h)
     push_genomes(h)
-    p = sh(h, f"cd {h.repo} && DATA_DIR={h.data_dir} bash scripts/setup_node.sh", timeout=7200)
-    sync(h)
-    return {"host": h.name, "ok": p.returncode == 0, "tail": (p.stdout + p.stderr).strip()[-300:]}
+    p = sh(h, f"cd {shlex.quote(h.repo)} && DATA_DIR={shlex.quote(h.data_dir)} bash scripts/setup_node.sh", timeout=7200)
+    s = sync(h)
+    ok = p.returncode == 0 and s["ok"]
+    return {"host": h.name, "ok": ok, "tail": (p.stdout + p.stderr).strip()[-300:] if p.returncode else s["tail"]}
 
 
 def sync(h: Host) -> dict:
     copy_repo(h)
     b = selftest.make_bundle(SETTINGS.data_dir, SETTINGS.rounds_dir)
     push(h, [b["bam"], b["bai"]], f"{h.data_dir}/selftest/")
-    p = sh(h, f"cd {h.repo} && bash evaluator/gatk_patch/build.sh", timeout=1200)
+    p = sh(h, f"cd {shlex.quote(h.repo)} && bash evaluator/gatk_patch/build.sh", timeout=1200)
     return {"host": h.name, "ok": p.returncode == 0, "tail": (p.stdout + p.stderr).strip()[-200:]}
 
 
 def run_selftest(h: Host) -> dict:
-    p = sh(h, f"cd {h.repo} && DATA_DIR={h.data_dir} {h.repo}/.venv/bin/python -m evaluator.fleet.node --selftest-only",
-           timeout=900)
+    repo = shlex.quote(h.repo)
+    p = sh(h, f"cd {repo} && DATA_DIR={shlex.quote(h.data_dir)} {repo}/.venv/bin/python -m evaluator.fleet.node "
+              f"--selftest-only", timeout=900)
     try:
         return {"host": h.name, **json.loads(p.stdout.strip().splitlines()[-1])}
     except (IndexError, json.JSONDecodeError):
@@ -95,6 +99,11 @@ def run_selftest(h: Host) -> dict:
 
 
 def reap(h: Host) -> dict:
+    """Kill every node GATK container on the host - only when no node agent is running there (a running agent's
+    containers are live jobs; stop main first)."""
+    busy = sh(h, "pgrep -f 'evaluator.fleet.node --stdi[o]' >/dev/null && echo busy || echo idle").stdout.strip()
+    if busy == "busy":
+        return {"host": h.name, "killed": 0, "skipped": "a node agent is running there (stop main first)"}
     p = sh(h, "ids=$(docker ps -q --filter name=minos-node-); [ -n \"$ids\" ] && docker kill $ids | wc -l || echo 0")
     return {"host": h.name, "killed": p.stdout.strip()}
 

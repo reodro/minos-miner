@@ -1267,13 +1267,17 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
     }
 
     // ---------------------------------------------------------------------------------------------------------------
-    // minos: batch evaluation of genotyping-only config variants in one run.
+    // minos: batch evaluation of config variants in one run.
     //
-    // -Dminos.gt.variants=<tsv> with lines: output.vcf.gz <TAB> stand_call_conf <TAB> indel_heterozygosity
-    //                                       <TAB> max_alternate_alleles <TAB> contamination_fraction_to_filter
-    // These four parameters are read only by the genotyping engine (the active-region genotyper fixes its own
-    // confidence and contamination and, for one sample, uses only the SNP prior), so everything before genotyping
-    // is shared. Each output must be bit-identical to a separate stock run of that config.
+    // -Dminos.gt.variants=<tsv>, one line per variant (evaluator/gatk.py variant_line): output.vcf.gz, then
+    //   columns 1-4  genotyping: stand_call_conf, indel_heterozygosity, max_alternate_alleles, contamination
+    //   columns 5-8  PairHMM: base_quality_score_threshold, pcr_indel_model, gap continuation, mismapping rate
+    //   columns 9-14 assembly: min_pruning, min_dangling_branch_length, recover_all_dangling_branches,
+    //                max_num_haplotypes_in_population, adaptive_pruning_initial_error_rate, pruning_lod_threshold
+    //   columns 15-17 activity: active_probability_threshold, min/max_assembly_region_size
+    // Each variant shares everything before the first stage it changes (genotyping engine; likelihoods; assembly;
+    // region finding - see AssemblyRegionIterator). Each output must be bit-identical to a separate stock run of
+    // that config; a variant whose random draws would differ is flagged diverged (and repaired by the runner).
     // ---------------------------------------------------------------------------------------------------------------
     private static final class MinosGenotypingVariant {
         final String output;

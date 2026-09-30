@@ -31,7 +31,8 @@ class LocalExecutor:
 
     Batching: if the runner offers `branch_key`/`run_batch`, a free slot takes the highest-priority job plus every
     queued job sharing its branch key (up to `max_batch`) and evaluates them in one run. Nothing ever waits to be
-    batched - only jobs already queued ride along. A variant that comes back DIVERGED is re-queued to run alone.
+    batched - only jobs already queued ride along. A variant that comes back DIVERGED is re-queued alone and fixed by
+    runner.repair (or simply run again when the runner cannot repair).
     """
 
     def __init__(self, runner: Runner, workers: Optional[int] = None, max_batch: int = 32):
@@ -54,7 +55,6 @@ class LocalExecutor:
         self._lock = threading.Lock()
         self._wake = threading.Event()             # set by submit(): an idle poll() waits on it instead of spinning
         self.batches_run = 0
-        self.batched_jobs = 0
 
     # ---- running ---------------------------------------------------------------------------------------------
     def _branch(self, job: EvalJob) -> Optional[str]:
@@ -108,7 +108,6 @@ class LocalExecutor:
                     heapq.heappush(self._queue, item)
             if len(batch) > 1:
                 self.batches_run += 1
-                self.batched_jobs += len(batch)
             self._running[self._pool.submit(self._run, batch)] = batch
 
     def submit(self, jobs: Iterable[EvalJob]) -> None:
