@@ -123,7 +123,7 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                 break
             batch = executor.poll(0) if virtual else await asyncio.to_thread(executor.poll, settings.poll_timeout)
             for cs in batch:
-                if virtual or not cs.ok:
+                if virtual or not cs.ok or cs.score is not None:     # already scored on its node: no work here
                     client.deliver(cs)
                 else:
                     to_score.append(cs)

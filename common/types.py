@@ -135,6 +135,8 @@ class CallSet:
     error: Optional[str] = None
     job_id: str = ""
     fidelity: str = FULL
+    score: Optional["ScoreResult"] = None   # set when the machine that ran it also scored it (fleet nodes); then
+                                            # nobody else needs the VCF, which stays on that machine
 
 
 @dataclass

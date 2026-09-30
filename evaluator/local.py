@@ -52,6 +52,7 @@ class LocalExecutor:
         self._solo = set()                         # job ids that must not be batched again
         self._repair: Dict[str, CallSet] = {}      # job id -> its diverged batch output, for runner.repair
         self._lock = threading.Lock()
+        self._wake = threading.Event()             # set by submit(): an idle poll() waits on it instead of spinning
         self.batches_run = 0
         self.batched_jobs = 0
 
@@ -122,12 +123,20 @@ class LocalExecutor:
                     self._inflight[k] = job
                     heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
             self._fill()
+            self._wake.set()
 
     def poll(self, timeout: float) -> List[CallSet]:
         with self._lock:
             running = list(self._running) if not self._ready and self._running else []
+            idle = not self._ready and not self._running
+            if idle:
+                self._wake.clear()
         if running:
             wait(running, timeout=timeout, return_when=FIRST_COMPLETED)
+        elif idle:
+            # nothing to wait for: block until a submit (or the timeout) instead of returning at once - callers poll
+            # in loops, and a spinning loop starves every other thread of the GIL (seen: node scoring 20x slower)
+            self._wake.wait(timeout)
         with self._lock:
             for f in [f for f in self._running if f.done()]:
                 jobs = self._running.pop(f)

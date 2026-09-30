@@ -62,8 +62,10 @@ class MinedRound:
     note: str = ""
 
 
-def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float]) -> MinedRound:
-    """One round with the fallback chain. Never raises."""
+def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url: Optional[str] = None,
+               bai_url: Optional[str] = None) -> MinedRound:
+    """One round with the fallback chain. Never raises. With a fleet executor, the round (truth files, BAM location)
+    is published to the nodes once the answer set exists."""
     try:
         answer_set = parts.provider.build(round)
     except Exception as e:  # noqa: BLE001 - the round still gets the static baseline
@@ -71,6 +73,9 @@ def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float]) -> Mine
         return _static(round, parts, f"answer set failed: {e}")
     if answer_set.regime == Regime.UNKNOWN or not answer_set.germline:
         return _static(round, parts, "no donor identified: searching without a truth would be noise")
+    publish = getattr(parts.executor, "publish_round", None)
+    if publish:
+        publish(round, answer_set, bam_url, bai_url)
 
     class Built:                                  # the loop builds once; hand it the answer set we already have
         def build(self, _round):
@@ -143,7 +148,7 @@ def run_forever(source: RoundSource, make_parts: Callable[[Round], Parts], refer
             done.add(live.round_id)
             try:
                 rnd = fetch_round(live, reference_for)
-                mined = mine_round(rnd, make_parts(rnd), live.deadline_ts)
+                mined = mine_round(rnd, make_parts(rnd), live.deadline_ts, live.bam_url, live.bai_url)
             except Exception as e:  # noqa: BLE001
                 log.exception("round %s failed", live.round_id)
                 mined = MinedRound(live.round_id, "failed", note=str(e))

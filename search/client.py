@@ -135,7 +135,10 @@ class EvalClient:
         return len(self._pending)
 
     def deliver(self, cs: CallSet) -> None:
-        """Score one callset now and hand its outcome to the waiting strategy (synchronous path)."""
+        """Score one callset now (unless its machine already did) and hand the outcome to the waiting strategy."""
+        if cs.score is not None:
+            self.complete(cs, cs.score)
+            return
         result, error = (self.score_batch([cs])[0] if cs.ok else (None, None))
         self.complete(cs, result, error)
 

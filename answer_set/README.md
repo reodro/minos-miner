@@ -59,7 +59,7 @@ These KPIs used the true N; rerun them with the estimate.
 - **p=0.5 candidates** (thin or ambiguous parent, ~80-150 per round) are left out of the truth; decide from evidence.
 - **N**: measure how much the 13% estimate error moves rankings; try better predictors.
 - **Speed**: GIAB `classify` (pileups at 300x) takes ~60-80 s; `build()` must stay within a few minutes.
-- **Setup**: the NIST VCFs/BEDs and reference FASTAs/SDFs are not downloaded by a script yet.
+- **Setup**: the NIST VCFs/BEDs are not downloaded by a script yet (reference genomes: `scripts/fetch_genome.sh`).
 
 ## Ideas (not planned)
 

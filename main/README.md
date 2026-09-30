@@ -32,12 +32,16 @@ Try `python -m main live --wallet W --hotkey H --demo` first.
 ```bash
 .venv/bin/python -m main replay <round_tag> --minutes 20 [--strategy rf_ucb|random]
 .venv/bin/python -m main live --wallet W --hotkey H [--demo]
+# either one with a fleet: main only proposes, sub-VPS nodes run GATK and score (see evaluator/README.md)
+MINOS_FLEET_TOKEN=... .venv/bin/python -m main replay <tag> --fleet 0.0.0.0:8707 --cert fleet.crt --key fleet.key
 ```
+
+With `--fleet`, `mine_round` publishes each round (truth files, BAM location) to the nodes once the answer set
+exists; replay cannot print the TRUE score then (the final VCF is on a node).
 
 ## Open work
 
 - Test the live path (demo mode, then one real round with a known-good static config).
-- Fleet wiring once the evaluator's fleet executor exists (main announces the round; nodes download their own BAM).
 - Round logs: local vs true score and rank per round, feeding backtests.
 - Submission timing: tune `resubmit_interval_s` / `stop_before_deadline_s` against the chain's commitment limit.
 

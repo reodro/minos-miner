@@ -39,8 +39,8 @@ round opens ─▶ main: download BAM, announce round
 
 - Strategies never know where jobs run; the executor never knows why a job was chosen.
 - Running and scoring are separate steps: if the answer set changes, callsets are re-scored, never re-run.
-  Today scoring happens on the main machine (background thread); with a fleet it must move to the nodes
-  (see evaluator/README.md, open work).
+  On one machine scoring runs in a background thread; with a fleet (`--fleet`) the sub-VPS nodes run GATK **and**
+  score, and main only proposes and submits (see evaluator/README.md).
 - Related configs (a *family*: same config except cheap parameters) go to the executor together and run as **one**
   GATK job; each still gets its own exact result.
 
@@ -77,13 +77,13 @@ docker pull quay.io/biocontainers/samtools:1.20--h50ea8bc_0   # parent-read slic
 # hap.py image: the digest pinned in minos_subnet/utils/scoring.py is pulled on first use
 
 bash evaluator/gatk_patch/build.sh              # GATK batching patch -> evaluator/gatk_patch/build/minos-patch.jar
+bash scripts/fetch_genome.sh                    # GRCh38 chr1-22: FASTA, index, dict, SDF (validator's files)
 bash scripts/fetch_reference_data.sh            # 1000G callsets/panels/masks + CRAM indexes into $DATA_DIR
 .venv/bin/python -m backtest.data --last 20     # released rounds (BAM + truth) for backtests
 ```
 
-Data never goes in git; it lives under `DATA_DIR` (default `/minos/data`). The reference FASTAs + SDFs per
-chromosome (`$DATA_DIR/reference/chrN/`) come from the platform's reference endpoint, and the GIAB NIST VCFs + BEDs
-(`$DATA_DIR/giab/`) from NIST; neither is scripted yet.
+Data never goes in git; it lives under `DATA_DIR` (default `/minos/data`). The GIAB NIST VCFs + BEDs
+(`$DATA_DIR/giab/`) are not scripted yet. Fleet nodes need much less: `scripts/setup_node.sh` sets one up.
 
 ## Everyday commands
 

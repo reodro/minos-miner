@@ -19,7 +19,7 @@ Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `DecisionCach
 | `LocalExecutor` | priority queue, dedup, result cache, batching of queued families, family pricing (`cost_hints`) |
 | `DecisionCacheScorer` | exact hap.py scoring with a per-cluster cache; `score_many` packs several callsets into shared runs |
 | `SimExecutor` | virtual clock for testing strategies and scheduling without GATK |
-| Fleet executor | **not built** (see Open work) |
+| Fleet (`fleet/`) | `FleetExecutor` on main + node agents on sub-VPSs: GATK **and scoring** on the nodes, main only proposes |
 
 ## Making one evaluation cheaper (kept)
 
@@ -77,20 +77,40 @@ Tests (all bit-identical to separate stock runs): genotyping 54/54, PairHMM 62/6
 - `ActivityProfile.add` mutates the state objects it stores: every activity stream needs its own copies.
 - `ReservoirDownsampler` takes the same number of draws whatever their values - that is why repair works.
 
+## Fleet (`evaluator/fleet/`)
+
+```
+main:   python -m main replay|live ... --fleet 0.0.0.0:8707 --cert fleet.crt --key fleet.key
+node:   python -m evaluator.fleet.node --main https://MAIN:8707 --cacert fleet.crt
+both:   MINOS_FLEET_TOKEN=<shared secret>   (env only - never in the repo or a config file)
+```
+
+- **`FleetExecutor`** (main) implements the same Executor protocol, so search and main do not change. Jobs wait in a
+  queue (dedup + result cache); a node asks for as many groups as it has free workers; a **family is always one
+  group** (one GATK run). Every hand-out is a **lease**: a node that stops heartbeating loses it after `lease_s`
+  and its unfinished jobs go back to the queue; a late result from an expired lease still counts, duplicates are
+  ignored. Main serves each round's truth files (and the BAM when no presigned URL is given).
+- **Node agent** (sub-VPS): before joining, a **self-test** runs a fixed config on a 3.6 MB BAM slice and must
+  reproduce `fleet/selftest.json`'s digest exactly (~11 s); then it pulls work, runs it with `LocalExecutor`
+  (batching, divergence repair, dedup), **scores every callset on the node** (DecisionCacheScorer, 2 threads) and
+  returns callsets carrying their score. VCFs stay on the node (~1 KB per result over the network).
+- **Security**: every request carries the token; off localhost main refuses to start without TLS
+  (`scripts/make_fleet_cert.sh`) and nodes refuse plain http.
+- **Setup a node**: `scripts/setup_node.sh` (docker, JDK, venv, images, patch jar, reference genomes).
+- Tested (`tests/test_fleet.py`, `test/fleet_local.py`): 2 node processes on one machine, 8 configs incl. a family
+  of 6 - 8/8 scores identical to the single-machine path; a node killed while holding work had its 7 jobs re-queued
+  and finished by the other; results in 130 s. **Not yet run on real separate VPSs.**
+- Trap found: `LocalExecutor.poll` used to return at once when idle; callers poll in loops, and the spin starved the
+  scoring threads of the GIL (scoring 20x slower). An idle poll now waits for a submit.
+
 ## Open work
 
+- **Real multi-VPS run**: rent 2 small nodes, run `setup_node.sh`, a replay with `--fleet`; watch per-node
+  throughput, scoring lag and bandwidth (BAM download per round per node).
 - **Randomized exactness test** - written, not run: `test/tip_random_exactness.py` (random base configs, random
   multi-parameter families, deep and non-deep rounds). All exactness tests so far used 3 base configs.
-- **E1 fleet executor + E3 node self-test**: one agent per machine that pulls job chunks from main, heartbeats,
-  and whose unfinished jobs are re-queued on loss. Prerequisite for tens of thousands of evals per round.
-  - **Score on the node, not on main.** Today every callset is scored on the main machine (one background thread,
-    packed hap.py runs, ~1-2 s per callset). At 40K callsets that is 40-80K CPU-s per round - 10-20 main cores -
-    and one thread manages only ~4-12K per round. On the node that ran GATK it is ~1-5% of an eval, the network
-    carries a ~1 KB score instead of a ~1 MB VCF, and it scales with the fleet. Main sends the answer set's truth
-    files (a few MB) to every node once per round.
-  - Contract change: `CallSet` may carry an optional score computed on the node; `EvalClient` uses it when present
-    and scores locally otherwise (local runs and tests unchanged). Callsets stay on the node, so re-scoring after
-    an answer-set update (parked idea) remains possible by asking the node.
+- **Scoring threads per node**: 2 by default; at ~59 workers and families of 5, a node may produce ~2 callsets/s -
+  measure whether 2 threads keep up, raise if the scoring queue grows.
 - **Family cost cap / splitting**: a batch's time is solo + sum of variant costs; split families that would run
   longer than ~4-5 min and spread them over idle workers.
 
