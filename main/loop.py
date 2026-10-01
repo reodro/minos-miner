@@ -102,8 +102,8 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         await asyncio.gather(*(s(client) for s in strategies))
 
     task = asyncio.create_task(search())
-    # Live executors: scoring (hap.py, seconds per callset) runs in a worker thread, in packed batches, so the loop
-    # keeps polling GATK and strategies keep proposing meanwhile. The virtual executor scores inline (deterministic).
+    # Live executors: scoring (one hap.py run per callset, seconds each) runs in a worker thread, so the loop keeps
+    # polling GATK and strategies keep proposing meanwhile. The virtual executor scores inline (deterministic).
     to_score: List[CallSet] = []
     scoring: List[Optional[asyncio.Task]] = [None]
     stopping = [False]

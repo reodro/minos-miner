@@ -260,7 +260,7 @@ class Reviewer:
 
     def _true_scores(self, rnd: Round, oracle, keys: List[str], configs: Dict[str, dict], m: dict):
         """True score per config: its VCF from this machine if there, else GATK runs it here (exact)."""
-        from evaluator import DecisionCacheScorer
+        from evaluator import HappyScorer
         callsets, missing = {}, []
         work = Path(SETTINGS.cache_dir) / "callsets" / rnd.tag              # where GatkRunner writes them
         for k in keys:
@@ -271,7 +271,7 @@ class Reviewer:
                 missing.append(k)
         if missing:
             callsets.update(self._run(rnd, {k: Config.from_dict(configs[k]["config"]) for k in missing}))
-        self._scorer = self._scorer or DecisionCacheScorer()
+        self._scorer = self._scorer or HappyScorer()
         true, gate = {}, {}
         for k, cs in callsets.items():
             try:

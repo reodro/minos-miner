@@ -32,7 +32,9 @@ class GatkCommandTest(unittest.TestCase):
             template.variant_call(Path("/x/input.bam"), Path("/y/chr20.fa"), Path("/z/out.vcf.gz"), r.region,
                                   {"gatk_options": cfg.params, "threads": 1, "memory_gb": 4})
         theirs = captured["cmd"]
-        strip = lambda c: [x for i, x in enumerate(c) if not (i > 0 and c[i - 1] == "--name")]  # noqa: E731
+        # container name and network are docker settings, not GATK arguments
+        strip = lambda c: [x for i, x in enumerate(c) if x != "--network"  # noqa: E731
+                           and not (i > 0 and c[i - 1] in ("--name", "--network"))]
         extra = []
         for a in SAFE_ANNOTATION_EXCLUSIONS:
             extra += ["-AX", a]
@@ -83,15 +85,10 @@ class VariantFileTest(unittest.TestCase):
 
 
 class WorkersRuleTest(unittest.TestCase):
-    def test_gatk_workers_floor_90_percent_minus_two(self):
+    def test_gatk_workers_floor_95_percent(self):
         from common.settings import default_workers
         with mock.patch.dict(os.environ, {"MINOS_WORKERS": ""}):
-            self.assertEqual([default_workers(c) for c in (2, 8, 16, 32, 36, 180)], [1, 5, 12, 26, 30, 160])
-
-    def test_scorer_threads_ceil_10_percent(self):
-        from common.settings import default_score_threads
-        with mock.patch.dict(os.environ, {"MINOS_SCORE_THREADS": ""}):
-            self.assertEqual([default_score_threads(c) for c in (2, 16, 32, 36, 180)], [1, 2, 4, 4, 18])
+            self.assertEqual([default_workers(c) for c in (2, 8, 16, 32, 36, 180)], [1, 7, 15, 30, 34, 171])
 
 
 class VariantCostTest(unittest.TestCase):

@@ -6,7 +6,7 @@ Turns configs into scores exactly like the validator does - as cheaply as possib
 EvalJob ──▶ Executor (where/when: local cores or the fleet) ──▶ Runner (GATK) ──▶ CallSet ──▶ Scorer (hap.py) ──▶ ScoreResult
 ```
 
-Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `DecisionCacheScorer`, `LocalExecutor`,
+Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `LocalExecutor`,
 `SimExecutor`, `FakeRunner`/`FakeScorer`, and the protocols in `base.py`.
 
 ## Status (2026-09-30)
@@ -17,7 +17,7 @@ Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `DecisionCach
 | GATK batching patch (`gatk_patch/`) | 17 parameters branchable in one run; bit-identical on every test (see below) |
 | Divergence repair | diverged batch variants fixed by a repair run (~34 s) instead of a full re-run (132 s) |
 | `LocalExecutor` | priority queue, dedup, result cache, batching of queued families, family pricing (`cost_hints`) |
-| `DecisionCacheScorer` | exact hap.py scoring with a per-cluster cache (one per scorer process on the nodes); `score_many` packs several callsets into shared runs |
+| `HappyScorer` | exact: upstream's hap.py path, one run per callset (the truth sliced once per round) |
 | `SimExecutor` | virtual clock for testing strategies and scheduling without GATK |
 | Fleet (`fleet/`) | `FleetExecutor` on main + node agents on sub-VPSs: GATK **and scoring** on the nodes, main only proposes |
 
@@ -26,9 +26,9 @@ Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `DecisionCach
 | Speed-up | Effect |
 |---|---|
 | Exclude annotations the score never uses (`SAFE_ANNOTATION_EXCLUSIONS`) | 1.135x, identical calls. QualByDepth, DepthPerAlleleBySample and RMSMappingQuality must stay (removing them changes QUAL via random draws) |
-| 1 thread per GATK job: `floor(cores x 0.9 - 2)` GATK workers per machine, plus `ceil(cores x 0.1)` scorer processes on fleet nodes | 2.06x throughput vs 4 jobs x 4 threads; scoring keeps up on big nodes (180 cores: 160 + 18) |
-| Decision cache (per-cluster hap.py results) | re-scoring 7.2 s -> ~0.6 s, identical |
-| Packed scoring (`score_many`) | 2.3-3.1x, identical |
+| 1 thread per GATK job, `floor(cores x 0.95)` jobs per machine | 2.06x throughput vs 4 jobs x 4 threads |
+| Truth sliced once per (truth, region) (`truth_slices`) | upstream slices the truth on every scoring (2 bcftools containers); the cached slice is the same bcftools output |
+| GATK containers with `--network none` | no network namespace and interface per container (container start 3.9 s -> 0.33 s measured in the legacy project) |
 
 Rejected after measuring (not exact, or no gain): GVCF re-genotyping, QUAL projection, native Java outside the
 image, interval restriction, scatter-gather, JVM heap/GC tuning, uncompressed BAM, no phasing.
@@ -93,7 +93,7 @@ python -m evaluator.fleet.control status | sync | selftest | reap
 python -m main replay|live ... --fleet                 # mine with the fleet (main starts the node agents)
 ```
 
-- **Inventory**: `workers: null` = the node's own rule floor(cores x 0.9 - 2); `port` lets several machines share
+- **Inventory**: `workers: null` = the node's own rule floor(cores x 0.95); `port` lets several machines share
   one IP; optional `repo` / `data_dir`; an entry without `user` / `key_filename` inherits them from the first entry
   that has them (a new host can be just `{"host": ..., "port": ...}`). `key_passphrase` (optional, also inherited):
   main unlocks the keys in its own `ssh-agent`. Each host may have its own key and passphrase.
@@ -112,15 +112,20 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   node holding its work gets "abort" - it drops the round's local queue, kills exactly that round's containers
   (names carry the round tag) and reports nothing more for it, so all workers are free at the start of the next round.
   `LocalExecutor.end_round` does the same on one machine.
-- **Node side**: `LocalExecutor` with `floor(cores x 0.9 - 2)` GATK workers (batching, divergence repair, dedup) and
-  `ceil(cores x 0.1)` **scorer processes**, each with its own interpreter and its own `DecisionCacheScorer`, fed
-  batches of up to 8 callsets (`score_many` packs their new clusters into shared hap.py runs). Only scores travel
-  back (~1 KB per result), VCFs stay on the node. Why processes: hap.py itself runs in docker, but the Python half
-  of scoring (cutting the VCF into clusters, reading hap.py's lines back, assembling, upstream's parsers) costs
-  ~0.3 s per result on a small region and several seconds on a large GIAB one - one interpreter (one GIL) caps a
-  big node at ~10 results/min, while 160 GATK workers produce ~75. Main counts a group as busy until its scored
-  results arrive, so scoring must keep pace with GATK. A scorer process exits by itself within ~2 s when its parent
-  is gone, even after `kill -9`.
+- **Node side**: `LocalExecutor` with `floor(cores x 0.95)` GATK workers (batching, divergence repair, dedup) and
+  **one scorer process per GATK worker**, each scoring one callset at a time with upstream's hap.py path
+  (`HappyScorer`), exactly what a validator runs. Main counts a group as
+  busy until its scored results arrive, so a worker's slot covers GATK and then scoring, and every finished GATK
+  result is scored at once. Processes, not threads: the Python half of scoring (upstream's parsers over hap.py's
+  output) takes seconds per result on a large GIAB region, and one interpreter (one GIL) capped a 180-core node at
+  ~10 results/min. Only scores
+  travel back (~1 KB per result), VCFs stay on the node. A scorer process exits by itself within ~2 s when its
+  parent is gone, even after `kill -9`.
+- **Host size**: the legacy project measured a full evaluation at 159 s on 67-core hosts, 182 s on 178 cores and
+  250 s on 356 cores (hap.py 24 -> 37.5 s): big hosts have lower clocks and less memory bandwidth per core. It
+  rented 64-core machines. dockerd starts ~16 containers/s, and ~240 concurrent containers made it refuse new ones
+  (rc=125); on a 180-core node with ~160 GATK containers plus scoring containers the load average passed 300 with
+  30-45% of the CPU idle.
 - **Setup a node**: `control provision` copies the repo and **main's reference genomes** (rsync), then runs
   `scripts/setup_node.sh` over SSH: docker, JDK, venv from `requirements.txt`, the GATK image, the **hap.py image
   at upstream's pinned digest** and the **bcftools image** scoring uses (all pre-pulled, so the first scoring does

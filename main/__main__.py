@@ -72,7 +72,7 @@ def _board():
 
 def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: int, fleet=None):
     from answer_set import Provider
-    from evaluator import DecisionCacheScorer, GatkRunner, LocalExecutor
+    from evaluator import GatkRunner, HappyScorer, LocalExecutor
     from evaluator.gatk import DEFAULT_PATCH_JAR
     from main.loop import LoopSettings
     from main.miner import Parts
@@ -86,7 +86,7 @@ def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: in
     strat = rf_ucb(r, in_flight=workers) if strategy == "rf_ucb" else random_stream(r, in_flight=workers)
     os.makedirs(os.path.join(SETTINGS.cache_dir, "results"), exist_ok=True)
     store = ResultStore(os.path.join(SETTINGS.cache_dir, "results", f"{rnd.tag}.sqlite"))
-    return Parts(Provider(), executor, DecisionCacheScorer(), [strat], submitter, r,
+    return Parts(Provider(), executor, HappyScorer(), [strat], submitter, r,
                  [r.defaults("gatk")], LoopSettings(resubmit_interval_s=300.0, stop_before_deadline_s=60.0), store,
                  status=_board())
 

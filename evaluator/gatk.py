@@ -175,6 +175,7 @@ class GatkRunner:
         heap = f"-Xmx{max(512, int(self.memory_gb * 1024 * 0.8))}m"
         cmd = ["docker", "run", "--rm", "--name", f"{self.container_prefix}-{round.tag}-{uuid.uuid4().hex[:10]}",
                f"--cpus={self.threads}", f"--memory={self.memory_gb}g",
+               "--network", "none",     # GATK needs no network; without one docker creates no interface per container
                "-v", f"{bam.parent}:/data/bams:ro", "-v", f"{ref.parent}:/data/reference:ro",
                "-v", f"{out_vcf.parent}:/data/output"]
         if self.patch_jar is None:
@@ -331,16 +332,18 @@ class GatkRunner:
 class HappyScorer:
     """Exact: upstream HappyScorer.score_vcf + parse_happy_vcf, counts through common.scoring.finalize.
 
-    Truth comes from the answer set: `notes['truth_vcf']` / `notes['mutations_vcf']` when the provider has files
-    (the oracle), otherwise a VCF written from its records. Slow (~8 s per callset): the reference implementation;
-    DecisionCacheScorer (identical results, cached per cluster) is what the miner uses.
+    One upstream hap.py run per callset, exactly what a validator runs. Truth comes from the answer set:
+    `notes['truth_vcf']` / `notes['mutations_vcf']` (writing them from reconstructed records is not implemented).
+    hap.py writes its outputs next to the callset's VCF.
     """
 
     def __init__(self, work_dir: Optional[str] = None):
         self.work_dir = Path(work_dir or os.path.join(SETTINGS.cache_dir, "happy"))
 
     def score(self, callset: CallSet, answer_set: AnswerSet) -> ScoreResult:
+        from evaluator import truth_slices
         from utils.scoring import HappyScorer as UpstreamHappy, difficulty_class_counts, parse_happy_vcf
+        truth_slices.install()                 # the truth is sliced once per round, not on every hap.py run
         truth = answer_set.notes.get("truth_vcf")
         mutations = answer_set.notes.get("mutations_vcf")
         region = answer_set.notes.get("region")
@@ -350,8 +353,6 @@ class HappyScorer:
                                       "(writing them from reconstructed records is not implemented yet)")
         chrom = region.split(":")[0]
         sdf = str(Path(reference).parent / f"{chrom}.sdf")
-        out = self.work_dir / uuid.uuid4().hex[:12]
-        out.mkdir(parents=True, exist_ok=True)
         m = UpstreamHappy().score_vcf(truth_vcf=truth, query_vcf=callset.vcf, reference_fasta=reference,
                                       confident_bed=None, region=region, reference_sdf=sdf, mutations_vcf=mutations)
         if not m or "happy_vcf_path" not in m:

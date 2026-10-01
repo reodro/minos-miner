@@ -14,7 +14,8 @@ Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatfor
    then all strategies run concurrently until `deadline - stop_before_deadline_s`.
 3. **Submissions**: a better config is resubmitted at most every `resubmit_interval_s` (300 s live - on-chain
    commitments are rate-limited); the best config found is submitted once more just before the loop stops.
-4. Scoring runs in a background thread in packed batches, so GATK workers stay fed while hap.py runs (with a
+4. Scoring (one upstream hap.py run per config) runs in a background thread, so GATK workers stay fed while
+   hap.py runs (with a
    fleet, the nodes score).
 5. Round end: after the final submission the executor ends the round (`end_round`): its queued jobs are dropped and
    its running GATK containers killed, locally or on every fleet node, so the next round starts with every worker free.

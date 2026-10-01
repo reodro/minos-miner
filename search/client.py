@@ -138,14 +138,8 @@ class EvalClient:
         self.complete(cs, result, error)
 
     def score_batch(self, callsets: List[CallSet]) -> List[Tuple[Optional[ScoreResult], Optional[str]]]:
-        """(result, error) per callset against the current answer set. Safe to run in a worker thread; packs the
-        batch into shared hap.py runs when the scorer supports it (score_many)."""
-        many = getattr(self.scorer, "score_many", None)
-        if many and len(callsets) > 1:
-            try:
-                return [(r, None) for r in many(callsets, self.answer_set)]
-            except Exception as e:  # noqa: BLE001 - one bad callset must not sink the batch: fall back one by one
-                log.warning("packed scoring failed (%s); scoring one by one", e)
+        """(result, error) per callset against the current answer set, one hap.py run each. Safe to run in a worker
+        thread."""
         out = []
         for cs in callsets:
             try:
