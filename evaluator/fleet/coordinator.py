@@ -376,6 +376,15 @@ class FleetExecutor:
             free = sum(max(0, s.workers - s.open_groups()) for s in self._sessions.values() if s.ready)
             return max(0, free - len(self._queue))
 
+    def stats(self) -> dict:
+        """For the public dashboard: nodes are numbered, never named (no IPs)."""
+        with self._lock:
+            nodes = [dict(node=f"node {i}", ready=s.ready, workers=s.workers, busy=s.open_groups(), jobs=len(s.jobs),
+                          rejected=bool(s.rejected)) for i, s in enumerate(self._sessions.values(), 1)]
+            return {"kind": "fleet", "queued": len(self._queue), "nodes": nodes,
+                    "workers": sum(n["workers"] for n in nodes if n["ready"]),
+                    "running": sum(n["busy"] for n in nodes if n["ready"])}
+
     def nodes(self) -> List[dict]:
         with self._lock:
             return [dict(host=n, ready=s.ready, workers=s.workers, open_groups=s.open_groups(), jobs=len(s.jobs),

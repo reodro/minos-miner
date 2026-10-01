@@ -169,6 +169,11 @@ class LocalExecutor:
         with self._lock:
             self._cancelled.update(job_ids)
 
+    def stats(self) -> dict:
+        with self._lock:
+            return {"kind": "local", "workers": self.workers, "running": len(self._running), "queued": len(self._queue),
+                    "batches_run": self.batches_run}
+
     def end_round(self, round_id: str) -> None:
         """The round is over: drop its queued jobs, kill its running GATK containers, deliver nothing more for it.
         Frees every worker for the next round at once instead of letting stale batches run on for minutes."""

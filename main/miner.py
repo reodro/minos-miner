@@ -53,6 +53,7 @@ class Parts:
     baselines: List[Config]                       # known-good configs, best first; [0] is the static fallback
     settings: LoopSettings = field(default_factory=LoopSettings)
     store: Optional[ResultStore] = None
+    status: Optional[object] = None               # main.status.StatusBoard: what the dashboard shows
 
 
 @dataclass
@@ -65,6 +66,16 @@ class MinedRound:
 
 def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url: Optional[str] = None,
                bai_url: Optional[str] = None) -> MinedRound:
+    if parts.status:
+        parts.status.round_started(round, deadline_ts)
+    mined = _mine_round(round, parts, deadline_ts, bam_url, bai_url)
+    if parts.status:
+        parts.status.round_ended(mined)
+    return mined
+
+
+def _mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url: Optional[str] = None,
+                bai_url: Optional[str] = None) -> MinedRound:
     """One round with the fallback chain. Never raises. With a fleet executor, the round (truth files, BAM location)
     is published to the nodes once the answer set exists."""
     try:
@@ -72,6 +83,8 @@ def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url
     except Exception as e:  # noqa: BLE001 - the round still gets the static baseline
         log.exception("answer set failed for %s", round.round_id)
         return _static(round, parts, f"answer set failed: {e}")
+    if parts.status:
+        parts.status.answer_set(answer_set)
     if answer_set.regime == Regime.UNKNOWN or not answer_set.germline:
         return _static(round, parts, "no donor identified: searching without a truth would be noise")
     publish = getattr(parts.executor, "publish_round", None)
@@ -92,7 +105,8 @@ def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url
     try:
         out = asyncio.run(run_round_async(round, Built(), parts.executor, parts.scorer, parts.strategies,
                                           parts.submitter, parts.ranges, parts.settings, parts.baselines,
-                                          store=parts.store, deadline_ts=deadline_ts))
+                                          store=parts.store, deadline_ts=deadline_ts,
+                                          on_tick=parts.status.tick if parts.status else None))
         return MinedRound(round.round_id, "searched", out)
     except Exception as e:  # noqa: BLE001
         log.exception("round loop failed for %s", round.round_id)

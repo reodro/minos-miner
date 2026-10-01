@@ -55,6 +55,17 @@ def fleet_executor(inventory: str):
     return _FLEET["ex"]
 
 
+_BOARD = {}
+
+
+def _board():
+    """One status board per process (the dashboard reads what it writes)."""
+    if "b" not in _BOARD:
+        from main.status import StatusBoard
+        _BOARD["b"] = StatusBoard()
+    return _BOARD["b"]
+
+
 def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: int, fleet=None):
     from answer_set import Provider
     from evaluator import DecisionCacheScorer, GatkRunner, LocalExecutor
@@ -72,7 +83,8 @@ def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: in
     os.makedirs(os.path.join(SETTINGS.cache_dir, "results"), exist_ok=True)
     store = ResultStore(os.path.join(SETTINGS.cache_dir, "results", f"{rnd.tag}.sqlite"))
     return Parts(Provider(), executor, DecisionCacheScorer(), [strat], submitter, r,
-                 [r.defaults("gatk")], LoopSettings(resubmit_interval_s=300.0, stop_before_deadline_s=60.0), store)
+                 [r.defaults("gatk")], LoopSettings(resubmit_interval_s=300.0, stop_before_deadline_s=60.0), store,
+                 status=_board())
 
 
 def replay(tag: str, minutes: float, strategy: str, workers: int, fleet=None) -> None:
@@ -102,8 +114,10 @@ def replay(tag: str, minutes: float, strategy: str, workers: int, fleet=None) ->
         print("final config's callset is not on this machine (fleet): rerun it locally to get its TRUE score"); return
     true = parts.scorer.score(cs, OracleProvider().build(rnd)).score
     field = field_scores(tag)
-    print(f"final submission {final}: TRUE score {true:.4f} -> rank {rank_in_field(true, field)} of {len(field) + 1} "
+    rank = rank_in_field(true, field)
+    print(f"final submission {final}: TRUE score {true:.4f} -> rank {rank} of {len(field) + 1} "
           f"(field best {max(field) if field else None})")
+    _board().true_score(rnd.round_id, true, rank, len(field) + 1)
 
 
 def main() -> None:

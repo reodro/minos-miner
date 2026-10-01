@@ -46,7 +46,8 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                           strategies: List[Strategy], submitter: Submitter, ranges: ParamRanges,
                           settings: LoopSettings, baselines: List[Config], store: Optional[ResultStore] = None,
                           deadline_ts: Optional[float] = None,
-                          clock: Optional[Callable[[], float]] = None) -> RoundOutcome:
+                          clock: Optional[Callable[[], float]] = None,
+                          on_tick: Optional[Callable] = None) -> RoundOutcome:
     virtual = hasattr(executor, "now")
     clock = clock or ((lambda: executor.now) if virtual else time.time)
     client = EvalClient(round, executor, scorer, ranges, store or ResultStore(), provider.build(round),
@@ -142,6 +143,8 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                     client.rescore(new)
                     out.answer_set_version = new.version
             maybe_submit()                        # an improvement held back by the interval goes out when it ends
+            if on_tick:
+                on_tick(client, out, executor)    # the dashboard snapshot (throttled by the callee)
             idle_spins = idle_spins + 1 if (virtual and not batch and client.in_flight == 0) else 0
             if idle_spins > 1000:                 # strategies alive but proposing nothing: a strategy bug
                 log.warning("strategies stalled with nothing in flight; ending round")

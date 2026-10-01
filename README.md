@@ -93,6 +93,8 @@ Data never goes in git; it lives under `DATA_DIR` (default `/minos/data`). The G
 .venv/bin/python -m main live --wallet W --hotkey H --demo        # live miner (untested; demo mode first)
 ```
 
+A password-protected dashboard (live round + history) runs on main: see [dashboard/README.md](dashboard/README.md).
+
 `replay` prints what the miner would have submitted, its **true** score and its rank among the real submissions.
 Reference points (round 092900Z, 20 min): one 16-core machine - 296 configs, true 87.22, rank 44/60; fleet of two
 16-core sub-VPSs - 587 configs, true 87.53, rank 36/60.
