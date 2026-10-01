@@ -59,6 +59,9 @@ class _Session:
     rounds_failed: set = field(default_factory=set)          # round_ids the node could not prepare
     groups: List[set] = field(default_factory=list)          # job_ids per open group (one GATK run each)
     jobs: Dict[str, EvalJob] = field(default_factory=dict)   # outstanding job_id -> job
+    done: int = 0                                            # results delivered (dashboard)
+    gatk_runs: int = 0                                       # groups handed to it: one GATK run each (dashboard)
+    gatk_runs_done: int = 0                                  # ... whose every result came back
     outq: "queue.Queue[Optional[str]]" = field(default_factory=queue.Queue)
     closed: bool = False
     finished: bool = False                                   # its session thread has ended
@@ -219,8 +222,11 @@ class FleetExecutor:
             job = s.jobs.pop(cs.job_id, None)
             for g in s.groups:
                 g.discard(cs.job_id)
+            open_before = len(s.groups)
             s.groups = [g for g in s.groups if g]
+            s.gatk_runs_done += open_before - len(s.groups)
             if job is not None:
+                s.done += 1
                 self._finish(cs, job)
             self._pump()
 
@@ -371,6 +377,11 @@ class FleetExecutor:
                 out.append(c)
             return out
 
+    def capacity(self) -> int:
+        """GATK workers on every ready node."""
+        with self._lock:
+            return sum(s.workers for s in self._sessions.values() if s.ready)
+
     def idle_slots(self) -> int:
         with self._lock:
             free = sum(max(0, s.workers - s.open_groups()) for s in self._sessions.values() if s.ready)
@@ -380,8 +391,12 @@ class FleetExecutor:
         """For the public dashboard: nodes are numbered, never named (no IPs)."""
         with self._lock:
             nodes = [dict(node=f"node {i}", ready=s.ready, workers=s.workers, busy=s.open_groups(), jobs=len(s.jobs),
-                          rejected=bool(s.rejected)) for i, s in enumerate(self._sessions.values(), 1)]
-            return {"kind": "fleet", "queued": len(self._queue), "nodes": nodes,
+                          done=s.done, gatk_runs=s.gatk_runs, gatk_runs_done=s.gatk_runs_done,
+                          rejected=bool(s.rejected))
+                     for i, s in enumerate(self._sessions.values(), 1)]
+            return {"kind": "fleet", "queued": len(self._queue), "nodes": nodes, "done": sum(n["done"] for n in nodes),
+                    "gatk_runs": sum(n["gatk_runs"] for n in nodes),
+                    "gatk_runs_done": sum(n["gatk_runs_done"] for n in nodes),
                     "workers": sum(n["workers"] for n in nodes if n["ready"]),
                     "running": sum(n["busy"] for n in nodes if n["ready"])}
 
@@ -411,6 +426,7 @@ class FleetExecutor:
                 for j in g:
                     s.jobs[j.job_id] = j
                 s.groups.append({j.job_id for j in g})
+                s.gatk_runs += 1
                 if not s.send({"type": "jobs", "groups": [[codec.job_to(j) for j in g]]}):
                     break                                      # the reader sees the session end and re-queues
 

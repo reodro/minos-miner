@@ -45,7 +45,8 @@ the validator too).
 - `base.py`: `RandomSampler`, `random_stream` - the baseline every real strategy must beat.
 - `rf_ucb.py`: **RF_UCB v1** - scikit-learn ExtraTrees surrogate, upper-confidence picks (mean + kappa x spread of
   the trees), mostly local moves around the top configs plus some random ones, and a small family of cheap variants
-  with every pick. Proposes whenever a worker is free.
+  with every pick. Proposes whenever a worker is free; the configs it keeps pending are capped at
+  max(256, (family + 1) x the executor's total workers), so a big fleet is never starved (a family fills one worker).
   - Fake landscape (6 seeds): 200 evals - mean best 93.2 vs random 91.7, RF_UCB better on 6/6 seeds; at 120 evals
     it is still warming up (91.8 vs 91.7).
   - Real replay, 092900Z, 20 min on 16 cores: 296 configs, true score 87.22, rank 44 of 60 (field best 88.96).

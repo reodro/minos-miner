@@ -23,11 +23,13 @@ command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | env UV_
 uv venv -q --python "$PY" --allow-existing .venv
 uv pip install -q --python .venv/bin/python -r requirements.txt
 
-# images: the validator's GATK, and hap.py at the exact digest upstream pins (pulled now: pulling it on first use
-# would stall the node's first scoring for minutes)
+# images: the validator's GATK, and the two images upstream's scoring runs - hap.py at its pinned digest and bcftools
+# (pulled now: pulling on first use would stall, or on a host that cannot reach the registry fail, the first scorings)
 docker pull -q broadinstitute/gatk:4.5.0.0
 HAPPY=$(grep -oP 'HAPPY_DOCKER_IMAGE = "\K[^"]+' /minos/minos_subnet/utils/scoring.py)
+BCFTOOLS=$(grep -oP 'BCFTOOLS_DOCKER_IMAGE = "\K[^"]+' /minos/minos_subnet/utils/scoring.py)
 docker pull -q "$HAPPY"
+docker pull -q "$BCFTOOLS"
 
 # the GATK batching patch, compiled against the exact jar inside the validator image
 mkdir -p /opt/gatk

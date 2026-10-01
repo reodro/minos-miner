@@ -27,18 +27,60 @@ import threading
 import time
 import uuid
 from dataclasses import replace
-from typing import Dict
+from typing import Dict, Optional
 
-from common.settings import SETTINGS, default_workers
+from common.settings import SETTINGS, default_score_threads, default_workers
 from common.types import AnswerSet, CallSet, Regime
 from evaluator.fleet import codec, selftest
 from evaluator.fleet.inventory import code_digest
 
 log = logging.getLogger("node")
 
+_PROC_SCORER = None
+
+
+def _proc_init(work_dir: str) -> None:
+    """A scorer process: its own interpreter (own GIL) and its own decision cache. It exits as soon as its parent (the
+    node agent, or any other caller) is gone - even after a hard kill - so no scorer is left running on its own."""
+    global _PROC_SCORER
+    parent = os.getppid()
+
+    def watchdog():
+        while os.getppid() == parent:
+            time.sleep(2)
+        os._exit(1)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s node: %(message)s")
+    from evaluator.decision_cache import DecisionCacheScorer
+    _PROC_SCORER = DecisionCacheScorer(work_dir=os.path.join(work_dir, f"p{os.getpid()}"))
+
+
+def _proc_score(css: list, aset: AnswerSet, keep: set) -> list:
+    """Score callsets of one round in a scorer process: [(callset, ScoreResult or None)], a failed one carrying its
+    error. Caches of rounds the node no longer keeps are dropped first."""
+    sc = _PROC_SCORER
+    for rid in {k[0] for k in list(sc._caches)} - set(keep):
+        sc.drop(rid)
+    try:
+        results = sc.score_many(css, aset) if len(css) > 1 else [sc.score(css[0], aset)]
+        return list(zip(css, results))
+    except Exception:  # noqa: BLE001 - score one by one so one bad callset cannot sink the batch
+        pairs = []
+        for c in css:
+            try:
+                pairs.append((c, sc.score(c, aset)))
+            except Exception as e:  # noqa: BLE001
+                pairs.append((replace(c, ok=False, error=f"scoring failed on node: {e}"), None))
+        return pairs
+
 
 class Node:
-    def __init__(self, workers: int, runner, scorer_factory, score_threads: int = 2):
+    def __init__(self, workers: int, runner, scorer_factory, score_threads: Optional[int] = None,
+                 score_dir: Optional[str] = None):
+        """`score_dir` set: score in `score_threads` separate processes (each its own GIL and decision cache) - the
+        Python half of scoring needs ~1 core per few dozen GATK workers, more than one interpreter has on a big node.
+        Unset (tests): score in threads with `scorer_factory`'s scorer."""
         from evaluator.local import LocalExecutor
         self.workers = workers
         self.runner, self.scorer_factory = runner, scorer_factory
@@ -48,8 +90,14 @@ class Node:
         self._to_score: "queue.Queue[CallSet]" = queue.Queue()
         self._out_lock = threading.Lock()
         self._stop = threading.Event()
-        self.score_threads = score_threads
-        self._scorers: list = []
+        self.score_threads = score_threads or default_score_threads()
+        self._scorers: list = []                             # thread mode (tests): one scorer shared by all threads
+        self._pool = None
+        if score_dir:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+            self._pool = ProcessPoolExecutor(self.score_threads, mp_context=multiprocessing.get_context("spawn"),
+                                             initializer=_proc_init, initargs=(score_dir,))
         self._aborted: set = set()
 
     # ---- messages -----------------------------------------------------------------------------------------------
@@ -110,8 +158,8 @@ class Node:
 
     # ---- scoring -------------------------------------------------------------------------------------------------
     def _scorer(self, i: int) -> None:
-        scorer = self.scorer_factory(i)
-        self._scorers.append(scorer)
+        """One feeder per scorer process (in thread mode, for tests: a scorer itself); batches of up to 8 callsets."""
+        scorer = None if self._pool else self._scorers[0]
         while not self._stop.is_set():
             try:
                 batch = [self._to_score.get(timeout=1.0)]
@@ -127,6 +175,15 @@ class Node:
                 if rid not in self._rounds:                     # the round was pruned meanwhile: nothing to report
                     continue
                 aset = self._rounds[rid][1]
+                if self._pool is not None:
+                    try:
+                        pairs = self._pool.submit(_proc_score, css, aset, set(self._rounds)).result()
+                    except Exception as e:  # noqa: BLE001 - a dead scorer process fails its batch, not the node
+                        pairs = [(replace(c, ok=False, error=f"scoring failed on node: {e}"), None) for c in css]
+                    for c, r in pairs:
+                        if c.round_id not in self._aborted:
+                            self.send({"type": "result", "callset": codec.callset_to(replace(c, score=r) if r else c)})
+                    continue
                 many = getattr(scorer, "score_many", None)
                 try:
                     results = many(css, aset) if many and len(css) > 1 else [scorer.score(c, aset) for c in css]
@@ -145,6 +202,8 @@ class Node:
     # ---- main loop -------------------------------------------------------------------------------------------------
     def serve(self) -> None:
         threading.Thread(target=self._reader, daemon=True).start()
+        if self._pool is None:
+            self._scorers.append(self.scorer_factory(0))        # shared: a cluster scored once is never re-run here
         for i in range(self.score_threads):
             threading.Thread(target=self._scorer, args=(i,), daemon=True).start()
         while not self._stop.is_set():
@@ -182,7 +241,7 @@ def main() -> None:
     ap.add_argument("--stdio", action="store_true", help="serve main over stdin/stdout (how main starts it over ssh)")
     ap.add_argument("--selftest-only", action="store_true", help="run the self-test, print the result, exit")
     ap.add_argument("--workers", type=int)
-    ap.add_argument("--score-threads", type=int, default=2)
+    ap.add_argument("--score-threads", type=int, help="scorer processes; default: ceil(cores * 0.1)")
     ap.add_argument("--fake", action="store_true", help="tests only: FakeRunner/FakeScorer, no GATK, no self-test")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s node: %(message)s")
@@ -207,17 +266,20 @@ def main() -> None:
         from evaluator.gatk import DEFAULT_PATCH_JAR, GatkRunner
         runner = GatkRunner(threads=1, memory_gb=4, patch_jar=DEFAULT_PATCH_JAR, container_prefix=prefix,
                             work_dir=os.path.join(SETTINGS.cache_dir, "callsets"))
-        scorer_factory = lambda i: DecisionCacheScorer(work_dir=os.path.join(SETTINGS.cache_dir, f"dcache_node{i}"))  # noqa: E731
+        scorer_factory = lambda i: DecisionCacheScorer(work_dir=os.path.join(SETTINGS.cache_dir, "dcache_node"))  # noqa: E731
         result = selftest.run(runner, SETTINGS.data_dir)
     if a.selftest_only:
         print(json.dumps(result)); return
-    node = Node(workers, runner, scorer_factory, a.score_threads)
+    node = Node(workers, runner, scorer_factory, a.score_threads,
+                score_dir=None if a.fake else os.path.join(SETTINGS.cache_dir, "dcache_node"))
     node.send({"type": "ready", "code": code, "workers": workers, **result})
     if not result["ok"]:
         log.error("self-test failed: %s != %s", result["digest"], result["expected"]); return
     try:
         node.serve()
     finally:
+        if node._pool is not None:
+            node._pool.shutdown(wait=False, cancel_futures=True)
         if not a.fake:
             reap(prefix)
 

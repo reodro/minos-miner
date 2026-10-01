@@ -67,7 +67,7 @@ class MinedRound:
 def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url: Optional[str] = None,
                bai_url: Optional[str] = None) -> MinedRound:
     if parts.status:
-        parts.status.round_started(round, deadline_ts)
+        parts.status.round_started(round, deadline_ts, parts.baselines)
     mined = _mine_round(round, parts, deadline_ts, bam_url, bai_url)
     if parts.status:
         parts.status.round_ended(mined)

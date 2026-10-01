@@ -17,7 +17,7 @@ Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `DecisionCach
 | GATK batching patch (`gatk_patch/`) | 17 parameters branchable in one run; bit-identical on every test (see below) |
 | Divergence repair | diverged batch variants fixed by a repair run (~34 s) instead of a full re-run (132 s) |
 | `LocalExecutor` | priority queue, dedup, result cache, batching of queued families, family pricing (`cost_hints`) |
-| `DecisionCacheScorer` | exact hap.py scoring with a per-cluster cache; `score_many` packs several callsets into shared runs |
+| `DecisionCacheScorer` | exact hap.py scoring with a per-cluster cache (one per scorer process on the nodes); `score_many` packs several callsets into shared runs |
 | `SimExecutor` | virtual clock for testing strategies and scheduling without GATK |
 | Fleet (`fleet/`) | `FleetExecutor` on main + node agents on sub-VPSs: GATK **and scoring** on the nodes, main only proposes |
 
@@ -26,7 +26,7 @@ Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `DecisionCach
 | Speed-up | Effect |
 |---|---|
 | Exclude annotations the score never uses (`SAFE_ANNOTATION_EXCLUSIONS`) | 1.135x, identical calls. QualByDepth, DepthPerAlleleBySample and RMSMappingQuality must stay (removing them changes QUAL via random draws) |
-| 1 thread per GATK job, `floor(cores x 0.95 - 1)` jobs per machine | 2.06x throughput vs 4 jobs x 4 threads |
+| 1 thread per GATK job: `floor(cores x 0.9 - 2)` GATK workers per machine, plus `ceil(cores x 0.1)` scorer processes on fleet nodes | 2.06x throughput vs 4 jobs x 4 threads; scoring keeps up on big nodes (180 cores: 160 + 18) |
 | Decision cache (per-cluster hap.py results) | re-scoring 7.2 s -> ~0.6 s, identical |
 | Packed scoring (`score_many`) | 2.3-3.1x, identical |
 
@@ -93,7 +93,7 @@ python -m evaluator.fleet.control status | sync | selftest | reap
 python -m main replay|live ... --fleet                 # mine with the fleet (main starts the node agents)
 ```
 
-- **Inventory**: `workers: null` = the node's own rule floor(cores x 0.95 - 1); `port` lets several machines share
+- **Inventory**: `workers: null` = the node's own rule floor(cores x 0.9 - 2); `port` lets several machines share
   one IP; optional `repo` / `data_dir`; an entry without `user` / `key_filename` inherits them from the first entry
   that has them (a new host can be just `{"host": ..., "port": ...}`). `key_passphrase` (optional, also inherited):
   main unlocks the keys in its own `ssh-agent`. Each host may have its own key and passphrase.
@@ -112,12 +112,24 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   node holding its work gets "abort" - it drops the round's local queue, kills exactly that round's containers
   (names carry the round tag) and reports nothing more for it, so all workers are free at the start of the next round.
   `LocalExecutor.end_round` does the same on one machine.
-- **Node side**: `LocalExecutor` (batching, divergence repair, dedup) + `DecisionCacheScorer` threads; only scores
-  travel back (~1 KB per result), VCFs stay on the node.
+- **Node side**: `LocalExecutor` with `floor(cores x 0.9 - 2)` GATK workers (batching, divergence repair, dedup) and
+  `ceil(cores x 0.1)` **scorer processes**, each with its own interpreter and its own `DecisionCacheScorer`, fed
+  batches of up to 8 callsets (`score_many` packs their new clusters into shared hap.py runs). Only scores travel
+  back (~1 KB per result), VCFs stay on the node. Why processes: hap.py itself runs in docker, but the Python half
+  of scoring (cutting the VCF into clusters, reading hap.py's lines back, assembling, upstream's parsers) costs
+  ~0.3 s per result on a small region and several seconds on a large GIAB one - one interpreter (one GIL) caps a
+  big node at ~10 results/min, while 160 GATK workers produce ~75. Main counts a group as busy until its scored
+  results arrive, so scoring must keep pace with GATK. A scorer process exits by itself within ~2 s when its parent
+  is gone, even after `kill -9`.
 - **Setup a node**: `control provision` copies the repo and **main's reference genomes** (rsync), then runs
-  `scripts/setup_node.sh` over SSH: docker, JDK, venv from `requirements.txt`, the GATK image and the **hap.py image
-  at upstream's pinned digest** (pre-pulled, so the first scoring does not stall), the patch jar, and any genome main
-  did not have (from the platform's reference endpoint).
+  `scripts/setup_node.sh` over SSH: docker, JDK, venv from `requirements.txt`, the GATK image, the **hap.py image
+  at upstream's pinned digest** and the **bcftools image** scoring uses (all pre-pulled, so the first scoring does
+  not stall or fail), the patch jar, and any genome main did not have (from the platform's reference endpoint).
+  Pushing genomes from main runs at ~1.3 MB/s per node over a 35 ms link (~12 min for 907 MB).
+- **Blocked registries**: some providers block Docker Hub and quay.io (both on AWS). Docker Hub images then come
+  through Google's mirror (`/etc/docker/daemon.json`: `{"registry-mirrors": ["https://mirror.gcr.io"]}`; digests
+  are identical, pinned digests resolve); quay.io's bcftools image is copied from main
+  (`docker save | ssh <node> docker load`, 66 MB).
 - Tested: `tests/test_fleet.py` runs the real node agent as subprocesses (fake GATK): scored results, families as
   one group, a killed node's jobs re-queued to the other, nodes with a failing self-test or other code rejected.
   `test/fleet_local.py` (real GATK, 2 nodes from an inventory, no ssh hop): 8 configs incl. a family of 6, the node
@@ -126,13 +138,27 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   **Real fleet** (2 x 16-core VPS, 28 workers, 2026-09-30): provisioned in ~4 min each, self-test identical on both;
   replay 092900Z, 20 min: **587 configs** (single machine: 296), both nodes 14/14 containers and 86-99% CPU, main
   ~2% CPU; final submission true score 87.53, rank 36/60 (single machine: 87.22, rank 44).
-- Trap found: `LocalExecutor.poll` used to return at once when idle; callers poll in loops, and the spin starved the
-  scoring threads of the GIL (scoring 20x slower). An idle poll now waits for a submit.
+  **Scorer processes vs upstream** (`test/scorer_exactness_check.py`): 20 stored callsets scored through spawned
+  scorer processes exactly as a node runs them, each compared with upstream's `HappyScorer`: 20/20 identical
+  (13 full ScoreResults equal; 1 normal and 5 SNP-less callsets fail in both - hap.py produces no result; 1 SNP-less
+  callset scores 0.0 in both, gate failed). A failed callset is reported as failed, never as 0.0.
+- Trap: `LocalExecutor.poll` waits for a submit when idle. Callers poll in loops; a poll returning at once would
+  spin and starve the scoring threads of the GIL (scoring 20x slower).
 
 ## Open work
 
-- **Scale**: more nodes (just `fleet.json` + `control provision`); watch whether 2 scoring threads per node keep up.
-  Nodes keep the last 3 rounds (`KEEP_ROUNDS`) and delete older rounds' BAMs and callsets.
+- **Scale**: more nodes (just `fleet.json` + `control provision`). Nodes keep the last 3 rounds (`KEEP_ROUNDS`) and
+  delete older rounds' BAMs and callsets.
+- **Big-node fleet run**: scorer processes are verified exact (above) but not yet run on a fleet; a 20-minute replay
+  on large nodes should show `busy` equal to the running GATK containers (scoring keeping pace).
+- **Shared cache across scorer processes**: each process caches only what it scored itself. If repeats across
+  processes turn out to be common, a disk-backed cache per node (SQLite or files keyed by cluster) shares it.
+- **Blocked registries, automated**: `setup_node.sh` could set the Docker Hub mirror when a pull fails, and
+  `control provision` could copy quay.io's bcftools image from main when its pull fails.
+- **Node-side genome download**: nodes fetching their reference from UCSC (`scripts/fetch_genome.sh`) instead of
+  main's rsync push would cut provisioning from ~12 min to ~1-2 min.
+- **Scoring in the self-test**: the self-test checks GATK output only; a node that cannot score (missing image)
+  passes it. Add one scored callset to it.
 - **Randomized exactness test** - written, not run: `test/tip_random_exactness.py` (random base configs, random
   multi-parameter families, deep and non-deep rounds). All exactness tests so far used 3 base configs.
 - **Family cost cap / splitting**: a batch's time is solo + sum of variant costs; split families that would run

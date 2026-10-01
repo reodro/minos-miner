@@ -14,9 +14,25 @@ Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatfor
    then all strategies run concurrently until `deadline - stop_before_deadline_s`.
 3. **Submissions**: a better config is resubmitted at most every `resubmit_interval_s` (300 s live - on-chain
    commitments are rate-limited); the best config found is submitted once more just before the loop stops.
-4. Scoring runs in a background thread in packed batches, so GATK workers stay fed while hap.py runs.
+4. Scoring runs in a background thread in packed batches, so GATK workers stay fed while hap.py runs (with a
+   fleet, the nodes score).
 5. Round end: after the final submission the executor ends the round (`end_round`): its queued jobs are dropped and
    its running GATK containers killed, locally or on every fleet node, so the next round starts with every worker free.
+
+## Status and post-round review (`main.status`, `main.review`)
+
+- **Status** (`StatusBoard`): every few seconds `<data_dir>/status/live.json`; at round end one `round` line in
+  `status/rounds.jsonl` with three sections (`answer_set`, `evaluator`, `search`), and `status/runs/<run_id>/`
+  (`manifest.json`: final + baseline config, every config's params and local score; `answer_set.json.gz`).
+  A run is one mining of one round: `<tag>-<start epoch>` (replays repeat tags). The dashboard reads all of this.
+- **Review** (`Reviewer`): next to `live`, a background thread checks every 5 min:
+  - truth released (one round after the deadline) -> `review` line: answer-set accuracy vs the released truth
+    (germline exact/sites, synthetic, N), TRUE scores of the final, the baseline and the top 8 by local score,
+    Spearman(local, true), pick gap, gain over baseline. VCFs on main are reused; others (fleet runs) are re-run
+    here with GATK, solo and in parallel (one worker per config, no batching: a batch runs its variants one after
+    another, ~2.5-3x a solo run) - that is what main's spare CPU is for.
+  - round finalized (a few rounds later) -> `rank` line: rank among the real submissions, gap to the field's best.
+  - `replay` reviews at once (its truth is on disk); `python -m main review <run_id|tag>` reviews one run by hand.
 
 ## Live platform (`miner.UpstreamPlatform`)
 
@@ -36,16 +52,17 @@ Try `python -m main live --wallet W --hotkey H --demo` first.
 .venv/bin/python -m main live --wallet W --hotkey H [--demo]
 # either one with a fleet: main only proposes, sub-VPS nodes run GATK and score (see evaluator/README.md)
 .venv/bin/python -m main replay <tag> --fleet            # sub-VPSs from fleet.json (repo folder), controlled over ssh
+.venv/bin/python -m main review <run_id|tag>             # review one stored run now (answer-set accuracy, TRUE, rank)
 ```
 
 With `--fleet`, `mine_round` publishes each round (truth files, BAM location) to the nodes once the answer set
-exists; when main stops, every node agent stops. Replay cannot print the TRUE score then (the final VCF is on a
-node).
+exists; when main stops, every node agent stops. The review then re-runs the configs it scores on main (their
+VCFs are on the nodes).
 
 ## Open work
 
-- Test the live path (demo mode, then one real round with a known-good static config).
-- Round logs: local vs true score and rank per round, feeding backtests.
+- Test the live path (demo mode, then one real round with a known-good static config). The 5-minute review
+  watcher only runs inside `live`, so it has only been exercised through `replay` and `review` so far.
 - Submission timing: tune `resubmit_interval_s` / `stop_before_deadline_s` against the chain's commitment limit.
 
 ## Ideas (not planned)

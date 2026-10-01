@@ -103,8 +103,11 @@ def rf_ucb(ranges: ParamRanges, *, tool: str = "gatk", n_init: int = 16, in_flig
 
         def room() -> bool:
             """Propose more while workers are free (a family runs as one job), else keep `in_flight` configs
-            running when the executor cannot report free workers. Capped so the queue cannot grow unbounded."""
-            if len(pending) >= max_pending:
+            running when the executor cannot report free workers. Capped so the queue cannot grow unbounded: at
+            least `max_pending`, more on a big fleet - a family of `family + 1` configs fills one worker, so a fixed
+            cap would leave workers idle (256 configs ~ 108 GATK runs for 199 workers)."""
+            cap = max(max_pending, (family + 1) * (client.capacity() or 0))
+            if len(pending) >= cap:
                 return False
             idle = client.idle_slots()
             return (len(pending) < in_flight) if idle is None else (idle > 0 or not pending)

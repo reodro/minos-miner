@@ -56,6 +56,10 @@ class LocalExecutor:
         self._lock = threading.Lock()
         self._wake = threading.Event()             # set by submit(): an idle poll() waits on it instead of spinning
         self.batches_run = 0
+        self.repairs_run = 0
+        self.gatk_runs = 0                              # GATK runs actually started (solo, batch or repair)
+        self.gatk_runs_done = 0                         # ... and finished
+        self.done = 0                                   # callsets delivered (dashboard)
 
     # ---- running ---------------------------------------------------------------------------------------------
     def _branch(self, job: EvalJob) -> Optional[str]:
@@ -64,9 +68,11 @@ class LocalExecutor:
         return self.runner.branch_key(job.config, job.fidelity)
 
     def _run(self, jobs: List[EvalJob]) -> List[CallSet]:
+        self.gatk_runs += 1
         try:
             if len(jobs) == 1 and jobs[0].job_id in self._repair:
                 j = jobs[0]
+                self.repairs_run += 1
                 out = [self.runner.repair(j.round, j.config, self._repair.pop(j.job_id), j.fidelity)]
             elif len(jobs) == 1:
                 out = [self.runner.run(jobs[0].round, jobs[0].config, jobs[0].fidelity)]
@@ -74,6 +80,8 @@ class LocalExecutor:
                 out = self.runner.run_batch(jobs[0].round, [j.config for j in jobs], jobs[0].fidelity)
         except Exception as e:  # a crashed config is a result, not a crashed executor
             return [failed(j, str(e)) for j in jobs]
+        finally:
+            self.gatk_runs_done += 1
         return [replace(cs, job_id=j.job_id, fidelity=j.fidelity) for cs, j in zip(out, jobs)]
 
     def _drop_cancelled(self, job: EvalJob) -> None:
@@ -162,6 +170,7 @@ class LocalExecutor:
                     self._ready += [replace(cs, job_id=w.job_id) for w in self._waiters.pop(k, [])]
             self._fill()
             out, self._ready = self._ready, []
+            self.done += len(out)
             return out
 
     # ---- queries ---------------------------------------------------------------------------------------------
@@ -172,7 +181,8 @@ class LocalExecutor:
     def stats(self) -> dict:
         with self._lock:
             return {"kind": "local", "workers": self.workers, "running": len(self._running), "queued": len(self._queue),
-                    "batches_run": self.batches_run}
+                    "batches_run": self.batches_run, "repairs_run": self.repairs_run, "done": self.done,
+                    "gatk_runs": self.gatk_runs, "gatk_runs_done": self.gatk_runs_done}
 
     def end_round(self, round_id: str) -> None:
         """The round is over: drop its queued jobs, kill its running GATK containers, deliver nothing more for it.
@@ -222,6 +232,9 @@ class LocalExecutor:
                             c = min(c, v)
             out.append(c)
         return out
+
+    def capacity(self) -> int:
+        return self.workers
 
     def idle_slots(self) -> int:
         with self._lock:

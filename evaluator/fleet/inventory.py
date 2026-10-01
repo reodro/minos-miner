@@ -4,7 +4,7 @@ fleet.example.json) and how main reaches each sub-VPS over SSH.
     [{"host": "1.2.3.4", "user": "root", "port": 22, "key_filename": "~/.ssh/id_ed25519",
       "workers": null, "enabled": true}]
 
-- `workers`: null = the node's own rule, floor(cores x 0.95 - 1); a number overrides it.
+- `workers`: null = the node's own rule, floor(cores x 0.9 - 2); a number overrides it.
 - `port`: several machines may share one IP behind different ports (e.g. vast.ai).
 - optional `repo` / `data_dir`: where the code and data live on that host (default /minos/minos-miner, /minos/data).
 - `host: "local"`: run the node as a local subprocess instead of over SSH (tests, or this machine as a node).

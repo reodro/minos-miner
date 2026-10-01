@@ -83,10 +83,15 @@ class VariantFileTest(unittest.TestCase):
 
 
 class WorkersRuleTest(unittest.TestCase):
-    def test_floor_of_95_percent_minus_one(self):
+    def test_gatk_workers_floor_90_percent_minus_two(self):
         from common.settings import default_workers
         with mock.patch.dict(os.environ, {"MINOS_WORKERS": ""}):
-            self.assertEqual([default_workers(c) for c in (2, 8, 16, 32, 64, 128)], [1, 6, 14, 29, 59, 120])
+            self.assertEqual([default_workers(c) for c in (2, 8, 16, 32, 36, 180)], [1, 5, 12, 26, 30, 160])
+
+    def test_scorer_threads_ceil_10_percent(self):
+        from common.settings import default_score_threads
+        with mock.patch.dict(os.environ, {"MINOS_SCORE_THREADS": ""}):
+            self.assertEqual([default_score_threads(c) for c in (2, 16, 32, 36, 180)], [1, 2, 4, 4, 18])
 
 
 class VariantCostTest(unittest.TestCase):

@@ -1,10 +1,14 @@
 """python -m main replay <round_tag> [--minutes 15] [--strategy rf_ucb|random]
        python -m main live --wallet NAME --hotkey NAME [--demo]
+       python -m main review <run_id|round_tag>
 
 replay  the whole miner on a stored round, as if live: real answer set, real GATK (batched), real scoring, the
         chosen strategy, dry-run submissions, a deadline `--minutes` from now. Then reports what it would have
-        submitted, that config's TRUE score (released truth) and its rank among the real submissions.
-live    the real miner (needs bittensor, httpx and a registered wallet; untested - try --demo first).
+        submitted, and reviews the run (main.review): answer-set accuracy, TRUE scores, rank.
+live    the real miner (needs bittensor, httpx and a registered wallet; untested - try --demo first). Next to it
+        main.review checks every 5 min whether a mined round's truth is out / the round is finalized, and reviews
+        it then (answer-set accuracy, true scores, rank) - main's spare CPU is for this.
+review  review one stored run now (replay does this itself; live does it in the background).
 
 --fleet [INVENTORY] (both commands): main only proposes; GATK and scoring run on the sub-VPSs listed in the
         inventory (default: fleet.json in the repo folder), which main starts and controls over ssh.
@@ -88,9 +92,7 @@ def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: in
 
 
 def replay(tag: str, minutes: float, strategy: str, workers: int, fleet=None) -> None:
-    from answer_set import OracleProvider
-    from backtest.data import field_scores, load
-    from backtest.kpi import rank_in_field
+    from backtest.data import load
     from main.miner import mine_round
     from main.submitter import DryRunSubmitter
     rnd = load(tag, reference=reference_for(load(tag).chrom))
@@ -106,18 +108,30 @@ def replay(tag: str, minutes: float, strategy: str, workers: int, fleet=None) ->
     if out:
         print(f"evaluated {out.evaluated}, failed {out.failed}, submissions {len(out.submissions)}; "
               f"local best {out.best.score if out.best else None}")
-    final = sub.sent[-1][1]
-    if out is None:
-        print(f"static fallback submitted {final}: no search ran ({mined.note})"); return
-    cs = out.callsets.get(final)
-    if cs is None or not os.path.exists(cs.vcf):
-        print("final config's callset is not on this machine (fleet): rerun it locally to get its TRUE score"); return
-    true = parts.scorer.score(cs, OracleProvider().build(rnd)).score
-    field = field_scores(tag)
-    rank = rank_in_field(true, field)
-    print(f"final submission {final}: TRUE score {true:.4f} -> rank {rank} of {len(field) + 1} "
-          f"(field best {max(field) if field else None})")
-    _board().true_score(rnd.round_id, true, rank, len(field) + 1)
+    review_now(_board().state.get("round", {}).get("run_id"))
+
+
+def review_now(run_id: str) -> None:
+    """Review + rank one run at once (its truth must be on disk or released) and print the result."""
+    from main.review import Reviewer
+    rv = Reviewer(board=_board())
+    row = rv.review(run_id)
+    if row is None:
+        print(f"{run_id}: truth not released yet"); return
+    a, srch = row.get("answer_set") or {}, row["search"]
+    if a:
+        g, y, n = a["germline_exact"], a["synthetic"], a["n_targets"]
+        print(f"answer set vs truth: germline exact P {g['precision']} R {g['recall']} | synthetic P {y['precision']} "
+              f"R {y['recall']} | N ours {n['ours']} truth {n['truth']}")
+    for c in row["configs"]:
+        print(f"  {c['role']:8s} {c['config']}  local {c['local']}  TRUE {c['true']}")
+    print(f"final TRUE {srch.get('final_true')} | best true among them {srch.get('best_true')} "
+          f"(pick gap {srch.get('pick_gap')}) | spearman {srch.get('spearman')} | rerun here {row['rerun']}")
+    rank = rv.rank(run_id)
+    if rank:
+        print(f"rank {rank['rank']} of {rank['field']} (field best {rank['field_best']}, gap {rank['gap_to_best']})")
+    else:
+        print("rank: round not finalized yet")
 
 
 def main() -> None:
@@ -128,17 +142,24 @@ def main() -> None:
     a.add_argument("--workers", type=int, default=default_workers())
     b = sp.add_parser("live"); b.add_argument("--wallet", required=True); b.add_argument("--hotkey", required=True)
     b.add_argument("--demo", action="store_true"); b.add_argument("--workers", type=int, default=default_workers())
+    c = sp.add_parser("review"); c.add_argument("run", help="run id (<tag>-<epoch>) or round tag (its newest run)")
     for p in (a, b):
         p.add_argument("--fleet", nargs="?", const=str(_inventory_default()),
                        metavar="INVENTORY",
                        help="run GATK and scoring on the sub-VPSs in the inventory (over ssh) instead of here")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if args.cmd == "review":
+        from main.review import find_run
+        review_now(find_run(args.run)); return
+    _board().kind = args.cmd
     fleet = fleet_executor(args.fleet) if args.fleet else None
     try:
         if args.cmd == "replay":
             replay(args.tag, args.minutes, args.strategy, args.workers, fleet)
         else:
+            from main.review import Reviewer
+            Reviewer(board=_board()).start()                  # every 5 min: truth out? finalized? -> review / rank
             from main.miner import PlatformSubmitter, UpstreamPlatform, run_forever
             platform = UpstreamPlatform(args.wallet, args.hotkey, demo=args.demo)
             r = ranges()

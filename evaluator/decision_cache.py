@@ -157,7 +157,6 @@ class _RoundCache:
         self.truth_spans = [(r.pos, r.end) for r in read_records(truth, self.chrom, self.start, self.end)]
         self.lines: Dict[tuple, Tuple[str, ...]] = {}
         self.header: Optional[str] = None
-        self.lock = threading.Lock()
 
     def clusters(self, query: Sequence[Record]) -> List[Cluster]:
         return make_clusters(self.truth_spans, query, self.gap)
@@ -274,7 +273,8 @@ class DecisionCacheScorer:
     """Scorer returning exactly evaluator.gatk.HappyScorer's ScoreResult, running hap.py only for new clusters.
 
     One cache per (round_id, answer_set.version, truth file): a new answer-set version starts a new cache. Safe to
-    call from several threads; fills of one cache are serialized.
+    call from several threads, and hap.py fills run concurrently (no lock held while hap.py runs): a cluster's lines
+    depend only on the records inside it, so two threads filling the same cluster write identical lines.
     """
 
     def __init__(self, work_dir: Optional[str] = None, gap: int = GAP):
@@ -359,15 +359,13 @@ class DecisionCacheScorer:
                     header = "".join(l for l in f if l[0] == "#")
             for c in missing:
                 items[c.key] = (c, by_span[(c.start, c.end)])
+        items = {k: v for k, v in items.items() if k not in cache.lines}   # another thread may have filled some
         if items:
-            with cache.lock:
-                items = {k: v for k, v in items.items() if k not in cache.lines}
-                if items:
-                    try:
-                        runs = cache.fill_packed(items, header, workers)
-                        self._count(happy_runs=runs, packed_runs=runs)
-                    except RuntimeError:
-                        self._count(packed_failures=1)     # per-callset fills below isolate the bad callset
+            try:
+                runs = cache.fill_packed(items, header, workers)
+                self._count(happy_runs=runs, packed_runs=runs)
+            except RuntimeError:
+                self._count(packed_failures=1)             # per-callset fills below isolate the bad callset
         out = []
         for cs in callsets:
             out.append(self.score(cs, answer_set))
@@ -397,12 +395,10 @@ class DecisionCacheScorer:
     @staticmethod
     def _ensure_cached(cache: _RoundCache, vcf: str, clusters: List[Cluster]) -> Tuple[int, int]:
         """(clusters that were missing, hap.py runs) after making sure every cluster is cached."""
-        if all(c.key in cache.lines for c in clusters):
+        missing = [c for c in clusters if c.key not in cache.lines]
+        if not missing:
             return 0, 0
-        with cache.lock:
-            missing = [c for c in clusters if c.key not in cache.lines]   # another thread may have filled some
-            runs = cache.fill(vcf, missing) if missing else 0
-        return len(missing), runs
+        return len(missing), cache.fill(vcf, missing)     # no lock: concurrent fills of a cluster are identical
 
     @staticmethod
     def _metrics(happy_vcf: str, mutations: str) -> Optional[dict]:

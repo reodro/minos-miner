@@ -177,6 +177,11 @@ class EvalClient:
         f = getattr(self.executor, "idle_slots", None)
         return f() if f else None
 
+    def capacity(self) -> Optional[int]:
+        """Executor's total workers (all fleet nodes that are ready), or None if it cannot tell."""
+        f = getattr(self.executor, "capacity", None)
+        return f() if f else None
+
     def rescore(self, answer_set: AnswerSet) -> None:
         """New answer-set version: re-score every stored callset that is on this machine (~0.6 s each; callsets
         scored on fleet nodes stay there and keep their score), then notify strategies. Failures keep the old score."""

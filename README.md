@@ -40,7 +40,9 @@ round opens ─▶ main: download BAM, announce round
 - Strategies never know where jobs run; the executor never knows why a job was chosen.
 - Running and scoring are separate steps: if the answer set changes, callsets are re-scored, never re-run.
   On one machine scoring runs in a background thread; with a fleet (`--fleet`) main controls the sub-VPSs over SSH,
-  they run GATK **and** score, and main only proposes and submits (see evaluator/README.md).
+  they run GATK **and** score (in scorer processes), and main only proposes and submits (see evaluator/README.md).
+- After the round, `main.review` judges every part against the released truth (answer-set accuracy, true scores,
+  pick gap, rank); a public read-only dashboard on main shows the live round and the history (dashboard/README.md).
 - Related configs (a *family*: same config except cheap parameters) go to the executor together and run as **one**
   GATK job; each still gets its own exact result.
 
@@ -74,7 +76,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 docker pull broadinstitute/gatk:4.5.0.0                       # validator's GATK image
 docker pull quay.io/biocontainers/samtools:1.20--h50ea8bc_0   # parent-read slices
-# hap.py image: the digest pinned in minos_subnet/utils/scoring.py is pulled on first use
+docker pull "$(grep -oP 'HAPPY_DOCKER_IMAGE = "\K[^"]+' ../minos_subnet/utils/scoring.py)"      # hap.py, pinned digest
+docker pull "$(grep -oP 'BCFTOOLS_DOCKER_IMAGE = "\K[^"]+' ../minos_subnet/utils/scoring.py)"   # bcftools for scoring
 
 bash evaluator/gatk_patch/build.sh              # GATK batching patch -> evaluator/gatk_patch/build/minos-patch.jar
 bash scripts/fetch_genome.sh                    # GRCh38 chr1-22: FASTA, index, dict, SDF (validator's files)
@@ -88,13 +91,15 @@ Data never goes in git; it lives under `DATA_DIR` (default `/minos/data`). The G
 ## Everyday commands
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -t .              # unit tests (~20 s); RUN_SLOW=1 adds GATK tests
+.venv/bin/python -m unittest discover -s tests -t .              # unit tests (~30 s); RUN_SLOW=1 adds GATK tests
 .venv/bin/python -m main replay 20260928T092900Z --minutes 20     # whole miner on a stored round, dry-run
 .venv/bin/python -m main live --wallet W --hotkey H --demo        # live miner (untested; demo mode first)
 ```
 
-A password-protected dashboard (live round + history) runs on main: see [dashboard/README.md](dashboard/README.md).
+A public read-only dashboard (live round + history, https://<main's IP>:8443) runs on main: see [dashboard/README.md](dashboard/README.md).
 
-`replay` prints what the miner would have submitted, its **true** score and its rank among the real submissions.
-Reference points (round 092900Z, 20 min): one 16-core machine - 296 configs, true 87.22, rank 44/60; fleet of two
-16-core sub-VPSs - 587 configs, true 87.53, rank 36/60.
+`replay` prints what the miner would have submitted and reviews the run: answer-set accuracy, the **true** scores
+of the final, baseline and top configs, and the rank among the real submissions.
+Reference points (20-minute replays): round 092900Z - one 16-core machine 296 configs, true 87.22, rank 44/60;
+fleet of two 16-core sub-VPSs 587 configs, true 87.53, rank 36/60. Round 20261001T044100Z (GIAB HG007, chr18) -
+fleet of a 32-core and a 180-core sub-VPS: true 78.47, rank 52/68 (field best 79.77).
