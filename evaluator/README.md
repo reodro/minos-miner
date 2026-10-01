@@ -67,7 +67,7 @@ run would have taken different numbers at a deep spot if it made a different num
   ~55% of the newest; a diverging round typically has only 1-4 deep positions.
 
 Tests (all bit-identical to separate stock runs): genotyping 54/54, PairHMM 62/62, assembly 86/86, activity
-102/102, repair 48/48 complete VCF lines on the 3 worst rounds. Scripts: `test/tip_*branch.py`, `test/tip_repair.py`.
+102/102, repair 48/48 complete VCF lines on the 3 worst rounds.
 
 **Traps found the hard way:**
 - GATK's two generators (java `Random` for QD jitter / reservoir downsampling, `Well19937c` for contamination).
@@ -132,13 +132,13 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   (`docker save | ssh <node> docker load`, 66 MB).
 - Tested: `tests/test_fleet.py` runs the real node agent as subprocesses (fake GATK): scored results, families as
   one group, a killed node's jobs re-queued to the other, nodes with a failing self-test or other code rejected.
-  `test/fleet_local.py` (real GATK, 2 nodes from an inventory, no ssh hop): 8 configs incl. a family of 6, the node
+  Real GATK on 2 local nodes from an inventory (no ssh hop): 8 configs incl. a family of 6, the node
   holding all 8 jobs killed at 61 s - all re-queued, finished by the other node, **8/8 scores identical** to the
   single-machine path in 188 s, no agent or container left behind.
   **Real fleet** (2 x 16-core VPS, 28 workers, 2026-09-30): provisioned in ~4 min each, self-test identical on both;
   replay 092900Z, 20 min: **587 configs** (single machine: 296), both nodes 14/14 containers and 86-99% CPU, main
   ~2% CPU; final submission true score 87.53, rank 36/60 (single machine: 87.22, rank 44).
-  **Scorer processes vs upstream** (`test/scorer_exactness_check.py`): 20 stored callsets scored through spawned
+  **Scorer processes vs upstream**: 20 stored callsets scored through spawned
   scorer processes exactly as a node runs them, each compared with upstream's `HappyScorer`: 20/20 identical
   (13 full ScoreResults equal; 1 normal and 5 SNP-less callsets fail in both - hap.py produces no result; 1 SNP-less
   callset scores 0.0 in both, gate failed). A failed callset is reported as failed, never as 0.0.
@@ -159,8 +159,8 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   main's rsync push would cut provisioning from ~12 min to ~1-2 min.
 - **Scoring in the self-test**: the self-test checks GATK output only; a node that cannot score (missing image)
   passes it. Add one scored callset to it.
-- **Randomized exactness test** - written, not run: `test/tip_random_exactness.py` (random base configs, random
-  multi-parameter families, deep and non-deep rounds). All exactness tests so far used 3 base configs.
+- **Randomized exactness test** (not run yet): random base configs, random multi-parameter families, deep and
+  non-deep rounds. All exactness tests so far used 3 base configs.
 - **Family cost cap / splitting**: a batch's time is solo + sum of variant costs; split families that would run
   longer than ~4-5 min and spread them over idle workers.
 - **End-of-round scheduling**: in the last minutes, do not start a job whose expected runtime (solo ~132 s at load,

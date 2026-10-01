@@ -8,8 +8,8 @@ cached lines of its clusters into an annotated VCF and running the UNCHANGED ups
 difficulty_class_counts), in the same order and with the same fallbacks as upstream HappyScorer.score_vcf.
 hap.py runs only for clusters never seen before, on a query subset holding just those clusters' records.
 
-Verified (test/decision_cache.py prototype, test/dcache_validate.py): ScoreResults identical (Python ==) to
-evaluator.gatk.HappyScorer on 174 callsets x 3 rounds at gap 1000 and 300.
+Verified: ScoreResults identical (Python ==) to evaluator.gatk.HappyScorer on 174 callsets x 3 rounds at gap 1000
+and 300.
 
 Limitations:
   - Only FULL fidelity.

@@ -39,7 +39,7 @@ NA12878's 1000G calls instead, we would build the wrong germline for that donor 
 
 ## KPI
 
-`test/answer_set_kpi.py`: score the same callsets under our answer set and under the released truth.
+Score the same callsets under our answer set and under the released truth, then compare.
 
 | Round | Type | Spearman | Oracle gap (points) |
 |---|---|---|---|

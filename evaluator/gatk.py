@@ -1,6 +1,6 @@
 """The real runner and scorer. Owner: evaluator.
 
-Verified in test/ (2026-09-28; 3 rounds x 3 configs against the validator-identical baseline):
+Verified (2026-09-28; 3 rounds x 3 configs against the validator-identical baseline):
   used     - SAFE_ANNOTATION_EXCLUSIONS (-AX): bit-identical calls, x1.135.
            - batching (gatk_patch): variants differing only in genotyping params cost ~0.8 s extra each; in PairHMM
              params ~13 s per distinct PairHMM set (vs ~73 s full). 54/54 + 62/62 bit-identical to stock runs;
@@ -67,7 +67,7 @@ ACTIVITY_BRANCH_PARAMS = ("active_probability_threshold", "min_assembly_region_s
 ACTIVITY_DEFAULTS = {"active_probability_threshold": 0.002, "min_assembly_region_size": 50, "max_assembly_region_size": 300}
 BRANCH_PARAMS = GENOTYPING_BRANCH_PARAMS + PAIRHMM_BRANCH_PARAMS + ASSEMBLY_BRANCH_PARAMS + ACTIVITY_BRANCH_PARAMS
 # Extra cost of one batch variant, as a fraction of a solo run, by the most expensive stage it changes
-# (measured at production load by test/timing_tiers.py). A variant that differs in several tiers pays the highest.
+# (measured at production load). A variant that differs in several tiers pays the highest.
 VARIANT_COST = {"genotyping": 0.011, "pairhmm": 0.12, "assembly": 0.55, "activity": 0.59}   # 1.4 / 16.3 / 72 / 78 s of 132 s (14 workers, 16 cores)
 _TIER_OF = {**{p: "genotyping" for p in GENOTYPING_BRANCH_PARAMS}, **{p: "pairhmm" for p in PAIRHMM_BRANCH_PARAMS},
             **{p: "assembly" for p in ASSEMBLY_BRANCH_PARAMS}, **{p: "activity" for p in ACTIVITY_BRANCH_PARAMS}}

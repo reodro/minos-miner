@@ -11,7 +11,7 @@ Degraded paths: no donor -> Regime.UNKNOWN with no germline (main then submits a
 built); no parent reads -> every candidate goes into the truth unfiltered (real donor variants included: degraded,
 but scorable). build() may still raise on missing data; main falls back to the static baseline then.
 
-Status (2026-09-30), measured with test/answer_set_eval.py and test/answer_set_kpi.py:
+Status (2026-09-30), measured on released rounds:
   germline   exact: 1000G 36/36 rounds, GIAB 24/24 (donor ID 0.99+ vs runner-up <= 0.72)
   synthetic  1000G: SNP recall/precision ~0.998/0.997, indel ~0.99/0.985; GIAB HG005: SNP 0.995/0.985, indel 0.96/0.95
   KPI        same callsets scored under ours vs released truth: Spearman 0.98-0.998 and oracle gap 0 on 4 of 5
