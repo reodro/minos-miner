@@ -6,8 +6,10 @@ Turns configs into scores exactly like the validator does - as cheaply as possib
 EvalJob ──▶ Executor (where/when: local cores or the fleet) ──▶ Runner (GATK) ──▶ CallSet ──▶ Scorer (hap.py) ──▶ ScoreResult
 ```
 
-Public API (`evaluator/__init__.py`): `GatkRunner`, `HappyScorer`, `LocalExecutor`,
-`SimExecutor`, `FakeRunner`/`FakeScorer`, and the protocols in `base.py`.
+Public API (`evaluator/__init__.py`): the factories main uses - `local_executor(workers, batching)`, `scorer()`,
+`fleet_executor(inventory)`, `callset_dir(tag)` (`factory.py`: runner settings and the scorer choice live there, not in
+main) - and `GatkRunner`, `HappyScorer`, `LocalExecutor`, `SimExecutor`, `FakeRunner`/`FakeScorer`, the protocols in
+`base.py`.
 
 ## Status (2026-09-30)
 

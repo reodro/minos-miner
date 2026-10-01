@@ -27,6 +27,7 @@ from evaluator.fleet.inventory import REPO, Host, code_digest, ensure_agent, loa
 
 EXCLUDES = ["--exclude", ".git/", "--exclude", ".venv/", "--exclude", "test/", "--exclude", "__pycache__/",
             "--exclude", "/fleet.json",                     # the inventory (key passphrases) stays on main
+            "--exclude", "/cache/", "--exclude", "/status/",  # each machine's own (--delete would wipe them)
             "--exclude", "evaluator/gatk_patch/build/", "--exclude", "*.pyc"]
 
 
@@ -89,8 +90,8 @@ def provision(h: Host) -> dict:
 
 def sync(h: Host) -> dict:
     copy_repo(h)
-    b = selftest.make_bundle(SETTINGS.data_dir, SETTINGS.rounds_dir)
-    push(h, [b["bam"], b["bai"]], f"{h.data_dir}/selftest/")
+    b = selftest.make_bundle(SETTINGS.cache_dir, SETTINGS.rounds_dir)
+    push(h, [b["bam"], b["bai"]], f"{h.repo}/cache/selftest/")
     p = sh(h, f"cd {shlex.quote(h.repo)} && bash evaluator/gatk_patch/build.sh", timeout=1200)
     return {"host": h.name, "ok": p.returncode == 0, "tail": (p.stdout + p.stderr).strip()[-200:]}
 

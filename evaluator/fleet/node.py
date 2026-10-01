@@ -137,7 +137,9 @@ class Node:
                     drop(rid)
             for d in (os.path.dirname(rnd.bam), os.path.join(SETTINGS.cache_dir, "callsets", rnd.tag),
                       os.path.join(SETTINGS.cache_dir, "fleet", rnd.tag)):
-                if os.path.isdir(d) and os.path.abspath(d).startswith(os.path.abspath(SETTINGS.data_dir)):
+                safe = any(os.path.abspath(d).startswith(os.path.abspath(root) + os.sep)
+                           for root in (SETTINGS.data_dir, SETTINGS.cache_dir))     # never outside our own folders
+                if os.path.isdir(d) and safe:
                     shutil.rmtree(d, ignore_errors=True)
 
     def take_jobs(self, msg: dict) -> None:
@@ -239,7 +241,7 @@ def main() -> None:
         runner = GatkRunner(threads=1, memory_gb=4, patch_jar=DEFAULT_PATCH_JAR, container_prefix=prefix,
                             work_dir=os.path.join(SETTINGS.cache_dir, "callsets"))
         scorer_factory = lambda i: HappyScorer()  # noqa: E731
-        result = selftest.run(runner, SETTINGS.data_dir)
+        result = selftest.run(runner, SETTINGS.data_dir, SETTINGS.cache_dir)
     if a.selftest_only:
         print(json.dumps(result)); return
     node = Node(workers, runner, scorer_factory, a.score_threads,

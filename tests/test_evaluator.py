@@ -56,7 +56,7 @@ class GatkEndToEndTest(unittest.TestCase):
         from answer_set import OracleProvider
         from backtest.data import load
         from evaluator import HappyScorer
-        r = load("20260928T032900Z", reference=os.path.join(SETTINGS.data_dir, "reference/chr22/chr22.fa"))
+        r = load("20260928T032900Z", reference=SETTINGS.reference_fasta("chr22"))
         cs = GatkRunner(threads=4).run(r, ranges().defaults("gatk"))
         res = HappyScorer().score(cs, OracleProvider().build(r))
         self.assertAlmostEqual(res.score / 100, 0.7665917881, places=10)   # a published validator score

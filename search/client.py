@@ -13,6 +13,7 @@ import asyncio
 import itertools
 import logging
 import math
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -42,10 +43,13 @@ class Outcome:
 
 class EvalClient:
     def __init__(self, round: Round, executor: Executor, scorer: Scorer, ranges: ParamRanges, store: ResultStore,
-                 answer_set: AnswerSet, budget: Optional[int] = None):
+                 answer_set: AnswerSet, budget: Optional[int] = None, deadline_ts: Optional[float] = None,
+                 clock: Optional[Callable[[], float]] = None):
         self.round, self.executor, self.scorer, self.ranges, self.store = round, executor, scorer, ranges, store
         self.answer_set = answer_set
         self.budget = budget
+        self.deadline_ts = deadline_ts                              # when main stops the search (None: no deadline)
+        self.clock = clock or time.time                             # the round's clock (virtual in simulations)
         self.spent = 0.0                                            # full-evaluation units sent to the executor
         self._ids = itertools.count()
         self._pending: Dict[str, Tuple[asyncio.Future, Config, str]] = {}
@@ -56,6 +60,10 @@ class EvalClient:
         self.on_rescore: List[Callable[[], None]] = []
 
     # ---- strategy-facing API -------------------------------------------------------------------------------
+    def time_left(self) -> Optional[float]:
+        """Seconds until the deadline main stops at (None without a deadline)."""
+        return None if self.deadline_ts is None else self.deadline_ts - self.clock()
+
     @property
     def exhausted(self) -> bool:
         return self.budget is not None and self.spent >= self.budget

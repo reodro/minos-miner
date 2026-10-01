@@ -1,4 +1,4 @@
-"""python -m main replay <round_tag> [--minutes 15] [--strategy rf_ucb|random]
+"""python -m main replay <round_tag> [--minutes 15] [--strategy NAME]      (names: search.STRATEGY_NAMES)
        python -m main live --wallet NAME --hotkey NAME [--demo]
        python -m main review <run_id|round_tag>
 
@@ -24,6 +24,7 @@ from common.params import ParamRanges
 from common.settings import SETTINGS, default_workers
 from common.store import ResultStore
 from common.types import Round
+from search.lineup import STRATEGY_NAMES
 
 
 def ranges() -> ParamRanges:
@@ -36,27 +37,12 @@ def ranges() -> ParamRanges:
 
 
 def reference_for(chrom: str) -> str:
-    return os.path.join(SETTINGS.data_dir, "reference", chrom, f"{chrom}.fa")
-
-
-_FLEET = {}
+    return SETTINGS.reference_fasta(chrom)
 
 
 def _inventory_default():
     from evaluator.fleet.inventory import INVENTORY       # repo-folder fleet.json, or MINOS_FLEET_INVENTORY
     return INVENTORY
-
-
-def fleet_executor(inventory: str):
-    """One coordinator per process, started on first use: main only proposes; sub-VPS nodes run and score."""
-    if "ex" not in _FLEET:
-        from pathlib import Path
-        from evaluator.fleet.coordinator import FleetExecutor
-        from evaluator.gatk import DEFAULT_PATCH_JAR, GatkRunner
-        planner = GatkRunner(patch_jar=DEFAULT_PATCH_JAR)          # only groups and prices families; never runs
-        _FLEET["ex"] = FleetExecutor(planner, inventory=Path(inventory).expanduser()).start()
-        logging.info("fleet: nodes from %s", inventory)
-    return _FLEET["ex"]
 
 
 _BOARD = {}
@@ -71,22 +57,16 @@ def _board():
 
 
 def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: int, fleet=None):
+    """The pieces of one round, each from its own part's factory: main never builds another part's internals."""
+    import evaluator
+    import search
     from answer_set import Provider
-    from evaluator import GatkRunner, HappyScorer, LocalExecutor
-    from evaluator.gatk import DEFAULT_PATCH_JAR
     from main.loop import LoopSettings
     from main.miner import Parts
-    from search import random_stream, rf_ucb
-    if fleet is not None:
-        executor = fleet
-    else:
-        runner = GatkRunner(threads=1, memory_gb=4,
-                            patch_jar=DEFAULT_PATCH_JAR if os.path.exists(DEFAULT_PATCH_JAR) else None)
-        executor = LocalExecutor(runner, workers=workers)
-    strat = rf_ucb(r, in_flight=workers) if strategy == "rf_ucb" else random_stream(r, in_flight=workers)
+    executor = fleet if fleet is not None else evaluator.local_executor(workers)
     os.makedirs(os.path.join(SETTINGS.cache_dir, "results"), exist_ok=True)
     store = ResultStore(os.path.join(SETTINGS.cache_dir, "results", f"{rnd.tag}.sqlite"))
-    return Parts(Provider(), executor, HappyScorer(), [strat], submitter, r,
+    return Parts(Provider(), executor, evaluator.scorer(), search.strategies(strategy, r, workers), submitter, r,
                  [r.defaults("gatk")], LoopSettings(resubmit_interval_s=300.0, stop_before_deadline_s=60.0), store,
                  status=_board())
 
@@ -138,7 +118,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="python -m main")
     sp = ap.add_subparsers(dest="cmd", required=True)
     a = sp.add_parser("replay"); a.add_argument("tag"); a.add_argument("--minutes", type=float, default=15)
-    a.add_argument("--strategy", default="rf_ucb", choices=["rf_ucb", "random"])
+    a.add_argument("--strategy", default=STRATEGY_NAMES[0], choices=STRATEGY_NAMES)
     a.add_argument("--workers", type=int, default=default_workers())
     b = sp.add_parser("live"); b.add_argument("--wallet", required=True); b.add_argument("--hotkey", required=True)
     b.add_argument("--demo", action="store_true"); b.add_argument("--workers", type=int, default=default_workers())
@@ -153,7 +133,8 @@ def main() -> None:
         from main.review import find_run
         review_now(find_run(args.run)); return
     _board().kind = args.cmd
-    fleet = fleet_executor(args.fleet) if args.fleet else None
+    import evaluator
+    fleet = evaluator.fleet_executor(args.fleet) if args.fleet else None
     try:
         if args.cmd == "replay":
             replay(args.tag, args.minutes, args.strategy, args.workers, fleet)

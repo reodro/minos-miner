@@ -29,7 +29,9 @@ Four parts, three people. These rules keep us from breaking each other - and, ab
 | Part code | `common/`, `answer_set/`, `evaluator/`, `search/`, `main/`, `backtest/` | yes |
 | Unit tests (contracts, fast, no network/GATK unless `RUN_SLOW=1`) | `tests/` | yes |
 | Experiments, benchmarks, exactness tests, scratch output | `test/` | **no** (ignored) |
-| Data: BAMs, references, callsets, caches | `$DATA_DIR` (default `/minos/data`) | **no** |
+| Inputs: reference, 1000G, panel, GIAB, rounds | `$DATA_DIR` (default `/minos/data`), shareable between clones | **no** |
+| Caches: callsets, results, parent slices, truth slices | `cache/` in each clone (`$CACHE_DIR`) | **no** (ignored) |
+| Miner status: live round, history, review (the dashboard reads it) | `status/` in each clone (`$STATUS_DIR`) | **no** (ignored) |
 | Secrets (tokens, wallets, keys) | never committed (the fleet's SSH keys/passphrases: `fleet.json` in the repo folder on main, git-ignored) | **never** |
 
 ## 4. How the parts may depend on each other

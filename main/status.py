@@ -1,9 +1,9 @@
 """What the dashboard shows: main writes a live snapshot and a per-round history; the dashboard only reads them.
 
-    <data_dir>/status/live.json             the current round, rewritten every few seconds (atomic replace)
-    <data_dir>/status/rounds.jsonl          one "round" line per finished run (sections answer_set / evaluator /
+    <status_dir>/live.json                  the current round, rewritten every few seconds (atomic replace)
+    <status_dir>/rounds.jsonl               one "round" line per finished run (sections answer_set / evaluator /
                                             search), later "review" and "rank" lines from main.review
-    <data_dir>/status/runs/<run_id>/        what main.review needs once the truth is released:
+    <status_dir>/runs/<run_id>/             what main.review needs once the truth is released:
         manifest.json                       final + baseline config, every config's params and local score
         answer_set.json.gz                  our answer set as used at the end of the run
 
@@ -30,7 +30,7 @@ from common.types import CLASSES
 TRANSITIONS = {("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")}
 
 log = logging.getLogger(__name__)
-STATUS_DIR = Path(SETTINGS.data_dir) / "status"
+STATUS_DIR = Path(SETTINGS.status_dir)
 
 
 class _Recent(logging.Handler):

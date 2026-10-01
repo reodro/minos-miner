@@ -22,10 +22,10 @@ def bundle_name() -> str:
     return f"{s['tag']}_{s['slice'].replace(':', '_').replace('-', '_')}.bam"
 
 
-def make_bundle(data_dir: str, rounds_dir: str) -> Dict[str, str]:
-    """On main: the slice BAM (+ index) under data_dir/selftest, cut from the stored round if not there yet."""
+def make_bundle(cache_dir: str, rounds_dir: str) -> Dict[str, str]:
+    """On main: the slice BAM (+ index) under cache_dir/selftest - rebuildable, cut from the stored round when missing."""
     s = spec()
-    d = Path(data_dir) / "selftest"
+    d = Path(cache_dir) / "selftest"
     d.mkdir(parents=True, exist_ok=True)
     bam = d / bundle_name()
     if not (bam.exists() and Path(str(bam) + ".bai").exists()):
@@ -43,12 +43,13 @@ def make_bundle(data_dir: str, rounds_dir: str) -> Dict[str, str]:
     return {"bam": str(bam), "bai": str(bam) + ".bai"}
 
 
-def run(runner, data_dir: str) -> dict:
-    """On a node: run the bundle, compare digests. {"ok", "digest", "expected"}."""
+def run(runner, data_dir: str, cache_dir: str) -> dict:
+    """On a node: run the bundle (from cache_dir/selftest, pushed by main) on the reference in data_dir, compare
+    digests. {"ok", "digest", "expected"}."""
     from common.types import FULL, Config, Round
     from evaluator.gatk import records_digest
     s = spec()
-    bam = Path(data_dir) / "selftest" / bundle_name()
+    bam = Path(cache_dir) / "selftest" / bundle_name()
     if not bam.exists():
         return {"ok": False, "digest": "no bundle (run: python -m evaluator.fleet.control sync)", "expected": s["expected_sha256"]}
     chrom, span = s["slice"].split(":")

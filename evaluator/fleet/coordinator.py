@@ -163,8 +163,8 @@ class FleetExecutor:
 
     def _connect(self, s: _Session) -> None:
         h = s.host
-        bundle = selftest.make_bundle(SETTINGS.data_dir, SETTINGS.rounds_dir)
-        push(h, [bundle["bam"], bundle["bai"]], f"{h.data_dir}/selftest/")
+        bundle = selftest.make_bundle(SETTINGS.cache_dir, SETTINGS.rounds_dir)
+        push(h, [bundle["bam"], bundle["bai"]], f"{h.repo}/cache/selftest/")
         args = h.extra.get("node_args", "") + (f" --workers {int(h.workers)}" if h.workers else "")
         env = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {"DATA_DIR": h.data_dir, **h.extra.get("env", {})}.items())
         repo = shlex.quote(h.repo)
@@ -499,7 +499,7 @@ def push(h: Host, files: List[str], dest_dir: str) -> None:
 
 def round_message(h: Host, r: Round, a: AnswerSet, bam_url: Optional[str], bai_url: Optional[str]) -> dict:
     """Push this round's files to the host and describe the round with the host's own paths."""
-    rdir, adir = f"{h.data_dir}/rounds/{r.tag}", f"{h.data_dir}/cache/fleet/{r.tag}/v{a.version}"
+    rdir, adir = f"{h.data_dir}/rounds/{r.tag}", f"{h.repo}/cache/fleet/{r.tag}/v{a.version}"   # the node's own cache
     truth = [a.notes["truth_vcf"], a.notes["mutations_vcf"]]
     push(h, truth + [f + ".tbi" for f in truth if Path(f + ".tbi").exists()], adir + "/")
     if not (bam_url and bai_url):                              # replay: main's own copy of the BAM

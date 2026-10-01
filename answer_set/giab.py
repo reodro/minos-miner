@@ -41,7 +41,7 @@ def _sh(cmd: str) -> str:
 
 
 def _query(donor: str, round: Round) -> List[Tuple[int, str, str, str]]:
-    txt = _sh(f"bcftools query -r {round.region} -f '%POS\\t%REF\\t%ALT[\\t%GT]\\n' {SETTINGS.data_dir}/giab/{donor}.vcf.gz")
+    txt = _sh(f"bcftools query -r {round.region} -f '%POS\\t%REF\\t%ALT[\\t%GT]\\n' {SETTINGS.giab_dir}/{donor}.vcf.gz")
     return [tuple(line.split("\t")) for line in txt.splitlines()]
 
 
@@ -52,7 +52,7 @@ def nist_germline(round: Round, donor: str) -> List[Variant]:
 
 def _confident(donor: str, round: Round) -> Tuple[List[int], List[int]]:
     starts, ends = [], []
-    with open(f"{SETTINGS.data_dir}/giab/{donor}.bed") as f:
+    with open(f"{SETTINGS.giab_dir}/{donor}.bed") as f:
         for line in f:
             c, a, b = line.split("\t")[:3]
             if c == round.chrom and int(b) >= round.start and int(a) <= round.end:

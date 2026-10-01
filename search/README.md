@@ -4,9 +4,14 @@ Decides which configs to evaluate. A strategy is an `async` function `strategy(c
 through `EvalClient` (the evaluator evaluates them) and reads their scores; several run at once. Only main
 **submits**, to the platform - strategies never do.
 
-Public API: `EvalClient`, `Outcome`, `Strategy`, `RandomSampler`, `random_stream`, `rf_ucb`.
+Public API: `strategies`, `STRATEGY_NAMES`, `EvalClient`, `Outcome`, `Strategy`, `RandomSampler`, `random_stream`,
+`rf_ucb`.
 
 ## The contract with main and the evaluator
+
+Main asks `search.strategies(name, ranges, workers)` for the round's lineup (`search/lineup.py`; names in
+`STRATEGY_NAMES`, the first is the default) and runs them with one shared `EvalClient`. Adding, retuning or combining
+strategies is a change in `lineup.py` only - never in main.
 
 ```python
 fut = client.propose(config)                         # one config; await fut -> Outcome(config, result, error)
@@ -16,6 +21,7 @@ client.latest[(key, FULL)]                           # every scored result, from
 client.variant_cost(main, variant)                   # extra cost of `variant` in `main`'s batch (0..1 of a full run)
 client.idle_slots()                                  # free workers right now
 client.exhausted                                     # budget used up (full-run units; batch riders are cheap)
+client.time_left()                                   # seconds until main stops the search (None: no deadline)
 ```
 
 Failed configs come back as `Outcome(ok=False)`; they never raise.

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import json
-import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,8 +13,10 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/minos/data"))
-STATUS = DATA_DIR / "status"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common.settings import SETTINGS  # noqa: E402 - the repo root is on the path only after the line above
+
+STATUS = Path(SETTINGS.status_dir)                  # the same folder main/status.py writes (STATUS_DIR overrides)
 
 st.set_page_config(page_title="Minos miner", page_icon="🧬", layout="wide")
 

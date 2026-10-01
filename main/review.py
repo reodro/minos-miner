@@ -1,7 +1,7 @@
 """Post-round review: once a round's truth is released, judge every part of what main did in it. Owner: main.
 
 Runs next to the live miner (a background thread on main, which is otherwise idle: the fleet does the evaluating)
-and every `poll_s` (5 min) looks at the recent runs in <data_dir>/status/rounds.jsonl:
+and every `poll_s` (5 min) looks at the recent runs in <status_dir>/rounds.jsonl:
 
     truth released?  -> "review" line: answer-set accuracy (ours vs the released truth), and the TRUE score of
                         the final config, the baseline and the top-k configs by local score (their VCFs are reused
@@ -31,7 +31,7 @@ from common.types import FULL, CallSet, Config, EvalJob, Round, Variant
 
 log = logging.getLogger(__name__)
 
-STATUS_DIR = Path(SETTINGS.data_dir) / "status"
+STATUS_DIR = Path(SETTINGS.status_dir)
 GIVE_UP_REVIEW_S = 24 * 3600            # truth should be out one round (72 min) after the deadline
 GIVE_UP_RANK_S = 72 * 3600              # finalization takes a few rounds
 
@@ -260,9 +260,9 @@ class Reviewer:
 
     def _true_scores(self, rnd: Round, oracle, keys: List[str], configs: Dict[str, dict], m: dict):
         """True score per config: its VCF from this machine if there, else GATK runs it here (exact)."""
-        from evaluator import HappyScorer
+        import evaluator
         callsets, missing = {}, []
-        work = Path(SETTINGS.cache_dir) / "callsets" / rnd.tag              # where GatkRunner writes them
+        work = evaluator.callset_dir(rnd.tag)
         for k in keys:
             vcf = work / f"{k}_{FULL}.vcf.gz"
             if vcf.exists():
@@ -271,7 +271,7 @@ class Reviewer:
                 missing.append(k)
         if missing:
             callsets.update(self._run(rnd, {k: Config.from_dict(configs[k]["config"]) for k in missing}))
-        self._scorer = self._scorer or HappyScorer()
+        self._scorer = self._scorer or evaluator.scorer()
         true, gate = {}, {}
         for k, cs in callsets.items():
             try:
@@ -282,14 +282,11 @@ class Reviewer:
         return true, gate, len(missing)
 
     def _run(self, rnd: Round, configs: Dict[str, Config]) -> Dict[str, CallSet]:
-        from evaluator import GatkRunner, LocalExecutor
-        from evaluator.gatk import DEFAULT_PATCH_JAR
+        import evaluator
         # solo and in parallel: one config per worker, no batching. A batch runs its variants one after another in
         # one JVM thread (~2.5-3x a solo run for assembly-level variants), which made a 9-config review take ~10 min.
         workers = min(self.workers or len(configs), len(configs), default_workers())
-        runner = GatkRunner(threads=1, memory_gb=4,
-                            patch_jar=DEFAULT_PATCH_JAR if os.path.exists(DEFAULT_PATCH_JAR) else None)
-        executor = LocalExecutor(runner, workers=workers, max_batch=1)
+        executor = evaluator.local_executor(workers, batching=False)
         log.info("review %s: running %d configs here, solo on %d workers (their VCFs are not on this machine)",
                  rnd.tag, len(configs), workers)
         jobs = {f"review-{rnd.tag}-{i}": k for i, k in enumerate(configs)}
@@ -308,7 +305,7 @@ class Reviewer:
 
 def _reference(m: dict) -> str:
     chrom = Round.parse_region(m["region"])[0]
-    return os.path.join(SETTINGS.data_dir, "reference", chrom, f"{chrom}.fa")
+    return SETTINGS.reference_fasta(chrom)
 
 
 def _sha(path: Path) -> str:

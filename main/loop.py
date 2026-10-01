@@ -51,7 +51,8 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
     virtual = hasattr(executor, "now")
     clock = clock or ((lambda: executor.now) if virtual else time.time)
     client = EvalClient(round, executor, scorer, ranges, store or ResultStore(), provider.build(round),
-                        budget=settings.max_evals)
+                        budget=settings.max_evals, clock=clock,
+                        deadline_ts=None if deadline_ts is None else deadline_ts - settings.stop_before_deadline_s)
     out = RoundOutcome(client.answer_set.version)
     submitted: List[Optional[str]] = [None]
     last_submit = [float("-inf")]

@@ -3,6 +3,9 @@
 The miner process: watch for a round, fetch it, build the answer set, run the search, keep the best config
 submitted. Wires the other parts together through their public APIs.
 
+Main builds nothing of another part: it asks `search.strategies(...)`, `evaluator.local_executor(...)` /
+`evaluator.fleet_executor(...)` / `evaluator.scorer()` and `answer_set.Provider()` for the pieces of a round (`make_parts`).
+
 Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatform`, `PlatformSubmitter`,
 `DryRunSubmitter`, `run_round`/`run_round_async`, `LoopSettings`.
 
@@ -23,8 +26,8 @@ Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatfor
 
 ## Status and post-round review (`main.status`, `main.review`)
 
-- **Status** (`StatusBoard`): every few seconds `<data_dir>/status/live.json`; at round end one `round` line in
-  `status/rounds.jsonl` with three sections (`answer_set`, `evaluator`, `search`), and `status/runs/<run_id>/`
+- **Status** (`StatusBoard`): every few seconds `<status_dir>/live.json`; at round end one `round` line in
+  `<status_dir>/rounds.jsonl` with three sections (`answer_set`, `evaluator`, `search`), and `<status_dir>/runs/<run_id>/`
   (`manifest.json`: final + baseline config, every config's params and local score; `answer_set.json.gz`).
   A run is one mining of one round: `<tag>-<start epoch>` (replays repeat tags). The dashboard reads all of this.
 - **Review** (`Reviewer`): next to `live`, a background thread checks every 5 min:
@@ -50,7 +53,7 @@ Try `python -m main live --wallet W --hotkey H --demo` first.
 ## Commands
 
 ```bash
-.venv/bin/python -m main replay <round_tag> --minutes 20 [--strategy rf_ucb|random]
+.venv/bin/python -m main replay <round_tag> --minutes 20 [--strategy NAME]   # names: search.STRATEGY_NAMES
 .venv/bin/python -m main live --wallet W --hotkey H [--demo]
 # either one with a fleet: main only proposes, sub-VPS nodes run GATK and score (see evaluator/README.md)
 .venv/bin/python -m main replay <tag> --fleet            # sub-VPSs from fleet.json (repo folder), controlled over ssh

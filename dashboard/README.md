@@ -15,7 +15,8 @@ Read-only web page showing what the miner is doing:
   (no domain needed). A self-signed certificate is not enough: browsers then fail to load Streamlit's lazy JS chunks
   ("Failed to fetch dynamically imported module").
 - **Access**: public, no password (read-only; node names anonymized).
-- **Data**: main writes `<DATA_DIR>/status/live.json` and `rounds.jsonl` (`main/status.py`, `main/review.py`); the
+- **Data**: main writes `status/live.json` and `status/rounds.jsonl` in its clone (`STATUS_DIR`; `main/status.py`,
+  `main/review.py`); the
   dashboard only reads them, so it can never slow down or break mining. Node names are anonymized (public page).
 - **When the TRUE columns fill in**: once `main.review` has reviewed the run - about one round after it for the
   review, a few rounds for the rank; a replay is reviewed right after mining.

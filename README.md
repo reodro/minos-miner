@@ -86,8 +86,21 @@ bash scripts/fetch_reference_data.sh            # 1000G raw callset + panel + CR
 .venv/bin/python -m backtest.data --last 20     # released rounds (BAM + truth) for backtests
 ```
 
-Data never goes in git; it lives under `DATA_DIR` (default `/minos/data`). The GIAB NIST VCFs + BEDs
-(`$DATA_DIR/giab/`) are not scripted yet. Fleet nodes need much less: `scripts/setup_node.sh` sets one up.
+Data never goes in git, and lives in three places (`common/settings.py`):
+- `DATA_DIR` (default `/minos/data`): **inputs** - reference, 1000G, panel, GIAB, rounds, truths (released truths of
+  rounds without a stored BAM). Shareable between clones.
+- `cache/` in each clone: **rebuildable caches** (callsets, results, parent slices, truth slices).
+- `status/` in each clone: what this clone's miner writes for the dashboard and the review.
+
+Git-ignored folders in each clone (never committed, never synced to fleet nodes - every clone keeps its own):
+
+| Folder | What | Safe to delete? |
+|---|---|---|
+| `cache/` | rebuildable caches (callsets, results, parent slices, truth slices, the fleet self-test's BAM slice) | yes - rebuilt on the next run |
+| `status/` | this clone's miner output: live round, history, review (the dashboard reads it) | no - it is the run history; back it up |
+| `test/` | your experiments, benchmarks, exactness checks and their output | your call - nothing in the miner uses it |
+
+The GIAB NIST VCFs + BEDs (`$DATA_DIR/giab/`) are not scripted yet. Fleet nodes need much less: `scripts/setup_node.sh` sets one up.
 
 ## Everyday commands
 
