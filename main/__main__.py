@@ -60,13 +60,13 @@ def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: in
     """The pieces of one round, each from its own part's factory: main never builds another part's internals."""
     import evaluator
     import search
-    from answer_set import Provider
+    import answer_set
     from main.loop import LoopSettings
     from main.miner import Parts
     executor = fleet if fleet is not None else evaluator.local_executor(workers)
     os.makedirs(os.path.join(SETTINGS.cache_dir, "results"), exist_ok=True)
     store = ResultStore(os.path.join(SETTINGS.cache_dir, "results", f"{rnd.tag}.sqlite"))
-    return Parts(Provider(), executor, evaluator.scorer(), search.strategies(strategy, r, workers), submitter, r,
+    return Parts(answer_set.builder(), executor, evaluator.scorer(), search.strategies(strategy, r, workers), submitter, r,
                  [r.defaults("gatk")], LoopSettings(resubmit_interval_s=300.0, stop_before_deadline_s=60.0), store,
                  status=_board())
 

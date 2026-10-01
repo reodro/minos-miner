@@ -4,7 +4,7 @@ The miner process: watch for a round, fetch it, build the answer set, run the se
 submitted. Wires the other parts together through their public APIs.
 
 Main builds nothing of another part: it asks `search.strategies(...)`, `evaluator.local_executor(...)` /
-`evaluator.fleet_executor(...)` / `evaluator.scorer()` and `answer_set.Provider()` for the pieces of a round (`make_parts`).
+`evaluator.fleet_executor(...)` / `evaluator.scorer()` and `answer_set.builder()` for the pieces of a round (`make_parts`).
 
 Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatform`, `PlatformSubmitter`,
 `DryRunSubmitter`, `run_round`/`run_round_async`, `LoopSettings`.

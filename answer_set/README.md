@@ -2,7 +2,7 @@
 
 Rebuilds the round's truth at round start, so configs can be scored without the validator.
 
-Public API: `Provider` (the real builder), `OracleProvider` (released truth - backtests and upper bound),
+Public API: `builder(name)` / `BUILDER_NAMES` (which builder main runs - `builders.py`), `Provider` (the real builder), `OracleProvider` (released truth - backtests and upper bound),
 `AnswerSetProvider` (protocol: `build(round)` once, `update(answer_set, callsets)` during the round).
 
 ## What the truth is
