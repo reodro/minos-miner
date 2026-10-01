@@ -30,7 +30,7 @@ Four parts, three people. These rules keep us from breaking each other - and, ab
 | Unit tests (contracts, fast, no network/GATK unless `RUN_SLOW=1`) | `tests/` | yes |
 | Experiments, benchmarks, exactness tests, scratch output | `test/` | **no** (ignored) |
 | Data: BAMs, references, callsets, caches | `$DATA_DIR` (default `/minos/data`) | **no** |
-| Secrets (tokens, wallets, keys) | never in the repo (the fleet's SSH keys/passphrases: `~/.minos/fleet.json` on main) | **never** |
+| Secrets (tokens, wallets, keys) | never committed (the fleet's SSH keys/passphrases: `fleet.json` in the repo folder on main, git-ignored) | **never** |
 
 ## 4. How the parts may depend on each other
 

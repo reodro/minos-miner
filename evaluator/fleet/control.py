@@ -1,4 +1,4 @@
-"""Control every sub-VPS from main, over SSH, using the inventory (~/.minos/fleet.json).
+"""Control every sub-VPS from main, over SSH, using the inventory (fleet.json in the repo folder).
 
     python -m evaluator.fleet.control status              reachable? cores, workers, docker, patch jar, genomes, code, disk
     python -m evaluator.fleet.control provision [HOST..]  copy the repo + main's genomes, run scripts/setup_node.sh
@@ -26,6 +26,7 @@ from evaluator.fleet.coordinator import push
 from evaluator.fleet.inventory import REPO, Host, code_digest, ensure_agent, load
 
 EXCLUDES = ["--exclude", ".git/", "--exclude", ".venv/", "--exclude", "test/", "--exclude", "__pycache__/",
+            "--exclude", "/fleet.json",                     # the inventory (key passphrases) stays on main
             "--exclude", "evaluator/gatk_patch/build/", "--exclude", "*.pyc"]
 
 

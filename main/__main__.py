@@ -7,7 +7,7 @@ replay  the whole miner on a stored round, as if live: real answer set, real GAT
 live    the real miner (needs bittensor, httpx and a registered wallet; untested - try --demo first).
 
 --fleet [INVENTORY] (both commands): main only proposes; GATK and scoring run on the sub-VPSs listed in the
-        inventory (default ~/.minos/fleet.json), which main starts and controls over ssh.
+        inventory (default: fleet.json in the repo folder), which main starts and controls over ssh.
 """
 from __future__ import annotations
 
@@ -36,6 +36,11 @@ def reference_for(chrom: str) -> str:
 
 
 _FLEET = {}
+
+
+def _inventory_default():
+    from evaluator.fleet.inventory import INVENTORY       # repo-folder fleet.json, or MINOS_FLEET_INVENTORY
+    return INVENTORY
 
 
 def fleet_executor(inventory: str):
@@ -110,7 +115,7 @@ def main() -> None:
     b = sp.add_parser("live"); b.add_argument("--wallet", required=True); b.add_argument("--hotkey", required=True)
     b.add_argument("--demo", action="store_true"); b.add_argument("--workers", type=int, default=default_workers())
     for p in (a, b):
-        p.add_argument("--fleet", nargs="?", const=os.environ.get("MINOS_FLEET_INVENTORY", "~/.minos/fleet.json"),
+        p.add_argument("--fleet", nargs="?", const=str(_inventory_default()),
                        metavar="INVENTORY",
                        help="run GATK and scoring on the sub-VPSs in the inventory (over ssh) instead of here")
     args = ap.parse_args()

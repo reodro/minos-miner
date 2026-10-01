@@ -83,7 +83,7 @@ Main controls every sub-VPS over SSH; the sub-VPSs run GATK **and** score; main 
 configs and submits.
 
 ```
-~/.minos/fleet.json on main (the inventory; re-read at every round start):
+fleet.json in the repo folder on main (git-ignored; format in fleet.example.json; re-read at every round start):
   [{"host": "1.2.3.4", "user": "root", "port": 22, "key_filename": "~/.ssh/id_ed25519",
     "key_passphrase": "...", "workers": null, "enabled": true},
    {"host": "5.6.7.8"}]                                # inherits user, key and passphrase

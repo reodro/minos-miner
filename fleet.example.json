@@ -1,0 +1,20 @@
+[
+  {
+    "host": "95.133.254.101",
+    "user": "root",
+    "port": 22,
+    "key_filename": "~/.ssh/id_ed25519",
+    "key_passphrase": "YOUR_KEY_PASSPHRASE",
+    "workers": null,
+    "enabled": true
+  },
+  {
+    "host": "95.133.254.131",
+    "user": "root",
+    "port": 22,
+    "key_filename": "~/.ssh/id_ed25519",
+    "key_passphrase": "YOUR_KEY_PASSPHRASE",
+    "workers": null,
+    "enabled": true
+  }
+]

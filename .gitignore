@@ -13,3 +13,4 @@ data/
 test/
 evaluator/gatk_patch/build/
 .venv/
+fleet.json

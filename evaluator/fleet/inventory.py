@@ -1,4 +1,5 @@
-"""The fleet inventory (~/.minos/fleet.json on main) and how main reaches each sub-VPS over SSH.
+"""The fleet inventory (fleet.json in the repo folder on main - git-ignored, it holds key passphrases; the format is in
+fleet.example.json) and how main reaches each sub-VPS over SSH.
 
     [{"host": "1.2.3.4", "user": "root", "port": 22, "key_filename": "~/.ssh/id_ed25519",
       "workers": null, "enabled": true}]
@@ -26,9 +27,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-INVENTORY = Path(os.environ.get("MINOS_FLEET_INVENTORY", str(Path.home() / ".minos" / "fleet.json")))
-CONTROL_DIR = Path.home() / ".minos" / "ssh"                 # ssh ControlMaster sockets (one connection per host)
 REPO = Path(__file__).resolve().parents[2]
+INVENTORY = Path(os.environ.get("MINOS_FLEET_INVENTORY", str(REPO / "fleet.json")))
+CONTROL_DIR = Path.home() / ".minos" / "ssh"                 # ssh ControlMaster sockets (one connection per host)
 CODE_DIRS = ("common", "answer_set", "evaluator", "search", "main", "backtest", "scripts")
 CODE_SUFFIXES = (".py", ".java", ".json", ".sh")
 

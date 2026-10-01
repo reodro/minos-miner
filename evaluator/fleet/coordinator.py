@@ -1,7 +1,7 @@
 """FleetExecutor: the Executor on main when GATK and scoring run on sub-VPSs, controlled over SSH.
 
 Same protocol as LocalExecutor (submit / poll / cancel / cost_hint(s) / idle_slots), so search and main do not
-change. For every enabled host in the inventory (~/.minos/fleet.json) main keeps one SSH session that runs the node
+change. For every enabled host in the inventory (fleet.json, repo folder) main keeps one SSH session that runs the node
 agent (evaluator/fleet/node.py --stdio); jobs go down and scored callsets come back as JSON lines on that session.
 
 - joining: main pushes the self-test bundle, starts the agent, and accepts the node only if its self-test passed and
