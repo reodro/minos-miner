@@ -13,3 +13,8 @@ submissions, warnings) and the history of finished rounds (with true score and r
 - **Install** (main only, not the fleet nodes): `.venv/bin/pip install -r dashboard/requirements.txt`;
   certificate: `openssl req -x509 -newkey rsa:2048 -nodes -days 825 -subj "/CN=<IP>"
   -addext "subjectAltName=IP:<IP>" -keyout .certs/key.pem -out .certs/cert.pem` (inside `dashboard/`).
+
+## http → https redirect
+
+`dashboard/redirect.py` (systemd service `minos-dashboard-redirect`) answers on port 80 and redirects to `https://`,
+so typing the bare address works. It is plain python3, no extra packages.

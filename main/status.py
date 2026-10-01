@@ -100,6 +100,11 @@ class StatusBoard:
         r = self.state.get("round", {})
         out = mined.outcome
         r["mode"] = f"finished ({mined.mode})"
+        if out:                                  # final numbers, not the last throttled tick
+            self.state.setdefault("search", {}).update(
+                evaluated=out.evaluated, failed=out.failed, in_flight=0,
+                best=out.best.score if out.best else None)
+            self.state["submissions"] = [[t, key, score] for t, key, score in out.submissions]
         row = {"type": "round", "round_id": mined.round_id, "tag": r.get("tag"), "region": r.get("region"),
                "mode": mined.mode, "note": mined.note, "started": r.get("started_ts"), "ended": time.time(),
                "evaluated": out.evaluated if out else 0, "failed": out.failed if out else 0,
