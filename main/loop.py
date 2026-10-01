@@ -94,12 +94,16 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         return deadline_ts is None or clock() < deadline_ts - settings.stop_before_deadline_s
 
     async def search():
-        # Baselines first, in order: the first one that runs is submitted, so the round never ends empty.
-        for c in baselines:
-            await client.propose(c, priority=10, tag="baseline")
-            if submitted[0] is not None:
-                break
-        await asyncio.gather(*(s(client) for s in strategies))
+        # Baselines (highest priority, so they run first) and the strategies start together: the fleet fills at once
+        # instead of idling while the baseline runs. Baselines are tried in order until one has been submitted (or a
+        # better config has), so the round never ends empty.
+        async def baselines_in_order():
+            for c in baselines:
+                await client.propose(c, priority=10, tag="baseline")
+                if submitted[0] is not None:
+                    break
+
+        await asyncio.gather(baselines_in_order(), *(s(client) for s in strategies))
 
     task = asyncio.create_task(search())
     # Live executors: scoring (one hap.py run per callset, seconds each) runs in a worker thread, so the loop keeps

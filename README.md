@@ -34,7 +34,8 @@ round opens ─▶ main: download BAM, announce round
          └──────────── Outcome (score) ◀── Scorer (hap.py, background thread) ◀── CallSet
                  │
                  ▼
-  main: baseline first, then keeps the best config submitted (at most every 5 min, forced once before the deadline)
+  main: baseline + search start together; the best config is kept submitted (at most every 5 min, forced once
+  before the deadline)
 ```
 
 - Strategies never know where jobs run; the executor never knows why a job was chosen.

@@ -10,8 +10,9 @@ Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatfor
 
 1. **Answer set** (`provider.build`). If it fails, or no donor is identified -> submit the first valid **baseline**
    and stop (searching without a truth is noise). A round never ends without a valid submission.
-2. **Search** (`loop.run_round_async`): baselines are evaluated first and the first one that runs is submitted;
-   then all strategies run concurrently until `deadline - stop_before_deadline_s`.
+2. **Search** (`loop.run_round_async`): the baselines (highest priority, so they run first) and all strategies start
+   together, so every worker is busy from the first minute; baselines are tried in order until one is submitted (or a
+   better config is), so a round never ends empty. Strategies run until `deadline - stop_before_deadline_s`.
 3. **Submissions**: a better config is resubmitted at most every `resubmit_interval_s` (300 s live - on-chain
    commitments are rate-limited); the best config found is submitted once more just before the loop stops.
 4. Scoring (one upstream hap.py run per config) runs in a background thread, so GATK workers stay fed while
