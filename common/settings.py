@@ -50,13 +50,13 @@ class Settings:
 
 
 def default_workers(cores: int = 0) -> int:
-    """GATK workers per machine (1 thread each): floor(cores * 0.95). Same rule on every fleet machine; override with
+    """GATK workers per machine (1 thread each): floor(cores * 0.9). Same rule on every fleet machine; override with
     MINOS_WORKERS."""
     env = os.environ.get("MINOS_WORKERS")
     if env:
         return int(env)
     cores = cores or os.cpu_count() or 1
-    return max(1, math.floor(cores * 0.95))
+    return max(1, math.floor(cores * 0.9))
 
 
 def _load() -> Settings:

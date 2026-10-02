@@ -29,7 +29,7 @@ main) - and `GatkRunner`, `HappyScorer`, `LocalExecutor`, `SimExecutor`, `FakeRu
 | Speed-up | Effect |
 |---|---|
 | Exclude annotations the score never uses (`SAFE_ANNOTATION_EXCLUSIONS`) | 1.135x, identical calls. QualByDepth, DepthPerAlleleBySample and RMSMappingQuality must stay (removing them changes QUAL via random draws) |
-| 1 thread per GATK job, `floor(cores x 0.95)` jobs per machine | 2.06x throughput vs 4 jobs x 4 threads |
+| 1 thread per GATK job, `floor(cores x 0.9)` jobs per machine | 2.06x throughput vs 4 jobs x 4 threads |
 | Machine-wide decision cache (`DecisionCacheScorer`) | a cluster scored by any process on the node is never sent to hap.py again by another; 34/34 identical to plain hap.py (3 rounds incl. deep coverage) |
 | One scoring unit per GATK batch (node agent) | a batch's callsets are scored one after another by one scorer (`score_many`: uncached clusters packed into few hap.py runs), so a worker slot never runs more than one scoring - no burst of parallel hap.py runs when a family finishes |
 | hap.py CPU limit (`MINOS_SCORE_CPUS`, default 1; 0 = none) | upstream runs hap.py with `--threads 4` and no limit; on a 180-core node scoring bursts drove the load to ~1000. At 1 core a full scoring takes ~10 s instead of ~5 s idle, identical results |
@@ -100,7 +100,7 @@ python -m evaluator.fleet.control status | sync | selftest | reap
 python -m main replay|live ... --fleet                 # mine with the fleet (main starts the node agents)
 ```
 
-- **Inventory**: `workers: null` = the node's own rule floor(cores x 0.95); `port` lets several machines share
+- **Inventory**: `workers: null` = the node's own rule floor(cores x 0.9); `port` lets several machines share
   one IP; optional `repo` / `data_dir`; an entry without `user` / `key_filename` inherits them from the first entry
   that has them (a new host can be just `{"host": ..., "port": ...}`). `key_passphrase` (optional, also inherited):
   main unlocks the keys in its own `ssh-agent`. Each host may have its own key and passphrase.
@@ -119,7 +119,7 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   node holding its work gets "abort" - it drops the round's local queue, kills exactly that round's containers
   (names carry the round tag) and reports nothing more for it, so all workers are free at the start of the next round.
   `LocalExecutor.end_round` does the same on one machine.
-- **Node side**: `LocalExecutor` with `floor(cores x 0.95)` GATK workers (batching, divergence repair, dedup) and
+- **Node side**: `LocalExecutor` with `floor(cores x 0.9)` GATK workers (batching, divergence repair, dedup) and
   **one scorer process per GATK worker**, each scoring one GATK batch's callsets at a time, one after another, with
   `DecisionCacheScorer` (upstream's
   hap.py path for the clusters not yet scored on this node; the per-round cluster store in `cache/dcache/<tag>/` is
