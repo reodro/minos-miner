@@ -19,7 +19,8 @@ main) - and `GatkRunner`, `HappyScorer`, `LocalExecutor`, `SimExecutor`, `FakeRu
 | GATK batching patch (`gatk_patch/`) | 17 parameters branchable in one run; bit-identical on every test (see below) |
 | Divergence repair | diverged batch variants fixed by a repair run (~34 s) instead of a full re-run (132 s) |
 | `LocalExecutor` | priority queue, dedup, result cache, batching of queued families, family pricing (`cost_hints`) |
-| `HappyScorer` | exact: upstream's hap.py path, one run per callset (the truth sliced once per round) |
+| `DecisionCacheScorer` | exact (identical `ScoreResult`s to `HappyScorer`): hap.py runs only for clusters this machine has not scored yet; the cluster cache is a per-round SQLite store shared by every scorer process on the machine (`evaluator.scorer()` returns it) |
+| `HappyScorer` | the reference: upstream's hap.py path, one full run per callset (the truth sliced once per round) |
 | `SimExecutor` | virtual clock for testing strategies and scheduling without GATK |
 | Fleet (`fleet/`) | `FleetExecutor` on main + node agents on sub-VPSs: GATK **and scoring** on the nodes, main only proposes |
 
@@ -29,6 +30,8 @@ main) - and `GatkRunner`, `HappyScorer`, `LocalExecutor`, `SimExecutor`, `FakeRu
 |---|---|
 | Exclude annotations the score never uses (`SAFE_ANNOTATION_EXCLUSIONS`) | 1.135x, identical calls. QualByDepth, DepthPerAlleleBySample and RMSMappingQuality must stay (removing them changes QUAL via random draws) |
 | 1 thread per GATK job, `floor(cores x 0.95)` jobs per machine | 2.06x throughput vs 4 jobs x 4 threads |
+| Machine-wide decision cache (`DecisionCacheScorer`) | a cluster scored by any process on the node is never sent to hap.py again by another; 34/34 identical to plain hap.py (3 rounds incl. deep coverage) |
+| Identical records scored once (node agent) | a callset whose records digest was already scored this round reuses that score (or failure): no hap.py |
 | Truth sliced once per (truth, region) (`truth_slices`) | upstream slices the truth on every scoring (2 bcftools containers); the cached slice is the same bcftools output |
 | GATK containers with `--network none` | no network namespace and interface per container (container start 3.9 s -> 0.33 s measured in the legacy project) |
 
@@ -115,8 +118,10 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   (names carry the round tag) and reports nothing more for it, so all workers are free at the start of the next round.
   `LocalExecutor.end_round` does the same on one machine.
 - **Node side**: `LocalExecutor` with `floor(cores x 0.95)` GATK workers (batching, divergence repair, dedup) and
-  **one scorer process per GATK worker**, each scoring one callset at a time with upstream's hap.py path
-  (`HappyScorer`), exactly what a validator runs. Main counts a group as
+  **one scorer process per GATK worker**, each scoring one callset at a time with `DecisionCacheScorer` (upstream's
+  hap.py path for the clusters not yet scored on this node; the per-round cluster store in `cache/dcache/<tag>/` is
+  shared by all of them and deleted with the round). Before a callset reaches a scorer, the agent checks its records
+  digest: identical records already scored this round reuse that score. Main counts a group as
   busy until its scored results arrive, so a worker's slot covers GATK and then scoring, and every finished GATK
   result is scored at once. Processes, not threads: the Python half of scoring (upstream's parsers over hap.py's
   output) takes seconds per result on a large GIAB region, and one interpreter (one GIL) capped a 180-core node at

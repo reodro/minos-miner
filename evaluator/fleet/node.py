@@ -54,8 +54,8 @@ def _proc_init(work_dir: str) -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s node: %(message)s")
     from evaluator.sandbox import install_scoring_shim
     install_scoring_shim()                     # this process imports scoring itself; the parent's shim does not carry over
-    from evaluator.gatk import HappyScorer
-    _PROC_SCORER = HappyScorer(work_dir=work_dir)
+    from evaluator.decision_cache import DecisionCacheScorer
+    _PROC_SCORER = DecisionCacheScorer(work_dir=work_dir)    # every scorer process shares work_dir's per-round store
 
 
 def _proc_score(cs: CallSet, aset: AnswerSet) -> tuple:
@@ -91,6 +91,8 @@ class Node:
             self._pool = ProcessPoolExecutor(self.score_threads, mp_context=multiprocessing.get_context("spawn"),
                                              initializer=_proc_init, initargs=(score_dir,))
         self._aborted: set = set()
+        self._by_digest: Dict[tuple, tuple] = {}             # (round, answer-set version, records digest) -> result
+        self._by_digest_lock = threading.Lock()
 
     # ---- messages -----------------------------------------------------------------------------------------------
     def send(self, msg: dict) -> None:
@@ -137,8 +139,11 @@ class Node:
                 drop = getattr(sc, "drop", None)
                 if drop:
                     drop(rid)
+            with self._by_digest_lock:
+                for k in [k for k in self._by_digest if k[0] == rid]:
+                    del self._by_digest[k]
             for d in (os.path.dirname(rnd.bam), os.path.join(SETTINGS.cache_dir, "callsets", rnd.tag),
-                      os.path.join(SETTINGS.cache_dir, "fleet", rnd.tag)):
+                      os.path.join(SETTINGS.cache_dir, "fleet", rnd.tag), os.path.join(SETTINGS.cache_dir, "dcache", rnd.tag)):
                 safe = any(os.path.abspath(d).startswith(os.path.abspath(root) + os.sep)
                            for root in (SETTINGS.data_dir, SETTINGS.cache_dir))     # never outside our own folders
                 if os.path.isdir(d) and safe:
@@ -163,18 +168,45 @@ class Node:
             if c.round_id not in self._rounds:                 # the round was pruned meanwhile: nothing to report
                 continue
             aset = self._rounds[c.round_id][1]
-            if self._pool is not None:
+            seen = self._seen(c, aset)
+            if seen is not None:                               # identical records already scored here this round
+                c, r = seen
+            elif self._pool is not None:
                 try:
                     c, r = self._pool.submit(_proc_score, c, aset).result()
                 except Exception as e:  # noqa: BLE001 - a dead scorer process fails its callset, not the node
                     c, r = replace(c, ok=False, error=f"scoring failed on node: {e}"), None
+                self._remember(c, aset, r)
             else:
                 try:
                     r = scorer.score(c, aset)
                 except Exception as e:  # noqa: BLE001
                     c, r = replace(c, ok=False, error=f"scoring failed on node: {e}"), None
+                self._remember(c, aset, r)
             if c.round_id not in self._aborted:
                 self.send({"type": "result", "callset": codec.callset_to(replace(c, score=r) if r else c)})
+
+    def _digest_key(self, c: CallSet, aset: AnswerSet) -> Optional[tuple]:
+        return (c.round_id, aset.version, c.sha256) if c.sha256 else None
+
+    def _seen(self, c: CallSet, aset: AnswerSet) -> Optional[tuple]:
+        """A callset whose records are byte-identical to one already scored here gets that score (or that failure):
+        hap.py sees only the records, so the result is the same - no second hap.py run."""
+        k = self._digest_key(c, aset)
+        with self._by_digest_lock:
+            hit = self._by_digest.get(k) if k else None
+        if hit is None:
+            return None
+        r, error = hit
+        if r is None:
+            return replace(c, ok=False, error=error), None
+        return c, replace(r, config_key=c.config_key, job_id=c.job_id, fidelity=c.fidelity)
+
+    def _remember(self, c: CallSet, aset: AnswerSet, r) -> None:
+        k = self._digest_key(c, aset)
+        if k:
+            with self._by_digest_lock:
+                self._by_digest[k] = (r, c.error)
 
     # ---- main loop -------------------------------------------------------------------------------------------------
     def serve(self) -> None:
@@ -249,7 +281,7 @@ def main() -> None:
     if a.selftest_only:
         print(json.dumps(result)); return
     node = Node(workers, runner, scorer_factory, a.score_threads,
-                score_dir=None if a.fake else os.path.join(SETTINGS.cache_dir, "happy"))
+                score_dir=None if a.fake else os.path.join(SETTINGS.cache_dir, "dcache"))
     node.send({"type": "ready", "code": code, "workers": workers, **result})
     if not result["ok"]:
         log.error("self-test failed: %s != %s", result["digest"], result["expected"]); return

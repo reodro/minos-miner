@@ -29,9 +29,10 @@ def callset_dir(round_tag: str) -> Path:
 
 
 def scorer():
-    """Exact scoring: upstream's hap.py path, one run per callset."""
-    from evaluator.gatk import HappyScorer
-    return HappyScorer()
+    """Exact scoring with the per-cluster decision cache: upstream's hap.py path, run only for clusters this machine
+    has not scored yet (results identical to HappyScorer)."""
+    from evaluator.decision_cache import DecisionCacheScorer
+    return DecisionCacheScorer()
 
 
 def fleet_executor(inventory: str):
