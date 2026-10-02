@@ -60,7 +60,7 @@ Released models are code: `k2/models/<track>/ACTIVE` names the version main runs
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
 Inputs, under `SETTINGS.data_dir` (listed in `k2/util.py`): the shared `reference/`, `giab/<donor>.vcf.gz|.bed` and
-`1kg/phased/` plus `answer_set/{kg_index,kg_gatk_sites,masks}`. This clone's `cache/answer_set/k2/`: one build per
+`1kg/{phased,index,gatk_sites,masks}` (the last three: the builder's 1000G inputs). This clone's `cache/answer_set/k2/`: one build per
 round, downloads (Google originals, per-person GATK), mask intervals, trained versions with their leave-out models,
 prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/train_track.py`.
 

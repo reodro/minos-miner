@@ -14,11 +14,11 @@ from pathlib import Path
 
 import numpy as np
 
-from answer_set.k2.util import AS_DIR, BCFTOOLS_IMG, CACHE, bcftools, read_alleles, ref_path, trim
+from answer_set.k2.util import KG_DIR as KG_ROOT, BCFTOOLS_IMG, CACHE, bcftools, read_alleles, ref_path, trim
 from common.settings import SETTINGS
 
 KG_DIR = Path(SETTINGS.kg_dir) / "phased"      # the phased panel, shared with answer_set.fingerprint
-INDEX_DIR = AS_DIR / "kg_index"
+INDEX_DIR = KG_ROOT / "index"
 CHROMS = [f"chr{i}" for i in range(14, 23)]
 THIN_BP = 1000          # at most one index site per 1 kb
 MIN_AF, MAX_AF = 0.05, 0.95
@@ -95,7 +95,7 @@ def sample_alleles(chrom, a, b, sample, workdir):
 DRAGEN_URL = "https://1000genomes-dragen.s3.amazonaws.com/data/dragen-3.7.6/hg38-graph-based"
 
 
-GATK_DIR = AS_DIR / "kg_gatk_sites"
+GATK_DIR = KG_ROOT / "gatk_sites"
 
 
 def gatk_sites(chrom, a, b, workdir):

@@ -4,9 +4,11 @@ Inputs, under SETTINGS.data_dir (shareable between clones):
   reference/<chrom>/<chrom>.fa        reference genome (SETTINGS.reference_fasta)
   giab/<donor>.vcf.gz, <donor>.bed    GIAB NIST v4.2.1 calls and confident region (SETTINGS.giab_dir)
   1kg/phased/<chrom>.vcf.gz           1000 Genomes phased panel (SETTINGS.kg_dir; shared with answer_set.fingerprint)
-  answer_set/kg_index/                panel lookup index, index_<chrom>.npz (kg.py --index)
-  answer_set/kg_gatk_sites/           1000G raw GATK callset, sites + annotations, <chrom>.sites.vcf.gz
-  answer_set/masks/                   region lists (1000G accessibility masks, GIAB v3.3 stratifications)
+  1kg/index/                          panel lookup index, index_<chrom>.npz (python -m answer_set.k2.kg --index all)
+  1kg/gatk_sites/                     1000G raw GATK callset, sites + annotations, <chrom>.sites.vcf.gz (EBI
+                                      20201028_3202_raw_GT_with_annot, the release 1kg/raw/ comes from)
+  1kg/masks/                          region lists used for 1000G rounds (1000G accessibility masks, GIAB v3.3
+                                      stratifications)
 Models: released ones in git (answer_set/k2/models, see tracks.py); trained ones in the cache.
 Caches, under SETTINGS.cache_dir (this clone, rebuildable):
   answer_set/k2/<round tag>/v1/       one build per round
@@ -24,7 +26,7 @@ from pathlib import Path
 
 from common.settings import SETTINGS
 
-AS_DIR = Path(SETTINGS.data_dir) / "answer_set"
+KG_DIR = Path(SETTINGS.kg_dir)
 CACHE = Path(SETTINGS.cache_dir) / "answer_set" / "k2"
 BCFTOOLS_IMG = "quay.io/biocontainers/bcftools:1.20--h8b25389_0"    # the image the validator's scoring uses
 DONORS = ["HG001", "HG002", "HG003", "HG004", "HG005", "HG006", "HG007"]

@@ -2,7 +2,7 @@
 
 Minos keeps a DRAGEN+GATK call almost always inside the 1000 Genomes strict mask (SNPs 99.9%,
 indels 98.9%; 16 rounds) and nearly all of its unexplained drops are outside it.
-Files (in <data_dir>/answer_set/masks/):
+Files (in <data_dir>/1kg/masks/):
   20160622.allChr.mask.bed                         1000G strict accessibility mask (GRCh38)
   20160622.allChr.pilot_mask.bed                   1000G pilot accessibility mask
   GRCh38_notinalldifficultregions.bed.gz           GIAB v3.3 stratification: not in any difficult region
@@ -15,9 +15,9 @@ import gzip
 
 import numpy as np
 
-from answer_set.k2.util import AS_DIR, CACHE
+from answer_set.k2.util import CACHE, KG_DIR
 
-MASK_DIR = AS_DIR / "masks"
+MASK_DIR = KG_DIR / "masks"
 NPZ_DIR = CACHE / "masks"
 MASKS = {
     "in_strict_mask": "20160622.allChr.mask.bed",
