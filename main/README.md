@@ -47,7 +47,12 @@ Follows the upstream miner (`minos_subnet/neurons/miner.py`):
   local ledger **before** publishing it on chain, then submitted with the config;
 - **never pays a resubmission fee**: if fees are enabled and the free allowance is used, the submission is not sent.
 
-**Untested**: needs `bittensor`, `httpx` and a registered wallet, none of which exist on the dev box yet.
+**Setup** (main only): `.venv/bin/pip install -r requirements-live.txt` (bittensor 10.3.1 + httpx, upstream's pins;
+fleet nodes never need them). Wallets are machine-wide in `~/.bittensor/wallets/`, managed with `btcli` (installed
+machine-wide with pipx, `bittensor-cli==9.21.1`). The miner needs the hotkey and the coldkey's public part
+(`coldkeypub.txt`) only - the coldkey itself stays offline; rewards go to the coldkey that registered the hotkey.
+
+**Untested on the platform**: the wallet and libraries are installed, but no live round has run yet.
 Try `python -m main live --wallet W --hotkey H --demo` first.
 
 ## Commands

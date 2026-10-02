@@ -1,0 +1,6 @@
+# Live mining only (python -m main live), on main - fleet nodes never need these.
+# Pinned to upstream's validator stack (minos_subnet/requirements.txt). btcli is installed machine-wide (pipx),
+# not here: wallets in ~/.bittensor/wallets are shared by everything on the machine.
+bittensor==10.3.1
+bittensor-drand==1.3.0
+httpx>=0.24.0
