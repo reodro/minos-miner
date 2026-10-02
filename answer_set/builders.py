@@ -12,7 +12,7 @@ from typing import Optional
 
 from answer_set.base import AnswerSetProvider
 
-BUILDER_NAMES = ("k2", "provider", "oracle")     # the first one is the default; "oracle" is for released rounds only
+BUILDER_NAMES = ("k2", "oracle")     # the first one is the default; "oracle" is for released rounds only
 
 
 class SearchableOracle:
@@ -33,9 +33,6 @@ class SearchableOracle:
 def builder(name: Optional[str] = None) -> AnswerSetProvider:
     """The answer-set builder `name` (None: $ANSWER_SET_BUILDER, else the default)."""
     name = name or os.environ.get("ANSWER_SET_BUILDER") or BUILDER_NAMES[0]
-    if name == "provider":
-        from answer_set.provider import Provider
-        return Provider()
     if name == "k2":
         from answer_set.k2 import K2Provider
         return K2Provider()

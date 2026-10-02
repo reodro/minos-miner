@@ -76,13 +76,12 @@ git clone <this repo> /minos/minos-miner && cd /minos/minos-miner
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 docker pull broadinstitute/gatk:4.5.0.0                       # validator's GATK image
-docker pull quay.io/biocontainers/samtools:1.20--h50ea8bc_0   # parent-read slices
 docker pull "$(grep -oP 'HAPPY_DOCKER_IMAGE = "\K[^"]+' ../minos_subnet/utils/scoring.py)"      # hap.py, pinned digest
 docker pull "$(grep -oP 'BCFTOOLS_DOCKER_IMAGE = "\K[^"]+' ../minos_subnet/utils/scoring.py)"   # bcftools for scoring
 
 bash evaluator/gatk_patch/build.sh              # GATK batching patch -> evaluator/gatk_patch/build/minos-patch.jar
 bash scripts/fetch_genome.sh                    # GRCh38 chr1-22: FASTA, index, dict, SDF (validator's files)
-bash scripts/fetch_reference_data.sh            # 1000G raw callset + panel + CRAM indexes (chr14-22 by default)
+bash scripts/fetch_reference_data.sh            # 1000G phased panel (chr14-22 by default) + GIAB index
 .venv/bin/python -m backtest.data --last 20     # released rounds (BAM + truth) for backtests
 ```
 

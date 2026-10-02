@@ -17,7 +17,7 @@ import numpy as np
 from answer_set.k2.util import KG_DIR as KG_ROOT, BCFTOOLS_IMG, CACHE, bcftools, read_alleles, ref_path, trim
 from common.settings import SETTINGS
 
-KG_DIR = Path(SETTINGS.kg_dir) / "phased"      # the phased panel, shared with answer_set.fingerprint
+KG_DIR = Path(SETTINGS.kg_dir) / "phased"      # the phased panel (scripts/fetch_reference_data.sh)
 INDEX_DIR = KG_ROOT / "index"
 CHROMS = [f"chr{i}" for i in range(14, 23)]
 THIN_BP = 1000          # at most one index site per 1 kb
