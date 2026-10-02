@@ -255,6 +255,87 @@ class BatchingExecutorTest(unittest.TestCase):
         self.assertIn(conf[2].key, runner.solo)                    # the diverged one re-ran alone
         self.assertIn(other.key, runner.solo)                      # different branch key: not batched
 
+    def test_splits_a_family_that_would_run_for_minutes(self):
+        r = ranges(); d = r.defaults("gatk").params
+        conf = [Config("gatk", {**d, self.BatchRunner.GT: c}) for c in (30.0, 40.0, 50.0, 60.0)]
+        runner = self.BatchRunner(r)
+        runner.variant_cost = lambda main, variant, fidelity: 0.6   # 132 + 79 s; a third variant passes 4.5 min
+        ex = LocalExecutor(runner, workers=2)
+        ex.submit([EvalJob(f"c{i}", ROUND, c) for i, c in enumerate(conf)])
+        got = self.drain(ex, 4)
+        self.assertEqual(len(got), 4)
+        self.assertEqual(sorted(len(b) for b in runner.batches), [2, 2])
+
+    def test_a_later_genotyping_variant_uses_the_warm_jvm(self):
+        r = ranges(); d = r.defaults("gatk").params
+        runner = self.BatchRunner(r)
+        runner.runs = []
+
+        def run(round, config, fidelity):
+            runner.runs.append(config.key)
+            return BatchingExecutorTest.BatchRunner.run(runner, round, config, fidelity)
+
+        def warm_submit(round, config, fidelity):
+            if runner.runs and config.params.get(self.BatchRunner.GT) == 40.0:
+                runner.warmed = config.key
+                return BatchingExecutorTest.BatchRunner.run(runner, round, config, fidelity)
+            return None
+
+        runner.run = run
+        runner.warm_submit = warm_submit
+        ex = LocalExecutor(runner, workers=1)
+        first = Config("gatk", {**d, self.BatchRunner.GT: 30.0})
+        second = Config("gatk", {**d, self.BatchRunner.GT: 40.0})
+        ex.submit([EvalJob("a", ROUND, first)])
+        got = self.drain(ex, 1)
+        ex.submit([EvalJob("b", ROUND, second)])
+        got.update(self.drain(ex, 1))
+        self.assertEqual(len(got), 2)
+        self.assertEqual(runner.warmed, second.key)
+        self.assertEqual(runner.runs, [first.key])          # the second config did not start its own GATK run
+
+    def test_queued_genotyping_variants_reuse_a_warm_jvm(self):
+        r = ranges(); d = r.defaults("gatk").params
+        runner = self.BatchRunner(r)
+        runner.warmed = []
+        runner.warm_ready = lambda round, config, fidelity: True
+
+        def warm_submit(round, config, fidelity):
+            runner.warmed.append(config.key)
+            return FakeRunner.run(runner, round, config, fidelity)
+
+        runner.warm_submit = warm_submit
+        ex = LocalExecutor(runner, workers=1, now=lambda: 0.0)
+        ex.set_finish_by(10.0)                             # a solo run is 132 s; a warm genotype is about 1.5 s
+        conf = [Config("gatk", {**d, self.BatchRunner.GT: c}) for c in (40.0, 50.0)]
+        ex.submit([EvalJob("a", ROUND, conf[0]), EvalJob("b", ROUND, conf[1])])
+        got = self.drain(ex, 2)
+        self.assertEqual(sorted(got), ["a", "b"])
+        self.assertEqual(runner.warmed, [c.key for c in conf])
+        self.assertEqual(runner.batches, [])
+        self.assertEqual(runner.solo, [])
+
+    def test_does_not_start_a_job_that_cannot_finish_and_still_starts_a_repair(self):
+        r = ranges(); d = r.defaults("gatk").params
+        runner = self.BatchRunner(r)
+        runner.repairs = []
+        runner.repair = lambda round, config, diverged, fidelity: runner.repairs.append(config.key) or FakeRunner.run(
+            runner, round, config, fidelity)
+        now = [0.0]
+        ex = LocalExecutor(runner, workers=1, now=lambda: now[0])
+        ex.set_finish_by(40.0)                                 # a solo run is 132 s; a repair is 34 s
+        normal = EvalJob("n", ROUND, Config("gatk", {**d, "min_pruning": 4}))
+        repair_job = EvalJob("r", ROUND, Config("gatk", {**d, "min_pruning": 5}))
+        ex._solo.add(repair_job.job_id)
+        ex._repair[repair_job.job_id] = CallSet(ROUND.round_id, repair_job.config.key, "batch.vcf.gz", "", 1.0,
+                                                ok=False, error="minos:diverged", job_id=repair_job.job_id)
+        ex.submit([normal, repair_job])
+        got = self.drain(ex, 1)
+        self.assertEqual(list(got), ["r"])
+        self.assertEqual(runner.repairs, [repair_job.config.key])
+        self.assertEqual(runner.solo, [])
+        self.assertEqual(ex.stats()["queued"], 1)
+
     def test_no_batching_without_run_batch(self):
         r = ranges(); runner = FakeRunner(r)
         ex = LocalExecutor(runner, workers=2)

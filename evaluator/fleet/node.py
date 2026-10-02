@@ -52,6 +52,8 @@ def _proc_init(work_dir: str) -> None:
 
     threading.Thread(target=watchdog, daemon=True).start()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s node: %(message)s")
+    from evaluator.sandbox import install_scoring_shim
+    install_scoring_shim()                     # this process imports scoring itself; the parent's shim does not carry over
     from evaluator.gatk import HappyScorer
     _PROC_SCORER = HappyScorer(work_dir=work_dir)
 
@@ -205,7 +207,9 @@ class Node:
 
 
 def reap(prefix: str) -> None:
-    """Kill every GATK container this node started (names carry the node's prefix)."""
+    """Kill every GATK job this node started (names carry the node's prefix)."""
+    from evaluator.sandbox import kill_prefix
+    kill_prefix(f"{prefix}-")
     ids = subprocess.run(["docker", "ps", "-q", "--filter", f"name={prefix}-"], capture_output=True, text=True).stdout.split()
     if ids:
         subprocess.run(["docker", "kill", *ids], capture_output=True)

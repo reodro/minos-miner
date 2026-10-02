@@ -195,6 +195,28 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(len(load(p, enabled_only=False)), 3)
 
 
+class FleetScheduleTest(unittest.TestCase):
+    """Grouping rules, without SSH: a long family is split, and a job that cannot finish stays queued."""
+
+    def test_splits_a_long_family_and_holds_a_job_that_cannot_finish(self):
+        rnd = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
+        d = ranges().defaults("gatk").params
+        conf = [Config("gatk", {**d, GT: c}) for c in (30.0, 40.0, 50.0, 60.0)]
+        ex = FleetExecutor(Planner(), inventory=Path("/tmp/does-not-exist-fleet.json"))
+        ex.runner.variant_cost = lambda main, variant, fidelity: 0.6
+        ex.submit([EvalJob(f"c{i}", rnd, c) for i, c in enumerate(conf)])
+        first = ex._take_groups({rnd.round_id})
+        second = ex._take_groups({rnd.round_id})
+        self.assertEqual([len(first[0]), len(second[0])], [2, 2])
+
+        held = FleetExecutor(Planner(), inventory=Path("/tmp/does-not-exist-fleet.json"))
+        held._now = lambda: 0.0
+        held.set_finish_by(10.0)                              # a solo run is 132 s
+        held.submit([EvalJob("a", rnd, conf[0])])
+        self.assertEqual(held._take_groups({rnd.round_id}), [])
+        self.assertEqual(len(held._queue), 1)
+
+
 class PassphraseTest(unittest.TestCase):
     def test_agent_unlocks_an_encrypted_key(self):
         import subprocess

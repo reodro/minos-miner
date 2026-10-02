@@ -4,6 +4,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
@@ -14,6 +15,24 @@ from common.types import CallSet, EvalJob
 from evaluator.base import Runner
 
 DIVERGED = "minos:diverged"   # same marker as evaluator.gatk.DIVERGED (kept here to avoid a GATK import)
+SOLO_S = 132.0                # one full GATK run at production load
+REPAIR_S = 34.0               # a diverged variant's repair run
+WARM_S = SOLO_S * 0.011       # genotyping one variant in a JVM that already walked the family
+MAX_BATCH_S = 4.5 * 60        # split a family that would run longer than this and leave the rest queued
+
+
+def extra_seconds(runner, main: EvalJob, variant: EvalJob) -> Optional[float]:
+    """Seconds `variant` adds inside `main`'s batch. None = it cannot join that batch.
+
+    A runner without variant_cost adds nothing: the old behavior, batch up to max_batch.
+    """
+    cost = getattr(runner, "variant_cost", None)
+    if cost is None:
+        return 0.0
+    frac = cost(main.config, variant.config, main.fidelity)
+    if frac is None:
+        return None
+    return SOLO_S * float(frac)
 
 
 def job_key(job: EvalJob) -> Tuple[str, str, str]:
@@ -35,11 +54,13 @@ class LocalExecutor:
     runner.repair (or simply run again when the runner cannot repair).
     """
 
-    def __init__(self, runner: Runner, workers: Optional[int] = None, max_batch: int = 32):
+    def __init__(self, runner: Runner, workers: Optional[int] = None, max_batch: int = 32, now=None):
         self.runner = runner
         workers = workers or default_workers()
         self.workers = workers
         self.max_batch = max_batch
+        self._now = now or time.time
+        self._finish_by: Optional[float] = None   # do not start a batch that would still be running then
         self._batching = hasattr(runner, "run_batch") and hasattr(runner, "branch_key")
         self._pool = ThreadPoolExecutor(workers)
         self._queue: list = []                     # (-priority, seq, job)
@@ -62,6 +83,34 @@ class LocalExecutor:
         self.done = 0                                   # callsets delivered (dashboard)
 
     # ---- running ---------------------------------------------------------------------------------------------
+    def _served_warm(self, job: EvalJob) -> bool:
+        """True when a live JVM can genotype this config without another traversal."""
+        ready = getattr(self.runner, "warm_ready", None)
+        if ready is None or job.job_id in self._repair or job.job_id in self._solo:
+            return False
+        return bool(ready(job.round, job.config, job.fidelity))
+
+    def _evaluate(self, jobs: List[EvalJob]) -> List[CallSet]:
+        """Genotype on a live JVM when one already walked this family; otherwise one traversal."""
+        warm = getattr(self.runner, "warm_submit", None)
+        if warm is not None and not any(j.job_id in self._solo for j in jobs):
+            hits = [warm(j.round, j.config, j.fidelity) for j in jobs]
+            if any(h is not None for h in hits):
+                missed = [j for j, h in zip(jobs, hits) if h is None]
+                by_id = {}
+                if len(missed) == 1:
+                    j = missed[0]
+                    by_id[j.job_id] = self.runner.run(j.round, j.config, j.fidelity)
+                elif missed:
+                    batched = self.runner.run_batch(missed[0].round, [j.config for j in missed], missed[0].fidelity)
+                    for j, cs in zip(missed, batched):
+                        by_id[j.job_id] = cs
+                return [h if h is not None else by_id[j.job_id] for j, h in zip(jobs, hits)]
+        if len(jobs) == 1:
+            j = jobs[0]
+            return [self.runner.run(j.round, j.config, j.fidelity)]
+        return self.runner.run_batch(jobs[0].round, [j.config for j in jobs], jobs[0].fidelity)
+
     def _branch(self, job: EvalJob) -> Optional[str]:
         if not self._batching or job.job_id in self._solo:
             return None
@@ -74,10 +123,8 @@ class LocalExecutor:
                 j = jobs[0]
                 self.repairs_run += 1
                 out = [self.runner.repair(j.round, j.config, self._repair.pop(j.job_id), j.fidelity)]
-            elif len(jobs) == 1:
-                out = [self.runner.run(jobs[0].round, jobs[0].config, jobs[0].fidelity)]
             else:
-                out = self.runner.run_batch(jobs[0].round, [j.config for j in jobs], jobs[0].fidelity)
+                out = self._evaluate(jobs)
         except Exception as e:  # a crashed config is a result, not a crashed executor
             return [failed(j, str(e)) for j in jobs]
         finally:
@@ -95,29 +142,56 @@ class LocalExecutor:
         else:
             self._inflight.pop(k, None)
 
+    def set_finish_by(self, ts: Optional[float]) -> None:
+        """Do not start a batch that would still be running at `ts` (the final submission). None clears it."""
+        with self._lock:
+            self._finish_by = ts
+
+    def _room(self) -> float:
+        """Seconds a batch started now may take: the family cap, and the time left before the final submission."""
+        room = MAX_BATCH_S
+        if self._finish_by is not None:
+            room = min(room, self._finish_by - self._now())
+        return room
+
     def _fill(self):
+        skipped = []
         while len(self._running) < self.workers and self._queue:
             _, _, job = heapq.heappop(self._queue)
             if job.job_id in self._cancelled:
                 self._drop_cancelled(job)
                 continue
-            batch = [job]
+            room = self._room()
+            served = self._served_warm(job)
+            main_s = WARM_S if served else (REPAIR_S if job.job_id in self._repair else SOLO_S)
+            if main_s > room:
+                # it would be killed at the deadline; leave it queued and try a shorter job behind it
+                skipped.append(job)
+                continue
+            batch, seconds = [job], main_s
             bk = self._branch(job)
             if bk is not None:
                 keep = []
                 while self._queue:
                     item = heapq.heappop(self._queue)
                     other = item[2]
+                    extra = None
                     if (len(batch) < self.max_batch and other.job_id not in self._cancelled
-                            and other.round.round_id == job.round.round_id and self._branch(other) == bk):
+                            and other.round.round_id == job.round.round_id and self._branch(other) == bk
+                            and (not served or self._served_warm(other))):
+                        extra = extra_seconds(self.runner, job, other)
+                    if extra is not None and seconds + extra <= room:
                         batch.append(other)
+                        seconds += extra
                     else:
                         keep.append(item)
                 for item in keep:
                     heapq.heappush(self._queue, item)
-            if len(batch) > 1:
+            if len(batch) > 1 and not served:
                 self.batches_run += 1
             self._running[self._pool.submit(self._run, batch)] = batch
+        for job in skipped:
+            heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
 
     def submit(self, jobs: Iterable[EvalJob]) -> None:
         with self._lock:

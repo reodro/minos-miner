@@ -33,7 +33,7 @@ from common.settings import SETTINGS
 from common.types import AnswerSet, CallSet, EvalJob, Round
 from evaluator.fleet import codec, selftest
 from evaluator.fleet.inventory import INVENTORY, Host, code_digest, ensure_agent, load
-from evaluator.local import failed, job_key
+from evaluator.local import MAX_BATCH_S, SOLO_S, extra_seconds, failed, job_key
 
 log = logging.getLogger(__name__)
 LOG_DIR = Path.home() / ".minos" / "fleet" / "logs"
@@ -119,6 +119,8 @@ class FleetExecutor:
         self._sessions: Dict[str, _Session] = {}
         self._ended = set()                                      # round ids ended by end_round()
         self._stopping = False
+        self._now = time.time
+        self._finish_by: Optional[float] = None                  # do not send a batch that would still be running then
         LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # ---- hosts --------------------------------------------------------------------------------------------------------
@@ -299,6 +301,17 @@ class FleetExecutor:
                     self._fail_if_unservable(rid)
 
     # ---- Executor protocol ----------------------------------------------------------------------------------------
+    def set_finish_by(self, ts: Optional[float]) -> None:
+        """Do not send a batch that would still be running at `ts` (the final submission). None clears it."""
+        with self._lock:
+            self._finish_by = ts
+
+    def _room(self) -> float:
+        room = MAX_BATCH_S
+        if self._finish_by is not None:
+            room = min(room, self._finish_by - self._now())
+        return room
+
     def _branch(self, job: EvalJob) -> Optional[str]:
         f = getattr(self.runner, "branch_key", None)
         return f(job.config, job.fidelity) if f else None
@@ -431,8 +444,10 @@ class FleetExecutor:
                     break                                      # the reader sees the session end and re-queues
 
     def _take_groups(self, rounds_ready: set) -> List[List[EvalJob]]:
-        """The top queued job whose round the node has, plus every queued job that can share its GATK run."""
-        skipped, group = [], None
+        """The top queued job whose round the node has and that can finish in time, plus queued jobs that can
+        share its GATK run without pushing the batch past the family cap or the time left."""
+        skipped, too_long, group = [], [], None
+        room = self._room()
         while self._queue and group is None:
             item = heapq.heappop(self._queue)
             job = item[2]
@@ -441,7 +456,10 @@ class FleetExecutor:
             if job.round.round_id not in rounds_ready:
                 skipped.append(item)
                 continue
-            group, bk = [job], self._branch(job)
+            if SOLO_S > room:
+                too_long.append(job)
+                continue
+            group, seconds, bk = [job], SOLO_S, self._branch(job)
             if bk is not None:
                 keep = []
                 while self._queue:
@@ -449,15 +467,21 @@ class FleetExecutor:
                     other = other_item[2]
                     if self._skip(other):
                         continue
+                    extra = None
                     if (len(group) < self.max_batch and other.round.round_id == job.round.round_id
                             and self._branch(other) == bk):
+                        extra = extra_seconds(self.runner, job, other)
+                    if extra is not None and seconds + extra <= room:
                         group.append(other)
+                        seconds += extra
                     else:
                         keep.append(other_item)
                 for it in keep:
                     heapq.heappush(self._queue, it)
         for it in skipped:
             heapq.heappush(self._queue, it)
+        for job in too_long:
+            heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
         return [group] if group else []
 
     def _skip(self, job: EvalJob) -> bool:

@@ -2,16 +2,21 @@
 
 Verified (2026-09-28; 3 rounds x 3 configs against the validator-identical baseline):
   used     - SAFE_ANNOTATION_EXCLUSIONS (-AX): bit-identical calls, x1.135.
-           - batching (gatk_patch): variants differing only in genotyping params cost ~0.8 s extra each; in PairHMM
-             params ~13 s per distinct PairHMM set (vs ~73 s full). 54/54 + 62/62 bit-identical to stock runs;
-             variants whose own run would draw random numbers differently come back DIVERGED and are repaired.
-           - assembly params: ~41 s extra per distinct assembly set (only traversal is shared), 86/86 bit-identical.
+           - batching (gatk_patch): at full load a variant costs the most expensive stage it changes
+             (VARIANT_COST: genotyping 1.4 s, PairHMM 16 s, assembly 72 s, activity 78 s, of a 132 s solo).
+             54/54 + 62/62 bit-identical to stock runs; variants whose own run would draw random numbers
+             differently come back DIVERGED and are repaired.
+           - assembly params share traversal and region finding only, 86/86 bit-identical.
              Excluding QualByDepth or DepthPerAlleleBySample changes QUAL; RMSMappingQuality is required.
            - 1 thread per job: x2.06 throughput vs 4 threads per job on a saturated box; calls identical.
+           - warm JVM: the process stays up after a traversal. A later genotyping-only variant of that
+             family is genotyped from the stored likelihoods. Anything else, or a JVM that ran out of
+             memory, is a cold run. Bit-identical to cold runs on chr18:57771001-57871001 (229 calls).
   rejected - GVCF re-genotyping (heterozygosity changes calls; QUAL shifts flip stand_call_conf thresholds in ~13%
              of cases), QUAL projection (1e-4..1e-3 off), native java outside the image (different calls and slower:
              GKL PairHMM missing), interval restriction (~2%), scatter-gather (x0.49 throughput).
-Workers must run the validator's docker image; a worker that differs silently changes calls.
+Workers must run the validator's image files. MINOS_RUNTIME=sandbox (the default) runs them
+without the Docker daemon; MINOS_RUNTIME=docker is the container path.
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -59,7 +65,9 @@ ASSEMBLY_BRANCH_PARAMS = ("min_pruning", "min_dangling_branch_length", "recover_
                           "pruning_lod_threshold")
 ASSEMBLY_DEFAULTS = {"min_pruning": 2, "min_dangling_branch_length": 4, "recover_all_dangling_branches": False,
                      "max_num_haplotypes_in_population": 128, "adaptive_pruning_initial_error_rate": 0.001,
-                     "pruning_lod_threshold": 2.302585}
+                     # GATK's unset value is MathUtils.log10ToLog(1), not the 6-digit truncation. A shorter
+                     # value makes the warm JVM treat a genotyping-only request as an assembly change and refuse it.
+                     "pruning_lod_threshold": 2.302585092994046}
 # Read only when the traversal cuts the activity profile into regions (assembly_region_padding is not: it also sets
 # how far each read shard reaches): variants differing in these get their own region stream from the shared per-locus
 # activity states and reads, then assembly and everything after it.
@@ -81,6 +89,7 @@ def variant_line(config: Config, output: str) -> str:
 
 DIVERGED = "minos:diverged"      # batch variant whose own run would differ; the executor re-runs it alone
 DEFAULT_PATCH_JAR = os.path.join(os.path.dirname(__file__), "gatk_patch", "build", "minos-patch.jar")
+MAX_WARM = 2                     # JVMs kept after a run so a later genotyping variant can reuse it
 
 SAFE_ANNOTATION_EXCLUSIONS = (
     "Coverage", "DepthPerSampleHC", "ChromosomeCounts", "BaseQualityRankSumTest", "ExcessHet", "FisherStrand",
@@ -121,6 +130,10 @@ def splice_repair(batch_vcf: Path, regions: Path, repair_vcf: Path, repair_log: 
         a, b = rng.split("-")
         spans.append((contig, int(a), int(b), key))
     spans.sort()
+    for earlier, later in zip(spans, spans[1:]):
+        # Closed intervals. A shared base belongs to two regions, and the bisect below would keep the later one.
+        if earlier[0] == later[0] and later[1] <= earlier[2]:
+            raise ValueError(f"overlapping assembly regions {earlier[3]} and {later[3]}")
     starts = [(c, a) for c, a, _, _ in spans]
     skipped = {l.split("\t", 1)[1] for l in repair_log.read_text().splitlines() if l.startswith("S\t")}
 
@@ -153,11 +166,56 @@ def splice_repair(batch_vcf: Path, regions: Path, repair_vcf: Path, repair_log: 
     pysam.tabix_index(str(out), preset="vcf", force=True)
 
 
+class _WarmSession:
+    """One GATK process that has finished its traversal and is waiting for genotyping variants."""
+
+    def __init__(self, proc, log_file, directory: Path, main: Config, timeout_s: int):
+        self.proc, self.log_file, self.directory, self.main = proc, log_file, directory, main
+        self.timeout_s = timeout_s
+        self.n = 0
+        self.lock = threading.Lock()
+
+    def request(self, line: str) -> str:
+        """Send one variant line. Returns exact, diverged, refused, or an error token."""
+        with self.lock:
+            if self.proc.poll() is not None:
+                return "dead"
+            self.n += 1
+            name = f"req-{self.n:05d}"
+            tmp = self.directory / (name + ".tmp")
+            tmp.write_text(line if line.endswith("\n") else line + "\n")
+            os.replace(tmp, self.directory / (name + ".tsv"))
+            done = self.directory / (name + ".done")
+            deadline = time.time() + self.timeout_s
+            while time.time() < deadline:
+                if done.exists():
+                    return done.read_text().strip() or "error"
+                if self.proc.poll() is not None:
+                    return "dead"
+                time.sleep(0.02)
+            return "timeout"
+
+    def stop(self) -> None:
+        (self.directory / "stop").write_text("1\n")
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            killer = getattr(self.proc, "minos_kill", None)
+            if killer:
+                killer()
+            else:
+                args = self.proc.args if isinstance(self.proc.args, (list, tuple)) else []
+                if "--name" in args:
+                    subprocess.run(["docker", "kill", args[args.index("--name") + 1]], capture_output=True)
+                self.proc.kill()
+        self.log_file.close()
+
+
 class GatkRunner:
     """The validator's HaplotypeCaller command (minos_subnet/templates/gatk.py) plus the verified speed-ups."""
 
     def __init__(self, work_dir: Optional[str] = None, threads: int = 1, memory_gb: int = 4, timeout_s: int = 1800,
-                 patch_jar: Optional[str] = None, container_prefix: str = "minos-run"):
+                 patch_jar: Optional[str] = None, container_prefix: str = "minos-run", runtime: Optional[str] = None):
         """patch_jar: our patched GATK classes (evaluator/gatk_patch), put before the GATK jar on the classpath,
         still inside the validator's image. None = the stock `gatk` wrapper."""
         self.work_dir = Path(work_dir or os.path.join(SETTINGS.cache_dir, "callsets"))
@@ -165,6 +223,10 @@ class GatkRunner:
         self.patch_jar = Path(patch_jar).resolve() if patch_jar else None
         self.container_prefix = container_prefix     # containers are named <prefix>-<round tag>-<id>, so the owner can
                                                      # stop all of them, or exactly one round's (kill_round)
+        self.runtime = runtime or os.environ.get("MINOS_RUNTIME", "sandbox")
+        self._warm = {}                              # (round_id, branch_key) -> _WarmSession
+        self._warm_lock = threading.Lock()
+        self._warm_reserved = 0
 
     def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path, jvm_props: Optional[dict] = None) -> list:
         from templates.tool_params import validate_and_build_flags   # upstream
@@ -196,20 +258,115 @@ class GatkRunner:
 
     def kill_round(self, round_id: str) -> int:
         """Kill this runner's running containers of one round (the round is over: their results are useless)."""
+        with self._warm_lock:
+            for key in [k for k in self._warm if k[0] == round_id]:
+                self._warm.pop(key).stop()
         tag = Round.tag_of(round_id)
+        if self.runtime != "docker":
+            from evaluator.sandbox import kill_prefix
+            return kill_prefix(f"{self.container_prefix}-{tag}-")
         ids = subprocess.run(["docker", "ps", "-q", "--filter", f"name={self.container_prefix}-{tag}-"],
                              capture_output=True, text=True).stdout.split()
         if ids:
             subprocess.run(["docker", "kill", *ids], capture_output=True)
         return len(ids)
 
-    def _docker(self, cmd: list) -> subprocess.CompletedProcess:
-        """Run a GATK container; on timeout also kill the container (killing the docker client leaves it running)."""
+    def _docker(self, cmd: list, warm_dir: Optional[Path] = None, warm_main: Optional[tuple] = None) -> subprocess.CompletedProcess:
+        """Run a GATK container; on timeout also kill the container (killing the docker client leaves it running).
+
+        warm_dir set: the process stays up after the traversal when it writes ready=ok, so a later genotyping
+        variant can be submitted to it. A ready of "no", or a process that exits, is an ordinary run.
+        """
+        name = cmd[cmd.index("--name") + 1]
+        if warm_dir is None:
+            try:
+                if self.runtime == "docker":
+                    return subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout_s)
+                from evaluator.sandbox import run as sandbox_run
+                return sandbox_run(cmd, timeout=self.timeout_s)
+            except subprocess.TimeoutExpired:
+                self._kill(name)
+                return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {self.timeout_s}s")
+        log_file = open(warm_dir / "jvm.log", "w")
+        if self.runtime == "docker":
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        else:
+            from evaluator.sandbox import start as sandbox_start
+            proc = sandbox_start(cmd, stdout=log_file)
+        state = self._wait_ready(proc, warm_dir)
+        if state == "ok" and warm_main is not None:
+            round, config, fidelity = warm_main
+            session = _WarmSession(proc, log_file, warm_dir, config, self.timeout_s)
+            with self._warm_lock:
+                self._warm_reserved = max(0, self._warm_reserved - 1)
+                old = self._warm.get((round.round_id, self.branch_key(config, fidelity)))
+                self._warm[(round.round_id, self.branch_key(config, fidelity))] = session
+            if old is not None:
+                old.stop()
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with self._warm_lock:
+            self._warm_reserved = max(0, self._warm_reserved - 1)
+        if proc.poll() is None:
+            (warm_dir / "stop").write_text("1\n")
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self._kill(name, proc)
+        log_file.close()
+        rc = proc.returncode if proc.returncode is not None else 1
+        err = ""
         try:
-            return subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout_s)
-        except subprocess.TimeoutExpired:
-            subprocess.run(["docker", "kill", cmd[cmd.index("--name") + 1]], capture_output=True)
-            return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {self.timeout_s}s")
+            err = (warm_dir / "jvm.log").read_text()[-2000:]
+        except OSError:
+            pass
+        if self.runtime != "docker":
+            from evaluator.sandbox import release
+            release(proc)
+        return subprocess.CompletedProcess(cmd, rc, "", err)
+
+    def _wait_ready(self, proc: subprocess.Popen, warm_dir: Path) -> str:
+        ready = warm_dir / "ready"
+        deadline = time.time() + self.timeout_s
+        while time.time() < deadline:
+            if ready.exists():
+                return ready.read_text().strip().split()[0] if ready.read_text().strip() else "no"
+            if proc.poll() is not None:
+                return "exited"
+            time.sleep(0.05)
+        self._kill(None, proc)
+        return "timeout"
+
+    def _kill(self, name: Optional[str], proc=None) -> None:
+        killer = getattr(proc, "minos_kill", None)
+        if killer:
+            killer()
+            return
+        if name:
+            if self.runtime == "docker":
+                subprocess.run(["docker", "kill", name], capture_output=True)
+            else:
+                from evaluator.sandbox import kill_name
+                kill_name(name)
+
+    def _release_warm_reservation(self, warm_dir: Optional[Path]) -> None:
+        """command() failed before the container started: give the reserved slot back."""
+        if warm_dir is None:
+            return
+        with self._warm_lock:
+            self._warm_reserved = max(0, self._warm_reserved - 1)
+
+    def _reserve_warm(self, parent: Path, config: Config, fidelity: str) -> Optional[Path]:
+        """A directory for a warm session, or None when this run should exit as usual."""
+        if self.patch_jar is None or self.branch_key(config, fidelity) is None:
+            return None
+        with self._warm_lock:
+            alive = sum(1 for s in self._warm.values() if s.proc.poll() is None)
+            if alive + self._warm_reserved >= MAX_WARM:
+                return None
+            self._warm_reserved += 1
+        directory = parent / f"warm_{uuid.uuid4().hex[:10]}"
+        directory.mkdir(parents=True)
+        return directory
 
     def _out(self, round: Round, config: Config, fidelity: str) -> Path:
         fid = "full" if fidelity == FULL else hashlib.sha1(fidelity.encode()).hexdigest()[:8]
@@ -221,8 +378,15 @@ class GatkRunner:
         if config.tool != "gatk":
             raise ValueError(f"GatkRunner cannot run {config.tool!r}")
         out = self._out(round, config, fidelity)
+        warm_dir = self._reserve_warm(out.parent, config, fidelity)
+        props = {"minos.warm.dir": f"/data/output/{warm_dir.name}"} if warm_dir else None
         t0 = time.time()
-        p = self._docker(self.command(round, config, fidelity, out))
+        try:
+            p = self._docker(self.command(round, config, fidelity, out, jvm_props=props),
+                             warm_dir=warm_dir, warm_main=(round, config, fidelity) if warm_dir else None)
+        except Exception:
+            self._release_warm_reservation(warm_dir)
+            raise
         dt = time.time() - t0
         if p.returncode != 0 or not out.exists():
             return CallSet(round.round_id, config.key, "", "", dt, ok=False,
@@ -264,10 +428,18 @@ class GatkRunner:
         outs = [self._out(round, c, fidelity) for c in configs[1:]]
         spec = main.parent / f"variants_{uuid.uuid4().hex[:10]}.tsv"
         spec.write_text("".join(variant_line(c, f"/data/output/{o.name}") for c, o in zip(configs[1:], outs)))
+        warm_dir = self._reserve_warm(main.parent, configs[0], fidelity)
+        props = {"minos.gt.variants": f"/data/output/{spec.name}"}
+        if warm_dir is not None:
+            props["minos.warm.dir"] = f"/data/output/{warm_dir.name}"
         t0 = time.time()
         try:
-            p = self._docker(self.command(round, configs[0], fidelity, main,
-                                          jvm_props={"minos.gt.variants": f"/data/output/{spec.name}"}))
+            try:
+                p = self._docker(self.command(round, configs[0], fidelity, main, jvm_props=props),
+                                 warm_dir=warm_dir, warm_main=(round, configs[0], fidelity) if warm_dir else None)
+            except Exception:
+                self._release_warm_reservation(warm_dir)
+                raise
         finally:
             spec.unlink(missing_ok=True)
         dt = time.time() - t0
@@ -276,24 +448,66 @@ class GatkRunner:
             return [CallSet(round.round_id, c.key, "", "", dt, ok=False, error=err, fidelity=fidelity) for c in configs]
         out = [CallSet(round.round_id, configs[0].key, str(main), records_digest(main), dt, fidelity=fidelity)]
         for c, o in zip(configs[1:], outs):
-            status = Path(str(o) + ".minos")
-            state = status.read_text().strip() if status.exists() else "missing"
-            status.unlink(missing_ok=True)
-            if state == "exact" and o.exists():
-                out.append(CallSet(round.round_id, c.key, str(o), records_digest(o), dt, fidelity=fidelity))
-            elif state == "diverged" and o.exists() and Path(str(o) + ".minos.regions").exists():
-                # kept for repair(): the batch output is right everywhere except near deep spots
-                kept = o.with_name(o.name.replace(".vcf.gz", ".batch.vcf.gz"))
-                o.rename(kept)
-                Path(str(o) + ".minos.regions").rename(str(kept) + ".minos.regions")
-                Path(str(o) + ".tbi").unlink(missing_ok=True)
-                out.append(CallSet(round.round_id, c.key, str(kept), "", dt, ok=False, error=DIVERGED, fidelity=fidelity))
-            else:
-                o.unlink(missing_ok=True)
-                out.append(CallSet(round.round_id, c.key, "", "", dt, ok=False,
-                                   error=DIVERGED if state == "diverged" else f"variant status {state}",
-                                   fidelity=fidelity))
+            out.append(self._adopt_variant(round.round_id, c, o, dt, fidelity))
         return out
+
+    def _genotyping_only(self, main: Config, variant: Config, fidelity: str) -> bool:
+        """True when variant can be genotyped from main's stored likelihoods."""
+        cost = self.variant_cost(main, variant, fidelity)
+        return cost is not None and cost <= VARIANT_COST["genotyping"]
+
+    def _adopt_variant(self, round_id: str, config: Config, out: Path, dt: float, fidelity: str) -> CallSet:
+        """Turn a variant's sidecar status into a CallSet. Diverged output is kept for repair()."""
+        status = Path(str(out) + ".minos")
+        state = status.read_text().strip() if status.exists() else "missing"
+        status.unlink(missing_ok=True)
+        if state == "exact" and out.exists():
+            return CallSet(round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
+        if state == "diverged" and out.exists() and Path(str(out) + ".minos.regions").exists():
+            kept = out.with_name(out.name.replace(".vcf.gz", ".batch.vcf.gz"))
+            out.rename(kept)
+            Path(str(out) + ".minos.regions").rename(str(kept) + ".minos.regions")
+            Path(str(out) + ".tbi").unlink(missing_ok=True)
+            return CallSet(round_id, config.key, str(kept), "", dt, ok=False, error=DIVERGED, fidelity=fidelity)
+        out.unlink(missing_ok=True)
+        return CallSet(round_id, config.key, "", "", dt, ok=False,
+                       error=DIVERGED if state == "diverged" else f"variant status {state}", fidelity=fidelity)
+
+    def warm_ready(self, round: Round, config: Config, fidelity: str = FULL) -> bool:
+        """True when a live JVM has this family's likelihoods and config only changes genotyping."""
+        key = self.branch_key(config, fidelity)
+        if key is None:
+            return False
+        with self._warm_lock:
+            session = self._warm.get((round.round_id, key))
+        if session is None or session.proc.poll() is not None:
+            return False
+        return self._genotyping_only(session.main, config, fidelity)
+
+    def warm_submit(self, round: Round, config: Config, fidelity: str = FULL) -> Optional[CallSet]:
+        """Genotype config inside the JVM that already walked this family. None = run it from scratch."""
+        key = self.branch_key(config, fidelity)
+        if key is None:
+            return None
+        with self._warm_lock:
+            session = self._warm.get((round.round_id, key))
+        if session is None or session.proc.poll() is not None:
+            with self._warm_lock:
+                self._warm.pop((round.round_id, key), None)
+            return None
+        if not self._genotyping_only(session.main, config, fidelity):
+            return None
+        out = self._out(round, config, fidelity)
+        t0 = time.time()
+        state = session.request(variant_line(config, f"/data/output/{out.name}"))
+        dt = time.time() - t0
+        if state not in ("exact", "diverged"):
+            log.info("warm JVM refused %s (%s); running it on its own", config.key, state)
+            return None
+        cs = self._adopt_variant(round.round_id, config, out, dt, fidelity)
+        if cs.error and cs.error != DIVERGED:
+            return None
+        return cs
 
     def repair(self, round: Round, config: Config, diverged: CallSet, fidelity: str = FULL) -> CallSet:
         """Exact callset for a diverged batch variant, from its batch output plus a repair run.
@@ -338,11 +552,15 @@ class HappyScorer:
     """
 
     def __init__(self, work_dir: Optional[str] = None):
+        # Accepted so a caller can pass a score directory. hap.py writes beside the query VCF
+        # (upstream score_vcf); this path is not an output directory and is not read.
         self.work_dir = Path(work_dir or os.path.join(SETTINGS.cache_dir, "happy"))
 
     def score(self, callset: CallSet, answer_set: AnswerSet) -> ScoreResult:
         from evaluator import truth_slices
+        from evaluator.sandbox import install_scoring_shim
         from utils.scoring import HappyScorer as UpstreamHappy, difficulty_class_counts, parse_happy_vcf
+        install_scoring_shim()                  # hap.py and bcftools: the image files, no container, when sandbox is on
         truth_slices.install()                 # the truth is sliced once per round, not on every hap.py run
         truth = answer_set.notes.get("truth_vcf")
         mutations = answer_set.notes.get("mutations_vcf")
@@ -351,6 +569,10 @@ class HappyScorer:
         if not (truth and mutations and region and reference):
             raise NotImplementedError("HappyScorer needs truth/mutations VCFs, region and reference in answer_set.notes "
                                       "(writing them from reconstructed records is not implemented yet)")
+        n_targets = answer_set.n_targets
+        if n_targets is None or n_targets < 1:
+            raise ValueError("HappyScorer needs a positive answer_set.n_targets "
+                             "(the fp_per_target denominator); refusing to invent one")
         chrom = region.split(":")[0]
         sdf = str(Path(reference).parent / f"{chrom}.sdf")
         m = UpstreamHappy().score_vcf(truth_vcf=truth, query_vcf=callset.vcf, reference_fasta=reference,
@@ -360,7 +582,6 @@ class HappyScorer:
         recs = parse_happy_vcf(m["happy_vcf_path"], truth_vcf_path=truth)
         cc = difficulty_class_counts(recs)
         ratios = {k: m[k] for k in ("titv_truth_snp", "titv_query_snp", "hethom_truth_snp", "hethom_query_snp") if k in m}
-        n_targets = answer_set.n_targets or 1
         result = ScoreResult(callset.round_id, callset.config_key, answer_set.version,
                              {k: ClassCounts(**cc[k]) for k in CLASSES}, int(m.get("region_fp_total", 0)), n_targets,
                              ratios, fidelity=callset.fidelity, job_id=callset.job_id)

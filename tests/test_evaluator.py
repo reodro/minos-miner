@@ -73,7 +73,7 @@ class VariantFileTest(unittest.TestCase):
         self.assertEqual(f[0], "/data/output/v.vcf.gz")
         self.assertEqual(f[1:5], ["30.0", "0.000125", "6", "0.0"])
         self.assertEqual(f[5:9], ["18", "CONSERVATIVE", "10", "45"])
-        self.assertEqual(f[9:15], ["3", "4", "true", "128", "0.001", "2.302585"])
+        self.assertEqual(f[9:15], ["3", "4", "true", "128", "0.001", "2.302585092994046"])
         self.assertEqual(f[15:18], ["0.002", "50", "450"])
 
     def test_activity_params_batch_together_but_padding_does_not(self):
@@ -129,6 +129,30 @@ class SpliceRepairTest(unittest.TestCase):
                 body = [l.split("\t")[1] + ":" + l.split("\t")[7].strip() for l in f if not l.startswith("#")]
             self.assertEqual(body, ["15:batch", "160:repair", "420:batch"])
             self.assertTrue((d / "out.vcf.gz.tbi").exists())
+
+    def test_overlapping_regions_are_refused(self):
+        import tempfile
+        from evaluator.gatk import splice_repair
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "regions").write_text("chr1:1-200|a\t0\t0\t0\t0\nchr1:150-300|b\t0\t0\t0\t0\n")
+            with self.assertRaises(ValueError):
+                splice_repair(d / "b.vcf.gz", d / "regions", d / "r.vcf.gz", d / "repair.log", d / "out.vcf.gz")
+            (d / "regions").write_text("chr1:1-100|a\t0\t0\t0\t0\nchr1:100-200|b\t0\t0\t0\t0\n")
+            with self.assertRaises(ValueError):
+                splice_repair(d / "b.vcf.gz", d / "regions", d / "r.vcf.gz", d / "repair.log", d / "out.vcf.gz")
+
+
+class HappyScorerNTest(unittest.TestCase):
+    def test_refuses_to_invent_n(self):
+        from common.types import AnswerSet, CallSet, Regime
+        from evaluator.gatk import HappyScorer
+        cs = CallSet("r", "k", "x.vcf.gz", "d", 1.0)
+        notes = {"truth_vcf": "t", "mutations_vcf": "m", "region": "chr1:1-2", "reference": "ref.fa"}
+        for n in (None, 0):
+            a = AnswerSet("r", 1, Regime.KG, "S", [], [], n, notes=notes)
+            with self.assertRaises(ValueError):
+                HappyScorer().score(cs, a)
 
 
 class GvcfNotBatchedTest(unittest.TestCase):

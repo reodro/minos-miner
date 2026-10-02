@@ -300,6 +300,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         defaultGenotypingEngine = new HaplotypeCallerGenotypingEngine(hcArgs, samplesList, ! hcArgs.doNotRunPhysicalPhasing, hcArgs.applyBQD);
         defaultGenotypingEngine.setAnnotationEngine(annotationEngine);
         minosInitGenotypingVariants();
+        minosInitWarm();
         minosInitRepair();
 
         // Create other custom genotyping engines if user provided ploidyRegions
@@ -587,6 +588,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         return vcfHeader;
     }
 
+    private SAMSequenceDictionary minosSequenceDictionary;
+    private Set<VCFHeaderLine> minosDefaultHeaderLines;
+
     /**
      * Writes an appropriate VCF header, given our arguments, to the provided writer
      *
@@ -595,6 +599,8 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
     public void writeHeader( final VariantContextWriter vcfWriter, final SAMSequenceDictionary sequenceDictionary,
                              final Set<VCFHeaderLine>  defaultToolHeaderLines) {
         Utils.nonNull(vcfWriter);
+        minosSequenceDictionary = sequenceDictionary;
+        minosDefaultHeaderLines = defaultToolHeaderLines;
         vcfWriter.writeHeader(makeVCFHeader(sequenceDictionary, defaultToolHeaderLines));
         for (final MinosGenotypingVariant v : minosGenotypingVariants) {
             v.writer = GATKVariantContextUtils.createVCFWriter(Paths.get(v.output), sequenceDictionary, false,
@@ -742,6 +748,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
     public List<VariantContext> callRegion(final AssemblyRegion region, final FeatureContext features, final ReferenceContext referenceContext) {
         if (minosRepairLog != null) {
             return minosRepairRegion(region, features, referenceContext);
+        }
+        if (minosWarmDir != null) {
+            minosWarmKey = minosRegionKey(region);
         }
         if (minosGenotypingVariants.isEmpty()) {
             return minosCallRegion(region, features, referenceContext);
@@ -1069,6 +1078,11 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
             }
         }
         minosAfterGenotyping();
+        if (minosWarmActive) {
+            minosWarmCapture(subsettedReadLikelihoodsFinal, perSampleFilteredReadList,
+                    assemblyResult.getFullReferenceWithPadding(), assemblyResult.getPaddedReferenceLoc(),
+                    regionForGenotyping.getSpan(), features, givenAlleles, readsHeader, suspiciousLocations);
+        }
 
         if ( haplotypeBAMWriter.isPresent() ) {
             final Set<Haplotype> calledHaplotypeSet = new HashSet<>(calledHaplotypes.getCalledHaplotypes());
@@ -1185,6 +1199,10 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
      */
     public void shutdown() {
         minosSyncRandom();
+        if (minosWarmActive) {
+            minosTrailingRandom = minosLastRandom;
+            minosTrailingWell = minosLastWell;
+        }
         if (minosRepairOut != null) {
             minosRepairOut.close();
         }
@@ -1202,6 +1220,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
                 throw new UserException("cannot write status for " + v.output, e);
             }
         }
+        minosWarmServe();
         likelihoodCalculationEngine.close();
         if (pdhmmLikelihoodCalculationEngine != null) pdhmmLikelihoodCalculationEngine.close();
         aligner.close();
@@ -1287,11 +1306,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         final HaplotypeCallerArgumentCollection args;
         double[] activity = null;            // {threshold, min size, max size}; null = the main config's
         int stream = -1;                     // activity stream, -1 = the main config's regions
-        final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng =
-                Utils.minosGlobalRandom().copyState();   // same state as the global at start, like a fresh run
-        final org.broadinstitute.hellbender.utils.MinosRecordingWell well = Utils.minosGlobalWell().copyState();
-        final org.apache.commons.math3.random.RandomDataGenerator rdg =
-                new org.apache.commons.math3.random.RandomDataGenerator(well);
+        final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng;
+        final org.broadinstitute.hellbender.utils.MinosRecordingWell well;
+        final org.apache.commons.math3.random.RandomDataGenerator rdg;
         VariantContextWriter writer;
         boolean diverged = false;
         final List<String> regionLog = new ArrayList<>();
@@ -1304,11 +1321,23 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
 
         MinosGenotypingVariant(final String output, final HaplotypeCallerGenotypingEngine engine, final String likelihoodKey,
                                final String assemblyKey, final HaplotypeCallerArgumentCollection args) {
+            this(output, engine, likelihoodKey, assemblyKey, args,
+                    Utils.minosGlobalRandom().copyState(), Utils.minosGlobalWell().copyState());
+        }
+
+        /** rng/well are the generator state at the start of the run, the same copy a variant built during init gets. */
+        MinosGenotypingVariant(final String output, final HaplotypeCallerGenotypingEngine engine, final String likelihoodKey,
+                               final String assemblyKey, final HaplotypeCallerArgumentCollection args,
+                               final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng,
+                               final org.broadinstitute.hellbender.utils.MinosRecordingWell well) {
             this.args = args;
             this.output = output;
             this.engine = engine;
             this.likelihoodKey = likelihoodKey;
             this.assemblyKey = assemblyKey;
+            this.rng = rng;
+            this.well = well;
+            this.rdg = new org.apache.commons.math3.random.RandomDataGenerator(well);
         }
     }
 
@@ -1406,6 +1435,8 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         }
         final List<int[]> draws = Utils.minosGlobalRandom().takeDraws();
         final List<int[]> wellDraws = Utils.minosGlobalWell().takeDraws();
+        minosLastRandom = draws;
+        minosLastWell = wellDraws;
         for (final MinosGenotypingVariant v : minosGenotypingVariants) {
             for (final int[] d : draws) {
                 if (!v.rng.replay(d)) {
@@ -1421,18 +1452,20 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
     }
 
     private void minosBeforeGenotyping() {
-        if (!minosGenotypingVariants.isEmpty()) {
-            minosSyncRandom();
-            Utils.minosGlobalRandom().setRecording(false);   // the main config's own genotyping draws are not shared
-            Utils.minosGlobalWell().setRecording(false);
+        if (minosGenotypingVariants.isEmpty() && !minosWarmActive) {
+            return;
         }
+        minosSyncRandom();
+        Utils.minosGlobalRandom().setRecording(false);   // the main config's own genotyping draws are not shared
+        Utils.minosGlobalWell().setRecording(false);
     }
 
     private void minosAfterGenotyping() {
-        if (!minosGenotypingVariants.isEmpty()) {
-            Utils.minosGlobalRandom().setRecording(true);
-            Utils.minosGlobalWell().setRecording(true);
+        if (minosGenotypingVariants.isEmpty() && !minosWarmActive) {
+            return;
         }
+        Utils.minosGlobalRandom().setRecording(true);
+        Utils.minosGlobalWell().setRecording(true);
     }
 
     /**
@@ -1862,5 +1895,226 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         }
         return region.getSpan().getContig() + ":" + region.getSpan().getStart() + "-" + region.getSpan().getEnd() + "|"
                 + region.isActive() + "|" + region.getReads().size() + "|" + Long.toHexString(h);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // minos warm JVM: after the traversal, stay up and genotype later variants of this same run.
+    // Only genotyping parameters may change. The stored likelihoods are the ones an in-batch variant would
+    // have genotyped; a variant whose read-pass draws would differ is flagged diverged, same as a batch.
+    // -Dminos.warm.dir=<dir written by the runner>. Ready file "ok" or "no". Requests are req-00001.tsv.
+    // ---------------------------------------------------------------------------------------------------------------
+    private java.nio.file.Path minosWarmDir;
+    private boolean minosWarmActive;
+    private String minosWarmKey;
+    private org.broadinstitute.hellbender.utils.MinosRecordingRandom minosWarmBaseRandom;
+    private org.broadinstitute.hellbender.utils.MinosRecordingWell minosWarmBaseWell;
+    private List<int[]> minosLastRandom = java.util.Collections.emptyList();
+    private List<int[]> minosLastWell = java.util.Collections.emptyList();
+    private List<int[]> minosTrailingRandom = java.util.Collections.emptyList();
+    private List<int[]> minosTrailingWell = java.util.Collections.emptyList();
+    private final List<WarmRegion> minosWarmRegions = new ArrayList<>();
+    private static final int MINOS_WARM_MAX_REGIONS = 200_000;   // one chr18 round is ~64k regions; the heap guard is the real limit
+    private static final long MINOS_WARM_MIN_FREE = 256L * 1024 * 1024;
+    private static final long MINOS_WARM_IDLE_MS = 15 * 60 * 1000L;
+
+    private static final class WarmRegion {
+        String key;
+        List<int[]> randomDraws;
+        List<int[]> wellDraws;
+        AlleleLikelihoods<GATKRead, Haplotype> likelihoods;
+        Map<String, List<GATKRead>> filteredReads;
+        byte[] fullRef;
+        SimpleInterval paddedLoc;
+        SimpleInterval span;
+        FeatureContext features;
+        List<Event> givenAlleles;
+        SAMFileHeader readsHeader;
+        Set<Integer> suspicious;
+    }
+
+    private void minosInitWarm() {
+        final String dir = System.getProperty("minos.warm.dir");
+        if (dir == null) {
+            return;
+        }
+        minosWarmDir = java.nio.file.Paths.get(dir);
+        if (!allCustomPloidies.isEmpty() || emitReferenceConfidence() || hcArgs.pileupDetectionArgs.generatePDHaplotypes
+                || hcArgs.stepwiseFiltering || hcArgs.filterAlleles || hcArgs.dontGenotype
+                || hcArgs.pileupDetectionArgs.usePileupDetection || assemblyDebugOutStream != null
+                || hcArgs.justDetermineActiveRegions || hcArgs.sampleNameToUse != null
+                || hcArgs.likelihoodArgs.likelihoodEngineImplementation != ReadLikelihoodCalculationEngine.Implementation.PairHMM) {
+            return;   // active stays false; shutdown writes "no" and exits
+        }
+        minosWarmActive = true;
+        AssemblyRegionIterator.minosHook = this;   // records the main activity settings; adds no stream when none differ
+        minosWarmBaseRandom = Utils.minosGlobalRandom().copyState();
+        minosWarmBaseWell = Utils.minosGlobalWell().copyState();
+        Utils.minosGlobalRandom().setRecording(true);
+        Utils.minosGlobalWell().setRecording(true);
+    }
+
+    private void minosWarmCapture(final AlleleLikelihoods<GATKRead, Haplotype> likelihoods,
+                                  final Map<String, List<GATKRead>> filteredReads, final byte[] fullRef,
+                                  final SimpleInterval paddedLoc, final SimpleInterval span, final FeatureContext features,
+                                  final List<Event> givenAlleles, final SAMFileHeader readsHeader,
+                                  final Set<Integer> suspicious) {
+        if (!minosWarmActive) {
+            return;
+        }
+        final long free = Runtime.getRuntime().maxMemory() - Runtime.getRuntime().totalMemory()
+                + Runtime.getRuntime().freeMemory();
+        if (minosWarmRegions.size() >= MINOS_WARM_MAX_REGIONS || free < MINOS_WARM_MIN_FREE) {
+            logger.warn("minos warm: dropping snapshots at " + minosWarmRegions.size()
+                    + " regions, " + (free / (1024 * 1024)) + " MiB free");
+            minosWarmActive = false;
+            minosWarmRegions.clear();
+            return;
+        }
+        final WarmRegion region = new WarmRegion();
+        region.key = minosWarmKey;
+        region.randomDraws = minosLastRandom;
+        region.wellDraws = minosLastWell;
+        region.likelihoods = likelihoods;
+        region.filteredReads = filteredReads;
+        region.fullRef = fullRef == null ? null : fullRef.clone();
+        region.paddedLoc = paddedLoc;
+        region.span = span;
+        region.features = features;
+        region.givenAlleles = givenAlleles;
+        region.readsHeader = readsHeader;
+        region.suspicious = new HashSet<>(suspicious);
+        minosWarmRegions.add(region);
+    }
+
+    private void minosWarmServe() {
+        if (minosWarmDir == null) {
+            return;
+        }
+        try {
+            Files.createDirectories(minosWarmDir);
+            if (!minosWarmActive || minosWarmRegions.isEmpty() || minosSequenceDictionary == null) {
+                logger.info("minos warm: not keeping this JVM, regions=" + minosWarmRegions.size());
+                Files.writeString(minosWarmDir.resolve("ready"), "no\n");
+                return;
+            }
+            logger.info("minos warm: keeping " + minosWarmRegions.size() + " regions");
+            Files.writeString(minosWarmDir.resolve("ready"), "ok\n");
+            minosWarmLastRequest = System.currentTimeMillis();
+            for (int n = 1; ; n++) {
+                final java.nio.file.Path req = minosWarmDir.resolve(String.format("req-%05d.tsv", n));
+                while (!Files.exists(req)) {
+                    if (Files.exists(minosWarmDir.resolve("stop"))) {
+                        return;
+                    }
+                    if (minosWarmIdle(n)) {
+                        return;
+                    }
+                    Thread.sleep(20);
+                }
+                final String line = Files.readString(req).trim();
+                if (line.equals("BYE")) {
+                    Files.writeString(minosWarmDir.resolve(String.format("req-%05d.done", n)), "bye\n");
+                    return;
+                }
+                minosWarmOne(n, line);
+            }
+        } catch (final Exception e) {
+            logger.warn("minos warm session ended: " + e.getMessage());
+            try {
+                Files.writeString(minosWarmDir.resolve("ready"), "no\n");
+            } catch (final IOException ignored) {
+                // the runner treats a dead process as a cold run
+            }
+        }
+    }
+
+    private long minosWarmLastRequest = System.currentTimeMillis();
+
+    private boolean minosWarmIdle(final int n) {
+        return System.currentTimeMillis() - minosWarmLastRequest > MINOS_WARM_IDLE_MS;
+    }
+
+    private void minosWarmOne(final int n, final String line) throws IOException {
+        minosWarmLastRequest = System.currentTimeMillis();
+        final java.nio.file.Path done = minosWarmDir.resolve(String.format("req-%05d.done", n));
+        final String[] f = line.split("\t");
+        if (f.length < 18) {
+            Files.writeString(done, "refused\n");
+            return;
+        }
+        final String mainPair = hcArgs.likelihoodArgs.BASE_QUALITY_SCORE_THRESHOLD + "|" + hcArgs.likelihoodArgs.pcrErrorModel
+                + "|" + hcArgs.likelihoodArgs.gcpHMM + "|" + hcArgs.likelihoodArgs.phredScaledGlobalReadMismappingRate;
+        final String pair = f[5] + "|" + f[6] + "|" + f[7] + "|" + f[8];
+        final HaplotypeCallerArgumentCollection probe = minosCloneArgs(hcArgs);
+        probe.assemblerArgs.minPruneFactor = Integer.parseInt(f[9]);
+        probe.assemblerArgs.minDanglingBranchLength = Integer.parseInt(f[10]);
+        probe.assemblerArgs.recoverAllDanglingBranches = Boolean.parseBoolean(f[11]);
+        probe.assemblerArgs.maxNumHaplotypesInPopulation = Integer.parseInt(f[12]);
+        probe.assemblerArgs.initialErrorRateForPruning = Double.parseDouble(f[13]);
+        probe.assemblerArgs.pruningLogOddsThreshold = Double.parseDouble(f[14]);
+        final double[] wantActivity = {Double.parseDouble(f[15]), Integer.parseInt(f[16]), Integer.parseInt(f[17])};
+        final boolean sameActivity = minosMainActivity != null && Arrays.equals(minosMainActivity, wantActivity);
+        if (!pair.equals(mainPair) || !minosAssemblyKey(probe).equals(minosAssemblyKey(hcArgs)) || !sameActivity) {
+            Files.writeString(done, "refused\n");
+            return;
+        }
+        final HaplotypeCallerArgumentCollection args = minosCloneArgs(hcArgs);
+        args.standardArgs.genotypeArgs.standardConfidenceForCalling = Double.parseDouble(f[1]);
+        args.standardArgs.genotypeArgs.indelHeterozygosity = Double.parseDouble(f[2]);
+        args.standardArgs.genotypeArgs.maxAlternateAlleles = Integer.parseInt(f[3]);
+        args.standardArgs.CONTAMINATION_FRACTION = Double.parseDouble(f[4]);
+        args.standardArgs.setSampleContamination(java.util.Collections.emptyMap());
+        final HaplotypeCallerGenotypingEngine engine =
+                new HaplotypeCallerGenotypingEngine(args, samplesList, !hcArgs.doNotRunPhysicalPhasing, hcArgs.applyBQD);
+        engine.setAnnotationEngine(annotationEngine);
+        final MinosGenotypingVariant variant = new MinosGenotypingVariant(f[0], engine, null, null, args,
+                minosWarmBaseRandom.copyState(), minosWarmBaseWell.copyState());
+        variant.writer = GATKVariantContextUtils.createVCFWriter(java.nio.file.Paths.get(f[0]), minosSequenceDictionary,
+                false, htsjdk.variant.variantcontext.writer.Options.INDEX_ON_THE_FLY);
+        variant.writer.writeHeader(makeVCFHeader(minosSequenceDictionary, minosDefaultHeaderLines));
+        try {
+            for (final WarmRegion region : minosWarmRegions) {
+                final long[] before = new long[]{variant.rng.gaussians(), variant.well.steps()};
+                for (final int[] d : region.randomDraws) {
+                    if (!variant.rng.replay(d)) {
+                        variant.diverged = true;
+                    }
+                }
+                for (final int[] d : region.wellDraws) {
+                    if (!variant.well.replay(d)) {
+                        variant.diverged = true;
+                    }
+                }
+                Utils.minosSetRandomOverride(variant.rng);
+                Utils.minosSetRandomDataOverride(variant.rdg);
+                try {
+                    engine.assignGenotypeLikelihoods(region.likelihoods.alleles(), region.likelihoods, region.filteredReads,
+                            region.fullRef, region.paddedLoc, region.span, region.features, region.givenAlleles,
+                            false, hcArgs.maxMnpDistance, region.readsHeader, false, region.suspicious, region.likelihoods)
+                            .getCalls().stream().map(RMSMappingQuality.getInstance()::finalizeRawMQ).forEach(variant.writer::add);
+                } finally {
+                    Utils.minosSetRandomOverride(null);
+                    Utils.minosSetRandomDataOverride(null);
+                }
+                variant.logRegion(region.key, before);
+            }
+            for (final int[] d : minosTrailingRandom) {
+                if (!variant.rng.replay(d)) {
+                    variant.diverged = true;
+                }
+            }
+            for (final int[] d : minosTrailingWell) {
+                if (!variant.well.replay(d)) {
+                    variant.diverged = true;
+                }
+            }
+        } finally {
+            variant.writer.close();
+        }
+        if (variant.diverged) {
+            Files.write(java.nio.file.Paths.get(variant.output + ".minos.regions"), variant.regionLog);
+        }
+        Files.writeString(java.nio.file.Paths.get(variant.output + ".minos"), (variant.diverged ? "diverged\n" : "exact\n"));
+        Files.writeString(done, (variant.diverged ? "diverged\n" : "exact\n"));
     }
 }
