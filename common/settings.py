@@ -14,10 +14,10 @@ REPO = Path(__file__).resolve().parents[1]
 @dataclass(frozen=True)
 class Settings:
     """Where things live. Three kinds, never mixed:
-    data_dir    INPUTS, shareable between clones on one machine: reference/, 1kg/, panel/, giab/, rounds/,
-                truths/ (released truth + mutations VCFs of rounds whose BAM was never stored)
-    cache_dir   rebuildable caches of THIS clone (git-ignored, never synced to nodes): callsets/, results/, parent/,
-                truth_slices/, answer_set/, selftest/ (the fleet self-test's BAM slice)
+    data_dir    INPUTS, shareable between clones on one machine: reference/, 1kg/, giab/, rounds/
+    cache_dir   rebuildable caches of THIS clone (git-ignored, never synced to nodes): callsets/, results/,
+                truth_slices/, dcache/ (scoring decision cache), rootfs/ (unpacked images), fleet/ (a node's rounds),
+                answer_set/, selftest/ (the fleet self-test's BAM slice)
     status_dir  what THIS clone's miner writes for the dashboard and the review (git-ignored, never synced)"""
     data_dir: str = "/minos/data"
     cache_dir: str = str(REPO / "cache")
@@ -32,7 +32,8 @@ class Settings:
 
     @property
     def kg_dir(self) -> str:
-        """1000G data from scripts/fetch_reference_data.sh: raw/, phased/, cram_index/."""
+        """1000G data: phased/ (the phased panel, scripts/fetch_reference_data.sh) and the answer-set builder's
+        gatk_sites/, index/, masks/ (answer_set/k2/util.py)."""
         return os.path.join(self.data_dir, "1kg")
 
     @property
