@@ -199,6 +199,7 @@ class UpstreamPlatform:
         import sys
         sys.path.insert(0, SETTINGS.minos_subnet_dir)
         import bittensor as bt  # noqa: F401 - imported here so the rest of the project runs without it
+        import utils.bt_compat  # noqa: F401 - like upstream's miner: bt.wallet / bt.subtensor on SDK 10.x, SDK check
         from utils.platform_client import MinerPlatformClient, PlatformConfig
         self.bt = bt
         self.wallet = bt.wallet(name=wallet_name, hotkey=hotkey)

@@ -21,7 +21,10 @@ Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatfor
 4. Scoring (one upstream hap.py run per config) runs in a background thread, so GATK workers stay fed while
    hap.py runs (with a
    fleet, the nodes score).
-5. Round end: after the final submission the executor ends the round (`end_round`): its queued jobs are dropped and
+5. Last minutes: at round start main tells the executor when the final submission happens
+   (`set_finish_by(deadline - stop_before_deadline_s - score_margin_s)`), so it starts no GATK work that could not be
+   scored by then.
+6. Round end: after the final submission the executor ends the round (`end_round`): its queued jobs are dropped and
    its running GATK containers killed, locally or on every fleet node, so the next round starts with every worker free.
 
 ## Status and post-round review (`main.status`, `main.review`)

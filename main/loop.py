@@ -27,6 +27,7 @@ class LoopSettings:
                                         # a better config found meanwhile is submitted when the interval ends
                                         # and, at the latest, just before the loop stops
     stop_before_deadline_s: float = 120.0
+    score_margin_s: float = 45.0        # scoring after GATK: work must end this long before the final submission
     max_evals: Optional[int] = None     # budget by count (backtests must match config count, not wall time)
     poll_timeout: float = 1.0
 
@@ -106,6 +107,10 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
 
         await asyncio.gather(baselines_in_order(), *(s(client) for s in strategies))
 
+    # The executor starts no GATK work that could not be scored before the final submission (it would only be killed).
+    finish_by = getattr(executor, "set_finish_by", None)
+    if finish_by and deadline_ts is not None:
+        finish_by(deadline_ts - settings.stop_before_deadline_s - settings.score_margin_s)
     task = asyncio.create_task(search())
     # Live executors: scoring (one hap.py run per callset, seconds each) runs in a worker thread, so the loop keeps
     # polling GATK and strategies keep proposing meanwhile. The virtual executor scores inline (deterministic).
@@ -165,6 +170,8 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         end = getattr(executor, "end_round", None)  # nobody will read this round's results any more: free every
         if end:                                   # worker (queued jobs dropped, running containers killed)
             end(round.round_id)
+        if finish_by:                             # a fleet executor serves the next round too
+            finish_by(None)
         elif client.in_flight:
             executor.cancel(list(client._pending))
         task.cancel()
