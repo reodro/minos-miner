@@ -178,8 +178,106 @@ class K2RobustnessTest(unittest.TestCase):
         self.assertEqual(retry(flaky, 3, 10, sleep=waits.append), ("ok", ["OSError: connection reset"] * 2))
         self.assertEqual(waits, [10, 20])
         with self.assertRaises(RuntimeError) as e:
-            retry(lambda: 1 / 0, 2, 0, sleep=lambda s: None)
-        self.assertIn("failed after 2 attempts: ZeroDivisionError", str(e.exception))
+            retry(lambda: (_ for _ in ()).throw(OSError("down")), 2, 0, sleep=lambda s: None)
+        self.assertIn("failed after 2 attempts: OSError: down", str(e.exception))
+
+    def test_retry_bug_is_not_retried(self):
+        from answer_set.k2.util import retry
+        calls = []
+
+        def bug():
+            calls.append(1)
+            return None < 1                                   # the TypeError readdiff hit on an unmapped read
+        with self.assertRaises(RuntimeError) as e:
+            retry(bug, 3, 10, sleep=lambda s: self.fail("waited before a retry of a bug"))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("a bug, not retried", str(e.exception))
+
+    def test_retry_budget(self):
+        from answer_set.k2.util import retry
+        now, waits = [0.0], []
+
+        def slow():
+            now[0] += 100                                     # every try takes 100 s and fails
+            raise OSError("timeout")
+        with self.assertRaises(RuntimeError) as e:
+            retry(slow, 5, 10, sleep=lambda s: (waits.append(s), now.__setitem__(0, now[0] + s)), budget_s=250,
+                  clock=lambda: now[0])
+        self.assertEqual(waits, [10, 20])                     # tries end at 100, 210, 330; a 30 s wait: past 250
+        self.assertIn("out of time after 3 attempts", str(e.exception))
+
+    def test_bcftools_timeout_removes_container(self):
+        import subprocess
+        from unittest import mock
+        from answer_set.k2 import util
+        calls = []
+
+        def run(args, **kw):
+            calls.append(args)
+            if args[:2] == ["docker", "run"]:
+                raise subprocess.TimeoutExpired(args, kw["timeout"])
+            return subprocess.CompletedProcess(args, 0)
+        with mock.patch.object(util.subprocess, "run", run):
+            with self.assertRaises(RuntimeError) as e:
+                util.bcftools("bcftools view x", [], timeout_s=5)
+        self.assertIn("timed out after 5 s", str(e.exception))
+        name = calls[0][calls[0].index("--name") + 1]
+        self.assertEqual(calls[1], ["docker", "rm", "-f", name])
+
+    def test_original_reads_fetch_is_bounded(self):
+        """A stuck download fails the fetch within its budget instead of blocking the round."""
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from answer_set.k2 import giab_origin
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "HG001.novaseq.pcr-free.50x.dedup.grch38.bam.bai").write_bytes(b"x")
+            now = [0.0]
+
+            def run(args, **kw):
+                now[0] += kw["timeout"]                       # every piece hangs until killed
+                raise subprocess.TimeoutExpired(args, kw["timeout"])
+            with mock.patch.object(giab_origin, "CACHE", Path(d)), \
+                    mock.patch.object(giab_origin.subprocess, "run", run), \
+                    mock.patch.object(giab_origin.time, "monotonic", lambda: now[0]), \
+                    mock.patch.object(giab_origin.time, "sleep", lambda s: now.__setitem__(0, now[0] + s)), \
+                    mock.patch.object(giab_origin.cf, "ThreadPoolExecutor",
+                                      lambda n: __import__("concurrent.futures").futures.ThreadPoolExecutor(1)):
+                with self.assertRaises(RuntimeError):
+                    giab_origin.fetch("HG001", "chr1", 1000, 2000, chunks=2, budget_s=400)
+            self.assertLessEqual(now[0], 400 + giab_origin.PIECE_TIMEOUT_S)
+            self.assertEqual([x.name for x in Path(d).iterdir()], ["HG001.novaseq.pcr-free.50x.dedup.grch38.bam.bai"])
+
+    def test_readdiff_skips_unmapped_reads(self):
+        """An unmapped round read (placed at its mate, no reference_end) that is an exact piece of an original read
+        broke the whole read comparison (TypeError sorting read ends) in 1 of 28 rounds."""
+        import random
+        import tempfile
+        import pysam
+        from answer_set.k2 import readdiff
+        rnd = random.Random(7)
+        seq = "".join(rnd.choice("ACGT") for _ in range(151))
+        header = {"HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"SN": "chr1", "LN": 100000}]}
+
+        def bam(path, reads):
+            with pysam.AlignmentFile(path, "wb", header=header) as o:
+                for name, s, start, unmapped in reads:
+                    r = pysam.AlignedSegment()
+                    r.query_name, r.query_sequence, r.reference_id, r.reference_start = name, s, 0, start
+                    r.query_qualities = pysam.qualitystring_to_array("I" * len(s))
+                    if unmapped:
+                        r.flag = 4
+                    else:
+                        r.cigarstring, r.mapping_quality = f"{len(s)}M", 60
+                    o.write(r)
+            pysam.index(path)
+        with tempfile.TemporaryDirectory() as d:
+            bam(f"{d}/orig.bam", [("o1", seq, 5000, False)])
+            bam(f"{d}/round.bam", [("r1", seq[10:138], 5010, False), ("r2", seq[20:148], 5020, True)])
+            found, stats = readdiff.recover(f"{d}/round.bam", f"{d}/orig.bam", "chr1", 4000, 6000, workers=1)
+        self.assertEqual(found, {})
+        self.assertEqual(stats, {"unedited": 1})
 
     def test_manifest(self):
         import tempfile

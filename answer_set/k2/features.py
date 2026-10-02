@@ -3,6 +3,7 @@ import bisect
 import os
 import shutil
 import tempfile
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -22,6 +23,7 @@ RD_1BP_FACTOR = float(os.environ.get("MINOS_RD1BP", "0.5"))
 # Without it the model sees NaN for every rd_* measurement - still scorable, but weaker (2026-10-01 08:17 on the
 # k2/107 machine: inserted 1-bp indels 94.9% found instead of 96.9%).
 RD_ATTEMPTS, RD_WAIT_S = 3, 10
+RD_BUDGET_S = 900               # the whole read comparison, every try: past it the build goes on without it
 
 FEATURES = [
     "is_indel", "indel_len", "abs_len", "dp", "ref_n", "alt_n", "alt_frac", "alt_frac_ra",
@@ -380,12 +382,14 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
     if mode_giab:
         from answer_set.k2 import giab_origin, localhap, readdiff
 
+        rd_end = time.monotonic() + RD_BUDGET_S
+
         def compare():
-            orig = giab_origin.fetch(mode_donor, chrom, a, b)
+            orig = giab_origin.fetch(mode_donor, chrom, a, b, budget_s=max(0.0, rd_end - time.monotonic()))
             found, stats = readdiff.recover(bam, orig, chrom, a, b, workers=threads)
             return readdiff.normalised(found, chrom, workdir), stats
         try:
-            (rdiff, rd_info), failed = retry(compare, RD_ATTEMPTS, RD_WAIT_S)
+            (rdiff, rd_info), failed = retry(compare, RD_ATTEMPTS, RD_WAIT_S, budget_s=RD_BUDGET_S)
             if failed:
                 rd_info["failed_tries"] = failed
         except RuntimeError as e:               # no originals after every try: the model sees NaN

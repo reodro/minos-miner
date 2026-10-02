@@ -68,11 +68,13 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   `edlib` and `parasail` (requirements.txt). ~1-1.5 min per round on 16 cores.
 - Released rounds (`round.released_dir` set) use the leave-out fold model that never saw the round.
 - 1000G rounds: nothing is flagged `SYNTHETIC`, so every record is `germline` (the score uses all records).
-- Never silently weaker: the GIAB read comparison (Google originals) is tried 3 times; if it still fails the build
-  goes on without it (inserted 1-bp indels ~2 points worse). Inputs are checked against a manifest
-  (`cache/answer_set/k2/inputs.json`: sha256, size, mtime; `python -m answer_set.k2.inputs record|verify [--full]`)
-  - the same model gave different answer sets when the k2/107 machine replaced its HG002 VCF between two runs.
-  Both land in `notes["warnings"]` of the AnswerSet and in the log.
+- Never silently weaker, never stuck: the GIAB read comparison (Google originals) gets up to 3 tries within 900 s
+  (a bug is not retried); if it still fails the build goes on without it (inserted 1-bp indels ~2 points worse).
+  Every download and Docker call has a time limit, because main builds the answer set before it can submit.
+- Inputs are checked against a manifest (`cache/answer_set/k2/inputs.json`: sha256, size, mtime;
+  `python -m answer_set.k2.inputs record|verify [--full]`) - the same model gave different answer sets when the
+  k2/107 machine replaced its HG002 VCF between two runs. A failed read comparison and changed inputs both land in
+  `notes["warnings"]` of the AnswerSet and in the log.
 - g007 (released 2026-10-02): g006's features, trained on 108 GIAB rounds (09-23..10-01 13:05). On 12 held-out
   rounds: F1 median 0.99905 (g006 0.99895, better in 12/12), v2 core +0.011 pts/round. Donor variants 100%; the
   remaining errors are mostly inserted 1-bp indels absent from the reads (validated before downsampling).

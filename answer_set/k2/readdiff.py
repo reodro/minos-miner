@@ -103,14 +103,14 @@ def _window(args):
     ob = pysam.AlignmentFile(str(orig_bam))
     by = defaultdict(list)                                   # (strand, start//50) -> originals
     for p in ob.fetch(chrom, max(0, w0 - 400), w1 + 400):
-        if p.is_secondary or p.is_supplementary or not p.query_sequence:
-            continue
+        if p.is_unmapped or p.is_secondary or p.is_supplementary or not p.query_sequence:
+            continue                              # unmapped: placed at the mate, no alignment to map edits through
         by[(p.is_reverse, p.reference_start // 50)].append(p)
     support, spans, stats = defaultdict(int), [], defaultdict(int)
     origins = defaultdict(set)                                # edit -> original reads it came from
     for r in rb.fetch(chrom, max(0, w0 - 1), w1):
-        if r.is_secondary or r.is_supplementary or not r.query_sequence:
-            continue
+        if r.is_unmapped or r.is_secondary or r.is_supplementary or not r.query_sequence:
+            continue                              # unmapped (placed at the mate, reference_end None): ~40-200 per round
         if not (w0 - 1 <= r.reference_start < w1):
             continue
         q = r.query_sequence

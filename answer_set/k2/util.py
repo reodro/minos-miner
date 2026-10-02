@@ -3,10 +3,10 @@
 Inputs, under SETTINGS.data_dir (shareable between clones):
   reference/<chrom>/<chrom>.fa        reference genome (SETTINGS.reference_fasta)
   giab/<donor>.vcf.gz, <donor>.bed    GIAB NIST v4.2.1 calls and confident region (SETTINGS.giab_dir)
-  1kg/phased/<chrom>.vcf.gz           1000 Genomes phased panel (SETTINGS.kg_dir; shared with answer_set.fingerprint)
+  1kg/phased/<chrom>.vcf.gz           1000 Genomes phased panel (SETTINGS.kg_dir; scripts/fetch_reference_data.sh)
   1kg/index/                          panel lookup index, index_<chrom>.npz (python -m answer_set.k2.kg --index all)
   1kg/gatk_sites/                     1000G raw GATK callset, sites + annotations, <chrom>.sites.vcf.gz (EBI
-                                      20201028_3202_raw_GT_with_annot, the release 1kg/raw/ comes from)
+                                      20201028_3202_raw_GT_with_annot)
   1kg/masks/                          region lists used for 1000G rounds (1000G accessibility masks, GIAB v3.3
                                       stratifications)
 Models: released ones in git (answer_set/k2/models, see tracks.py); trained ones in the cache.
@@ -22,6 +22,7 @@ import bisect
 import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from common.settings import SETTINGS
@@ -29,6 +30,7 @@ from common.settings import SETTINGS
 KG_DIR = Path(SETTINGS.kg_dir)
 CACHE = Path(SETTINGS.cache_dir) / "answer_set" / "k2"
 BCFTOOLS_IMG = "quay.io/biocontainers/bcftools:1.20--h8b25389_0"    # the image the validator's scoring uses
+BCFTOOLS_TIMEOUT_S = 900       # one bcftools call; a whole GIAB build takes ~1 min, its longest call less
 DONORS = ["HG001", "HG002", "HG003", "HG004", "HG005", "HG006", "HG007"]
 
 
@@ -44,16 +46,28 @@ def donor_bed(d):
     return Path(SETTINGS.giab_dir) / f"{d}.bed"
 
 
-def retry(fn, attempts, wait_s, sleep=time.sleep):
+# A bug gives the same answer on every try: not retried. Everything else (network, Docker, partial downloads,
+# timeouts) is worth another try.
+PERMANENT_ERRORS = (TypeError, AttributeError, NameError, KeyError, IndexError, ZeroDivisionError, AssertionError,
+                    NotImplementedError)
+
+
+def retry(fn, attempts, wait_s, sleep=time.sleep, budget_s=None, clock=time.monotonic):
     """fn() up to `attempts` times, waiting wait_s x attempt number between tries. Returns (result, messages of the
-    failed tries); if every try fails, raises RuntimeError listing them all."""
-    errors = []
+    failed tries); if every try fails, raises RuntimeError listing them all. A permanent error (a bug) fails at
+    once; with budget_s, no new try starts when the wait would end past budget_s from the first try."""
+    errors, end = [], None if budget_s is None else clock() + budget_s
     for i in range(attempts):
         try:
             return fn(), errors
-        except Exception as e:  # noqa: BLE001  (network, Docker, partial downloads: all worth another try)
+        except PERMANENT_ERRORS as e:
+            errors.append(f"{type(e).__name__}: {str(e)[:300]}")
+            raise RuntimeError("failed (a bug, not retried): " + " | ".join(errors)) from e
+        except Exception as e:  # noqa: BLE001
             errors.append(f"{type(e).__name__}: {str(e)[:300]}")
             if i + 1 < attempts:
+                if end is not None and clock() + wait_s * (i + 1) >= end:
+                    raise RuntimeError(f"failed, out of time after {i + 1} attempts: " + " | ".join(errors)) from e
                 sleep(wait_s * (i + 1))
     raise RuntimeError(f"failed after {attempts} attempts: " + " | ".join(errors))
 
@@ -64,13 +78,22 @@ def parse_region(region):
     return chrom, int(a), int(b)
 
 
-def bcftools(cmd, mounts):
-    """Run a bcftools shell pipeline in Docker. mounts: [(host_dir, container_dir), ...]."""
-    args = ["docker", "run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}"]
+def bcftools(cmd, mounts, timeout_s=BCFTOOLS_TIMEOUT_S):
+    """Run a bcftools shell pipeline in Docker. mounts: [(host_dir, container_dir), ...]. Past timeout_s the
+    container is removed and RuntimeError raised (killing only the docker client would leave it running)."""
+    name = f"k2-bcftools-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    args = ["docker", "run", "--rm", "--name", name, "-u", f"{os.getuid()}:{os.getgid()}"]
     for host, cont in mounts:
         args += ["-v", f"{host}:{cont}"]
     args += [BCFTOOLS_IMG, "sh", "-c", cmd]
-    r = subprocess.run(args, capture_output=True, text=True)
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+        raise RuntimeError(f"bcftools timed out after {timeout_s} s: {cmd[:200]}") from None
     if r.returncode != 0:
         raise RuntimeError(f"bcftools failed: {r.stderr[-2000:]}")
     return r.stdout
