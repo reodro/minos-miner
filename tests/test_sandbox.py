@@ -2,6 +2,7 @@
 import os
 import shutil
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from evaluator.sandbox import DockerSpec, command_for, parse_docker_run, start_in
@@ -129,3 +130,28 @@ class RunTest(unittest.TestCase):
             self.assertIsNotNone(running.poll())
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+class ScoreLimitTest(unittest.TestCase):
+    HAPPY = ["docker", "run", "--rm", "-v", "/a:/data/truth", "genonet/hap-py@sha256:abc", "/data/truth/t.vcf.gz"]
+
+    def test_hap_py_gets_the_scoring_cpu_limit(self):
+        from evaluator.sandbox import parse_docker_run, with_score_limit
+        with mock.patch.dict(os.environ, {"MINOS_SCORE_CPUS": ""}):
+            spec = parse_docker_run(with_score_limit(list(self.HAPPY)))
+        self.assertEqual(spec.cpus, 1.0)
+        self.assertEqual(spec.image, "genonet/hap-py@sha256:abc")
+
+    def test_setting_and_off_switch(self):
+        from evaluator.sandbox import parse_docker_run, with_score_limit
+        with mock.patch.dict(os.environ, {"MINOS_SCORE_CPUS": "2"}):
+            self.assertEqual(parse_docker_run(with_score_limit(list(self.HAPPY))).cpus, 2.0)
+        with mock.patch.dict(os.environ, {"MINOS_SCORE_CPUS": "0"}):
+            self.assertEqual(with_score_limit(list(self.HAPPY)), self.HAPPY)
+
+    def test_other_images_and_existing_limits_untouched(self):
+        from evaluator.sandbox import with_score_limit
+        bcf = ["docker", "run", "--rm", "quay.io/biocontainers/bcftools:1.20", "bcftools", "view"]
+        self.assertEqual(with_score_limit(list(bcf)), bcf)
+        own = ["docker", "run", "--cpus=3", "genonet/hap-py@sha256:abc"]
+        self.assertEqual(with_score_limit(list(own)), own)

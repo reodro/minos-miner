@@ -16,6 +16,7 @@ and kills the GATK containers it started. Logs go to stderr (main keeps them per
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
 import os
@@ -66,6 +67,18 @@ def _proc_score(cs: CallSet, aset: AnswerSet) -> tuple:
         return replace(cs, ok=False, error=f"scoring failed on node: {e}"), None
 
 
+def _proc_score_unit(css: list, aset: AnswerSet) -> list:
+    """Score one GATK batch's callsets in a scorer process, one after another: their clusters not yet cached on this
+    node are packed into as few hap.py runs as possible (score_many). If that fails, each is scored on its own, so one
+    bad callset cannot fail the others."""
+    if len(css) == 1:
+        return [_proc_score(css[0], aset)]
+    try:
+        return list(zip(css, _PROC_SCORER.score_many(css, aset)))
+    except Exception:  # noqa: BLE001
+        return [_proc_score(c, aset) for c in css]
+
+
 class Node:
     def __init__(self, workers: int, runner, scorer_factory, score_threads: Optional[int] = None,
                  score_dir: Optional[str] = None):
@@ -93,6 +106,8 @@ class Node:
         self._aborted: set = set()
         self._by_digest: Dict[tuple, tuple] = {}             # (round, answer-set version, records digest) -> result
         self._by_digest_lock = threading.Lock()
+        self._group_of: Dict[str, int] = {}                  # job id -> the GATK batch (group) it was sent in
+        self._group_ids = itertools.count()
 
     # ---- messages -----------------------------------------------------------------------------------------------
     def send(self, msg: dict) -> None:
@@ -152,39 +167,62 @@ class Node:
     def take_jobs(self, msg: dict) -> None:
         for group in msg["groups"]:
             jobs = [codec.job_from(d) for d in group]
+            token = next(self._group_ids)
+            for j in jobs:
+                self._group_of[j.job_id] = token
             local, _ = self._rounds[jobs[0].round.round_id]
             self.executor.submit([replace(j, round=local) for j in jobs])   # one call: a family stays one batch
 
     # ---- scoring -------------------------------------------------------------------------------------------------
     def _scorer(self, i: int) -> None:
-        """One feeder per scorer process (in thread mode, for tests: a scorer itself); one callset at a time, like a
-        validator: GATK's result goes straight to upstream's hap.py path."""
+        """One feeder per scorer process (in thread mode, for tests: a scorer itself). It takes one GATK batch's
+        callsets at a time and scores them one after another, so a worker's slot never runs more than one scoring:
+        no burst of parallel hap.py runs when a family finishes (with --threads 4 each, they oversubscribed big nodes)."""
         scorer = None if self._pool else self._scorers[0]
         while not self._stop.is_set():
             try:
-                c = self._to_score.get(timeout=1.0)
+                unit = self._to_score.get(timeout=1.0)
             except queue.Empty:
                 continue
-            if c.round_id not in self._rounds:                 # the round was pruned meanwhile: nothing to report
+            unit = [c for c in unit if c.round_id in self._rounds]   # a round pruned meanwhile: nothing to report
+            if not unit:
                 continue
-            aset = self._rounds[c.round_id][1]
-            seen = self._seen(c, aset)
-            if seen is not None:                               # identical records already scored here this round
-                c, r = seen
-            elif self._pool is not None:
-                try:
-                    c, r = self._pool.submit(_proc_score, c, aset).result()
-                except Exception as e:  # noqa: BLE001 - a dead scorer process fails its callset, not the node
-                    c, r = replace(c, ok=False, error=f"scoring failed on node: {e}"), None
-                self._remember(c, aset, r)
-            else:
-                try:
-                    r = scorer.score(c, aset)
-                except Exception as e:  # noqa: BLE001
-                    c, r = replace(c, ok=False, error=f"scoring failed on node: {e}"), None
-                self._remember(c, aset, r)
-            if c.round_id not in self._aborted:
-                self.send({"type": "result", "callset": codec.callset_to(replace(c, score=r) if r else c)})
+            aset = self._rounds[unit[0].round_id][1]
+            done: Dict[int, tuple] = {}
+            todo, first_of = [], {}
+            for n, c in enumerate(unit):
+                seen = self._seen(c, aset)
+                if seen is not None:                           # identical records already scored here this round
+                    done[n] = seen
+                elif c.sha256 and c.sha256 in first_of:        # identical records twice in this unit: score once
+                    continue
+                else:
+                    if c.sha256:
+                        first_of[c.sha256] = n
+                    todo.append(n)
+            if todo:
+                css = [unit[n] for n in todo]
+                if self._pool is not None:
+                    try:
+                        pairs = self._pool.submit(_proc_score_unit, css, aset).result()
+                    except Exception as e:  # noqa: BLE001 - a dead scorer process fails its callsets, not the node
+                        pairs = [(replace(c, ok=False, error=f"scoring failed on node: {e}"), None) for c in css]
+                else:
+                    pairs = []
+                    for c in css:
+                        try:
+                            pairs.append((c, scorer.score(c, aset)))
+                        except Exception as e:  # noqa: BLE001
+                            pairs.append((replace(c, ok=False, error=f"scoring failed on node: {e}"), None))
+                for n, (c, r) in zip(todo, pairs):
+                    done[n] = (c, r)
+                    self._remember(c, aset, r)
+            for n, c in enumerate(unit):
+                if n not in done:                              # a duplicate within the unit: take its twin's result
+                    done[n] = self._seen(c, aset) or (replace(c, ok=False, error="scoring failed on node"), None)
+                c, r = done[n]
+                if c.round_id not in self._aborted:
+                    self.send({"type": "result", "callset": codec.callset_to(replace(c, score=r) if r else c)})
 
     def _digest_key(self, c: CallSet, aset: AnswerSet) -> Optional[tuple]:
         return (c.round_id, aset.version, c.sha256) if c.sha256 else None
@@ -229,13 +267,17 @@ class Node:
                 elif msg["type"] == "abort":                  # main ended the round: stop its work, report nothing
                     self._aborted.add(msg["round_id"])
                     self.executor.end_round(msg["round_id"])
+            units: Dict[object, list] = {}
             for cs in self.executor.poll(0.5):
+                token = self._group_of.pop(cs.job_id, None)
                 if cs.round_id in self._aborted:
                     continue
-                if cs.ok:
-                    self._to_score.put(cs)
+                if cs.ok:                                      # one scoring unit per GATK batch delivered together
+                    units.setdefault(token if token is not None else f"solo:{cs.job_id}", []).append(cs)
                 else:
                     self.send({"type": "result", "callset": codec.callset_to(cs)})
+            for unit in units.values():
+                self._to_score.put(unit)
 
 
 def reap(prefix: str) -> None:

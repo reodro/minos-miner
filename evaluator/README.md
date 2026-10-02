@@ -31,6 +31,8 @@ main) - and `GatkRunner`, `HappyScorer`, `LocalExecutor`, `SimExecutor`, `FakeRu
 | Exclude annotations the score never uses (`SAFE_ANNOTATION_EXCLUSIONS`) | 1.135x, identical calls. QualByDepth, DepthPerAlleleBySample and RMSMappingQuality must stay (removing them changes QUAL via random draws) |
 | 1 thread per GATK job, `floor(cores x 0.95)` jobs per machine | 2.06x throughput vs 4 jobs x 4 threads |
 | Machine-wide decision cache (`DecisionCacheScorer`) | a cluster scored by any process on the node is never sent to hap.py again by another; 34/34 identical to plain hap.py (3 rounds incl. deep coverage) |
+| One scoring unit per GATK batch (node agent) | a batch's callsets are scored one after another by one scorer (`score_many`: uncached clusters packed into few hap.py runs), so a worker slot never runs more than one scoring - no burst of parallel hap.py runs when a family finishes |
+| hap.py CPU limit (`MINOS_SCORE_CPUS`, default 1; 0 = none) | upstream runs hap.py with `--threads 4` and no limit; on a 180-core node scoring bursts drove the load to ~1000. At 1 core a full scoring takes ~10 s instead of ~5 s idle, identical results |
 | Identical records scored once (node agent) | a callset whose records digest was already scored this round reuses that score (or failure): no hap.py |
 | Truth sliced once per (truth, region) (`truth_slices`) | upstream slices the truth on every scoring (2 bcftools containers); the cached slice is the same bcftools output |
 | GATK containers with `--network none` | no network namespace and interface per container (container start 3.9 s -> 0.33 s measured in the legacy project) |
@@ -118,7 +120,8 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   (names carry the round tag) and reports nothing more for it, so all workers are free at the start of the next round.
   `LocalExecutor.end_round` does the same on one machine.
 - **Node side**: `LocalExecutor` with `floor(cores x 0.95)` GATK workers (batching, divergence repair, dedup) and
-  **one scorer process per GATK worker**, each scoring one callset at a time with `DecisionCacheScorer` (upstream's
+  **one scorer process per GATK worker**, each scoring one GATK batch's callsets at a time, one after another, with
+  `DecisionCacheScorer` (upstream's
   hap.py path for the clusters not yet scored on this node; the per-round cluster store in `cache/dcache/<tag>/` is
   shared by all of them and deleted with the round). Before a callset reaches a scorer, the agent checks its records
   digest: identical records already scored this round reuse that score. Main counts a group as

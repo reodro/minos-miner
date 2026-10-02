@@ -441,15 +441,36 @@ def release(proc: subprocess.Popen) -> None:
     _drop(proc)
 
 
+def score_cpus() -> Optional[float]:
+    """CPU limit for one hap.py scoring (MINOS_SCORE_CPUS, default 1; 0 = none). Upstream runs hap.py with
+    --threads 4 and no limit: on a big node with one scorer per worker, bursts of scorings then oversubscribed the CPU
+    ~5x (load ~1000 on 180 cores). At 1 core a full scoring takes ~10 s instead of ~5 s idle; results are identical."""
+    raw = (os.environ.get("MINOS_SCORE_CPUS") or "").strip()
+    value = float(raw) if raw else 1.0
+    return value if value > 0 else None
+
+
+def with_score_limit(args: List[str]) -> List[str]:
+    """`docker run ... <hap.py image>` with the scoring CPU limit added (unless it already has one)."""
+    cpus = score_cpus()
+    if cpus is None or "run" not in args[:3] or not any("hap-py" in a or "hap.py" in a for a in args):
+        return args
+    if any(a == "--cpus" or a.startswith("--cpus=") for a in args):
+        return args
+    i = args.index("run") + 1
+    return args[:i] + [f"--cpus={cpus:g}"] + args[i:]
+
+
 class _ScoringSubprocess:
-    """Stands in for utils.scoring.subprocess. docker run goes through the sandbox; everything else is unchanged."""
+    """Stands in for utils.scoring.subprocess. docker run goes through the sandbox (hap.py with the scoring CPU
+    limit); everything else is unchanged."""
 
     _minos_sandbox = True
 
     def run(self, args, **kwargs):
         if isinstance(args, (list, tuple)) and args and args[0] == "docker":
-            return run(list(args), timeout=kwargs.get("timeout"), capture_output=kwargs.get("capture_output", False),
-                       text=kwargs.get("text", False))
+            return run(with_score_limit(list(args)), timeout=kwargs.get("timeout"),
+                       capture_output=kwargs.get("capture_output", False), text=kwargs.get("text", False))
         return subprocess.run(args, **kwargs)
 
     def __getattr__(self, name):
