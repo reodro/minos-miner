@@ -1428,9 +1428,13 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
      * run. In each variant's own run they would come from that variant's stream, whose position differs whenever
      * its genotyping drew a different number of QD-jitter values. Replay them on each variant's generator: if any
      * value differs, that variant's own run would have downsampled differently, so its output here is not exact.
+     *
+     * A warm walk has no batch variants, but a later request replays these same draws (minosWarmOne). Still take
+     * and keep them: otherwise every region stores an empty list, the request skips the downsampling draws, and
+     * it reports exact while QD and QUAL differ from a fresh run.
      */
     private void minosSyncRandom() {
-        if (minosGenotypingVariants.isEmpty()) {
+        if (minosGenotypingVariants.isEmpty() && !minosWarmActive) {
             return;
         }
         final List<int[]> draws = Utils.minosGlobalRandom().takeDraws();

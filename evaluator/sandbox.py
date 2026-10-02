@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -294,6 +295,18 @@ _jobs: Dict[str, _Job] = {}
 _jobs_lock = threading.Lock()
 
 
+def _chroot_bin() -> str:
+    """Absolute path of chroot. The script runs it under `env -i`, which clears PATH, so a later lookup cannot work.
+    Ubuntu 22.04 installs it at /usr/sbin/chroot; newer Ubuntu installs the same program at /usr/bin/chroot."""
+    for candidate in ("/usr/bin/chroot", "/usr/sbin/chroot"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("chroot")
+    if found:
+        return found
+    raise RuntimeError("chroot not found")
+
+
 def _script(rootfs: Path, spec: DockerSpec, config: dict, command: List[str],
             mnt: str, upper: str, work: str) -> str:
     lines = [
@@ -320,7 +333,7 @@ def _script(rootfs: Path, spec: DockerSpec, config: dict, command: List[str],
     env = image_env(config, spec.env)
     assigns = " ".join(f"{shlex.quote(k)}={shlex.quote(v)}" for k, v in env.items())
     quoted = " ".join(shlex.quote(a) for a in command)
-    lines.append(f"exec /usr/bin/env -i {assigns} /usr/sbin/chroot {shlex.quote(mnt)} {quoted}")
+    lines.append(f"exec /usr/bin/env -i {assigns} {shlex.quote(_chroot_bin())} {shlex.quote(mnt)} {quoted}")
     return "\n".join(lines) + "\n"
 
 

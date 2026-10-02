@@ -34,6 +34,38 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(bare, ["java", "HaplotypeCaller"])
 
 
+class ChrootPathTest(unittest.TestCase):
+    def _script(self, sandbox):
+        return sandbox._script(Path("/rootfs"), DockerSpec(image="img"), {}, ["echo", "hi"],
+                               "/mnt", "/upper", "/work")
+
+    def test_this_machine_uses_a_chroot_that_exists(self):
+        from evaluator import sandbox
+        path = sandbox._chroot_bin()
+        self.assertTrue(os.access(path, os.X_OK))
+        self.assertIn(path, self._script(sandbox))
+
+    def test_newer_ubuntu_chroot_in_usr_bin_is_used(self):
+        from unittest import mock
+        from evaluator import sandbox
+
+        def access(path, mode):
+            return path == "/usr/bin/chroot" and mode == os.X_OK
+
+        with mock.patch.object(sandbox.os, "access", access):
+            script = self._script(sandbox)
+        self.assertIn("/usr/bin/chroot ", script)
+        self.assertNotIn("/usr/sbin/chroot", script)
+
+    def test_missing_chroot_is_reported_before_the_script_runs(self):
+        from unittest import mock
+        from evaluator import sandbox
+        with mock.patch.object(sandbox.os, "access", lambda *_a, **_k: False), \
+                mock.patch.object(sandbox.shutil, "which", lambda *_a, **_k: None):
+            with self.assertRaises(RuntimeError):
+                sandbox._chroot_bin()
+
+
 class CacheHitTest(unittest.TestCase):
     def test_a_cached_image_does_not_call_docker(self):
         import tempfile
