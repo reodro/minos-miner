@@ -215,6 +215,147 @@ class K2RobustnessTest(unittest.TestCase):
         self.assertIn("needed 2 tries", warnings_of({"readdiff": {"failed_tries": ["OSError: x"]}})[0])
 
 
+class K2HapgenoTest(unittest.TestCase):
+    """The local haplotype genotyper on a synthetic 1 kb reference with a 12-A homopolymer at 501-512."""
+
+    def setUp(self):
+        import random
+        import tempfile
+        import pysam
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        rnd = random.Random(3)
+        body = "".join(rnd.choice("CGT") for _ in range(1000))   # no A: the homopolymer is the only A run
+        self.ref = body[:500] + "A" * 12 + body[512:]
+        with open(f"{d}/chrT.fa", "w") as f:
+            f.write(">chrT\n" + self.ref + "\n")
+        pysam.faidx(f"{d}/chrT.fa")
+        self.fasta = f"{d}/chrT.fa"
+        self.header = {"HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"SN": "chrT", "LN": len(self.ref)}]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _bam(self, path, reads):
+        import pysam
+        with pysam.AlignmentFile(path, "wb", header=self.header) as o:
+            for name, seq, start in sorted(reads, key=lambda r: r[2]):
+                r = pysam.AlignedSegment()
+                r.query_name, r.query_sequence, r.reference_id, r.reference_start = name, seq, 0, start
+                r.cigarstring, r.mapping_quality = f"{len(seq)}M", 60
+                r.query_qualities = pysam.qualitystring_to_array("I" * len(seq))
+                o.write(r)
+        pysam.index(path)
+
+    def _round(self, originals_carry_alt):
+        """8 round reads with an extra A in the homopolymer (each cut from its own original) + 8 reference reads."""
+        alt = self.ref[:506] + "A" + self.ref[506:]
+        rounds, origs = [], []
+        for i in range(16):
+            o0 = 400 + 3 * i                                   # original: 151 bp; round read: its bases 10..137
+            carry = i % 2 == 0
+            src = alt if carry and originals_carry_alt else self.ref
+            mark = lambda x: x[:20] + ("A" if x[20] != "A" else "C") + x[21:]   # the original's own sequencing error
+            o_seq = mark(src[o0:o0 + 151])                      # (outside the window), so each read has one source
+            r_src = mark((alt if carry else self.ref)[o0:o0 + 151])
+            origs.append((f"o{i}", o_seq, o0))
+            rounds.append((f"r{i}", r_src[10:138], o0 + 10))
+        d = self.tmp.name
+        self._bam(f"{d}/round.bam", rounds)
+        self._bam(f"{d}/orig.bam", origs)
+        return f"{d}/round.bam", f"{d}/orig.bam"
+
+    def test_minos_style_spelling(self):
+        import pysam
+        from answer_set.k2 import hapgeno
+        fa = pysam.FastaFile(self.fasta)
+        s, e = 470, 560
+        ref = self.ref[s - 1:e]
+        hap = ref[:20] + ref[21:40] + "T" + ref[40:]              # a deletion and an insertion 20 bp apart
+        ev = hapgeno._events_of(fa, "chrT", s, ref, hap)
+        self.assertEqual(len(ev), 2)
+        self.assertTrue(all(len(k[1]) != len(k[2]) for k in ev))  # two indels, not a run of mismatches
+
+    def test_edited_insertion_is_genotyped(self):
+        from answer_set.k2 import hapgeno
+        bam, orig = self._round(originals_carry_alt=False)
+        res = hapgeno.genotype(bam, self.fasta, "chrT", [(501, 502)], threads=1, orig_bam=orig)
+        ins = {k: v for k, v in res.items() if k[0] != "window"}
+        self.assertEqual(list(ins), [(500, self.ref[499], self.ref[499] + "A")])   # left-aligned 1-bp insertion
+        v = ins[(500, self.ref[499], self.ref[499] + "A")]
+        self.assertGreater(v["hg_post"], 0.99)
+        self.assertLess(v["hg_hom"], 0.01)                        # het: half the reads
+        self.assertEqual((v["hg_edit"], v["hg_edit_ori"], v["hg_unedit"]), (8.0, 8.0, 0.0))
+
+    def test_donor_variant_is_not_an_edit(self):
+        from answer_set.k2 import hapgeno
+        bam, orig = self._round(originals_carry_alt=True)        # the originals already carry the extra A
+        res = hapgeno.genotype(bam, self.fasta, "chrT", [(501, 502)], threads=1, orig_bam=orig)
+        v = res[(500, self.ref[499], self.ref[499] + "A")]
+        self.assertEqual((v["hg_edit"], v["hg_unedit"]), (0.0, 8.0))
+
+
+class K2HapwinTest(unittest.TestCase):
+    """Window decisions: the genotyper's whole-window answer replaces the per-variant one where trusted."""
+
+    def setUp(self):
+        import tempfile
+        from answer_set.k2.util import Bed
+        self.tmp = tempfile.TemporaryDirectory()
+        with open(f"{self.tmp.name}/c.bed", "w") as f:
+            f.write("chrT\t0\t1000\n")
+        self.bed = Bed(f"{self.tmp.name}/c.bed", "chrT")
+        self.s, self.ref = 101, "ACGTTGCA" + "A" * 10 + "CGTGCATG"         # window 101-126, 10 A at 109-118
+        self.ins = (108, "A", "AA")                                     # one more A (left-aligned)
+        alt = self.ref[:8] + "A" + self.ref[8:]
+        self.w = {"ref": self.ref, "pair": (self.ref, alt), "post": 0.99, "post2": 0.01, "lr2": 9.0, "hg_anchored": 14.0,
+                  "hg_n_haps": 2.0, "hg_win_edit_other": 0.0, "ref_reads": 7,
+                  "called": [{"events": [self.ins], "hom": False, "reads": 7, "edit": 7, "edit_ori": 7, "unedit": 0,
+                              "edit_q": 36.0}]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_added_where_trusted(self):
+        import numpy as np
+        from answer_set.k2 import hapwin
+        donor_rec = (300, "C", "T")                                     # elsewhere: untouched
+        recs = [(300, "C", "T", "hom", False, 2.0)]
+        answer = {(r[0], r[1], r[2]): (r[3], r[4]) for r in recs}
+        c = hapwin.candidates([(self.s, self.s + len(self.ref) - 1, self.w)], answer, {}, {donor_rec: "hom"}, self.bed)
+        self.assertEqual(len(c), 1)
+        self.assertEqual(c[0][4], {self.ins: "het"})
+        self.assertEqual(c[0][5].shape, (len(hapwin.FEATS),))
+        y, ok = hapwin.label(c, {self.ins: ("het", True), donor_rec: ("hom", False)})
+        self.assertEqual((list(y), ok), ([1], [False]))                 # called pair right, answer wrong: a fix
+        out, n = hapwin.apply(recs, c, np.array([0.9]), 0.4)
+        self.assertEqual(n, 1)
+        self.assertIn((108, "A", "AA", "het", True, 0.9), out)
+        self.assertIn(recs[0], out)
+        self.assertEqual(hapwin.apply(recs, c, np.array([0.2]), 0.4), (recs, 0))   # below the cut-off: unchanged
+
+    def test_donor_records_never_removed(self):
+        from answer_set.k2 import hapwin
+        d = (112, "A", "G")                                             # the person's own record inside the window
+        recs = [(112, "A", "G", "het", False, 2.0)]
+        answer = {(r[0], r[1], r[2]): (r[3], r[4]) for r in recs}
+        c = hapwin.candidates([(self.s, self.s + len(self.ref) - 1, self.w)], answer, {}, {d: "het"}, self.bed)
+        self.assertEqual(c, [])                                         # the call lacks it: the window is not eligible
+
+    def test_donor_genotype_kept(self):
+        import numpy as np
+        from answer_set.k2 import hapwin
+        recs = [(108, "A", "AA", "hom", False, 2.0)]                    # published hom; the genotyper says het + more
+        w = dict(self.w, called=[{"events": [self.ins, (120, "G", "T")], "hom": False, "reads": 7, "edit": 7,
+                                  "edit_ori": 7, "unedit": 0, "edit_q": 36.0}],
+                 pair=(self.ref, self.ref[:8] + "A" + self.ref[8:19] + "T" + self.ref[20:]))
+        answer = {(r[0], r[1], r[2]): (r[3], r[4]) for r in recs}
+        c = hapwin.candidates([(self.s, self.s + len(self.ref) - 1, w)], answer, {}, {self.ins: "hom"}, self.bed)
+        out, _ = hapwin.apply(recs, c, np.array([0.9]), 0.4)
+        self.assertIn(recs[0], out)                                     # still hom, still the person's record
+        self.assertEqual(sum(1 for r in out if r[:3] == self.ins), 1)
+
+
 class K2AssembleTest(unittest.TestCase):
     """Model scores -> truth records: donor background copied, threshold, <= 2 alleles per position, BED rule."""
 

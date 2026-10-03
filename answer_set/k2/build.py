@@ -88,7 +88,9 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     # candidate rules must match the GIAB model that will judge them
     gname = (track_versions or {}).get("giab") or tracks.active_name("giab")
     if gname:
-        features.RD_1BP_FACTOR = tracks.meta("giab", gname).get("rd_1bp_factor", 1.0)
+        gmeta = tracks.meta("giab", gname)
+        features.RD_1BP_FACTOR = gmeta.get("rd_1bp_factor", 1.0)
+        features.HAP_GENOTYPER = int(gmeta.get("hap_genotyper", 0))      # True (g009) == 1
     keys, X, info, donors, beds = extract(bam, region, out / "work", threads)
     t_feat = time.time() - t0
     track = tracks.track_of_info(info)
@@ -101,8 +103,11 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         X = X[:, [FEATURES.index(n) for n in meta["features"]]] if len(keys) else X
     p_any = m_any.predict_proba(X)[:, 1] if len(keys) else np.array([])
     p_hom = m_hom.predict_proba(X)[:, 1] if len(keys) else np.array([])
+    p_raw = p_any
+    if len(keys) and meta.get("thr_class"):
+        p_any = tracks.apply_class_thr(meta, keys, p_any)
     if len(keys) and meta.get("thr_only_rd") is not None:
-        p_any = tracks.apply_source_thr(meta, X_full, p_any)
+        p_any = tracks.apply_source_thr(meta, X_full, p_any, p_raw)
     if len(keys) and meta.get("gt_from_gatk"):
         p_hom = tracks.apply_gt_rule(meta, X_full, p_hom)
 
@@ -112,6 +117,17 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         bed = beds[info["mode_donor"]]
         allowed = lambda k: bed.contains(k[0]) and bed.contains(k[0] + len(k[1]) - 1)  # noqa: E731
     recs = assemble_records(keys, p_any, p_hom, thr, info["mode_giab"], donor, allowed)
+    n_windows = None
+    if info["mode_giab"] and meta.get("window_thr") is not None and (out / "work" / "hg_windows.pkl.gz").exists():
+        # window decisions: where the genotyper's whole-window answer replaces the per-variant one (hapwin.py)
+        from answer_set.k2 import hapwin
+        wm = tracks.load_window(track, (track_versions or {}).get(track) or tracks.active_name(track), exclude_round)
+        answer = {(r[0], r[1], r[2]): (r[3], r[4]) for r in recs}
+        cands = hapwin.candidates(hapwin.load_windows(out / "work" / "hg_windows.pkl.gz"), answer,
+                                  dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]])
+        if cands:
+            pw = wm.predict_proba(np.vstack([c[5] for c in cands]))[:, 1]
+            recs, n_windows = hapwin.apply(recs, cands, pw, meta["window_thr"])
     write_vcf(out / "truth.vcf.gz", chrom, [r[:5] for r in recs])
     write_scores(out / "scores.tsv.gz", keys, p_any, donor, allowed)
 
@@ -139,7 +155,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "background_from_donor": len(donor), "model_calls": len(recs) - len(donor),
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
-        "readdiff": info.get("readdiff"), "inputs": changed_inputs or "ok",
+        "readdiff": info.get("readdiff"), "inputs": changed_inputs or "ok", "windows_replaced": n_windows,
     }
     (out / "report.json").write_text(json.dumps(report, indent=1))
     return report

@@ -29,6 +29,14 @@ from answer_set.k2.train import PREPARED, assemble, cls, load, prf, truth_of
 
 FOLDS = 5
 IN_DONOR = FEATURES.index("in_mode_donor")
+IN_BED = FEATURES.index("in_donor_bed")
+# The validator's v2 core weighs classes (SNP het 0.18 + hom 0.02, indel 1 bp 0.40, 2-3 bp 0.16, 4-7 bp 0.10, >= 8 bp
+# 0.14); per class, one error costs ~ weight / (2 x truth records of the class). giab track: training rows are
+# weighted by that cost (POINT_ALPHA: 0 = every row alike) and each class gets its own cut-off, chosen on held-out
+# folds for weight x F1 - points, not counts: a missed 1-bp indel costs ~20 SNP errors.
+CLASS_W = {"snp": 0.20, "ind1": 0.40, "ind2_3": 0.16, "ind4_7": 0.10, "ind8+": 0.14}
+POINT_ALPHA = 1.0
+THR_GRID = [round(0.1 + 0.05 * i, 2) for i in range(17)]
 
 
 def round_track(r):
@@ -52,12 +60,52 @@ def rows(track, r, for_hom=False):
     return m
 
 
-def fit(track, rs, cols):
+def classes_of(r):
+    if "_cls" not in r:
+        r["_cls"] = np.array([cls(k) for k in zip(r["pos"].tolist(), r["ref"].tolist(), r["alt"].tolist())])
+    return r["_cls"]
+
+
+def class_cost(rs):
+    """Relative cost of one error per class (SNP = 1): validator weight / truth records of the class."""
+    n = Counter()
+    for r in rs:
+        for k in truth_of(r):
+            n[cls(k)] += 1
+    raw = {c: CLASS_W[c] / max(1, n[c]) for c in CLASS_W}
+    return {c: raw[c] / raw["snp"] for c in CLASS_W}
+
+
+def fit(track, rs, cols, cost=None):
+    def w(r, m):
+        if not cost or POINT_ALPHA == 0:
+            return None
+        return np.array([cost[c] ** POINT_ALPHA for c in classes_of(r)[m]])
     X = np.vstack([r["X"][rows(track, r)][:, cols] for r in rs])
     y = np.concatenate([r["y_any"][rows(track, r)] for r in rs])
     Xh = np.vstack([r["X"][rows(track, r, True)][:, cols] for r in rs])
     yh = np.concatenate([r["y_hom"][rows(track, r, True)] for r in rs])
-    return model().fit(X, y), model().fit(Xh, yh)
+    sw = [w(r, rows(track, r)) for r in rs]
+    swh = [w(r, rows(track, r, True)) for r in rs]
+    sw = np.concatenate(sw) if sw[0] is not None else None
+    swh = np.concatenate(swh) if swh[0] is not None else None
+    return model().fit(X, y, sample_weight=sw), model().fit(Xh, yh, sample_weight=swh)
+
+
+def class_points(rs, oof, truths, c, t):
+    """Mean over rounds of weight x F1 of class c with cut-off t (held-out scores; the person's own records are
+    copied, so they count as found; a record of ours counts only with the right het/hom)."""
+    vals = []
+    for r in rs:
+        pa, ph = oof[r["name"]]
+        m = rows("giab", r) & (classes_of(r) == c) & (r["X"][:, IN_BED] == 1)
+        pred = m & (pa >= t)
+        tp = int(np.sum(pred & (r["y_any"] == 1) & ((ph >= 0.5) == (r["y_hom"] == 1))))
+        t_ = truths[r["name"]]
+        own = sum(1 for k, (z, syn) in t_.items() if not syn and cls(k) == c)
+        n_truth = sum(1 for k in t_ if cls(k) == c)
+        vals.append(CLASS_W[c] * 2 * (own + tp) / max(1, own + int(pred.sum()) + n_truth))
+    return float(np.mean(vals))
 
 
 def predict(pair, r, cols):
@@ -73,7 +121,8 @@ def evaluate(track, name, rs):
     per, agg = {}, defaultdict(Counter)
     for r in rs:
         pa, ph = predict((m, h), r, cols)
-        pa = tracks.apply_source_thr(meta, r["X"], pa)
+        keys_ = list(zip(r["pos"].tolist(), r["ref"].tolist(), r["alt"].tolist()))
+        pa = tracks.apply_source_thr(meta, r["X"], tracks.apply_class_thr(meta, keys_, pa), pa)
         pred = assemble(r, pa, tracks.apply_gt_rule(meta, r["X"], ph), meta["threshold"], meta.get("bed_rule", False))
         t = truth_of(r)
         per[r["name"]] = prf(pred, t)
@@ -98,8 +147,11 @@ def train(track, rs, name):
         names = sorted(r["name"] for r in rs)
         fold_of = {names[i]: n % FOLDS for n, i in enumerate(np.random.default_rng(0).permutation(len(names)))}
         oof = {}
+        cost = class_cost(rs) if track == "giab" else None
+        if cost:
+            print("error cost per class (SNP = 1):", {c: round(v, 1) for c, v in cost.items()}, "alpha", POINT_ALPHA)
         for f in range(FOLDS):
-            pair = fit(track, [r for r in rs if fold_of[r["name"]] != f], cols)
+            pair = fit(track, [r for r in rs if fold_of[r["name"]] != f], cols, cost)
             joblib.dump(pair[0], out / f"fold{f}_model.joblib")
             joblib.dump(pair[1], out / f"fold{f}_hom.joblib")
             for r in rs:
@@ -123,11 +175,22 @@ def train(track, rs, name):
             thr_rd = max(t2tab, key=t2tab.get)
             print("held-out median F1 by cut-off for read-comparison-only candidates",
                   {k: round(v, 5) for k, v in t2tab.items()})
+        thr_class = None
+        if track == "giab":
+            thr_class = {}
+            print("held-out points by class cut-off (weight x F1, mean per round):")
+            for c in CLASS_W:
+                tab = {t: class_points(rs, oof, truths, c, t) for t in THR_GRID}
+                thr_class[c] = max(tab, key=tab.get)
+                print(f"   {c:7s} at {thr}: {tab[min(THR_GRID, key=lambda x: abs(x - thr))]:.6f}  best {thr_class[c]}: "
+                      f"{tab[thr_class[c]]:.6f}  (+{70 * (tab[thr_class[c]] - tab[min(THR_GRID, key=lambda x: abs(x - thr))]):.4f} pts)")
         agg = defaultdict(Counter)
         print(f"\n{'region':28s} {'person':8s} {'precision':>9s} {'recall':>7s} {'F1':>7s}")
-        mt = {"threshold": thr, "thr_only_rd": thr_rd}
+        mt = {"threshold": thr, "thr_only_rd": thr_rd, "thr_class": thr_class}
         for r in sorted(rs, key=lambda r: r["name"]):
-            pred = assemble(r, tracks.apply_source_thr(mt, r["X"], oof[r["name"]][0]), oof[r["name"]][1], thr, bed_rule)
+            keys_ = list(zip(r["pos"].tolist(), r["ref"].tolist(), r["alt"].tolist()))
+            pc = tracks.apply_class_thr(mt, keys_, oof[r["name"]][0])
+            pred = assemble(r, tracks.apply_source_thr(mt, r["X"], pc, oof[r["name"]][0]), oof[r["name"]][1], thr, bed_rule)
             t = truths[r["name"]]
             p, rc, f1 = prf(pred, t)
             person = r["info"]["mode_donor"] if track == "giab" else r["info"]["kg"]["person"]
@@ -144,28 +207,33 @@ def train(track, rs, name):
             c = agg[g]
             print(f"   {g:20s} {c['n']:7d}" if g.startswith("extra") else
                   f"   {g:20s} found {c['found']}/{c['n']} ({100 * c['found'] / c['n']:.2f}%)")
-        final = fit(track, rs, cols)
+        final = fit(track, rs, cols, cost)
         joblib.dump(final[0], out / "model.joblib")
         joblib.dump(final[1], out / "hom.joblib")
         meta = {"track": track, "created": tracks.now(), "features": tracks.features_for(track),
                 "rounds": names, "fold_of": fold_of, "threshold": thr, "heldout_f1": round(table[thr], 5),
                 "bed_rule": bed_rule, "n_targets_median": 580.0, "gt_from_gatk": track == "kg",
-                "thr_only_rd": thr_rd}
+                "thr_only_rd": thr_rd, "thr_class": thr_class, "point_alpha": POINT_ALPHA if cost else None}
         if track == "giab":
             from answer_set.k2 import features as _features
             meta["rd_1bp_factor"] = _features.RD_1BP_FACTOR
+            meta["hap_genotyper"] = min(int(r["info"].get("hap_genotyper") or 0) for r in rs)
         (out / "meta.json").write_text(json.dumps(meta, indent=1))
     (out / "report.txt").write_text(buf.getvalue())
     return meta
 
 
 def main():
+    global POINT_ALPHA
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--track", required=True, choices=tracks.TRACKS)
     ap.add_argument("--same-rounds-as", help="train on the rounds (of this track) that a track version used")
     ap.add_argument("--promote", action="store_true")
     ap.add_argument("--exclude-rounds", help="file with round dirs to leave out (e.g. a test set)")
+    ap.add_argument("--point-alpha", type=float, default=POINT_ALPHA,
+                    help="giab: weight rows by class error cost ** alpha (0: unweighted)")
     args = ap.parse_args()
+    POINT_ALPHA = args.point_alpha
     want = None
     if args.same_rounds_as:
         n = args.same_rounds_as
@@ -173,7 +241,7 @@ def main():
     rs = [r for r in load(want) if round_track(r) == args.track]
     if args.track == "giab" and any(f in tracks.features_for("giab") for f in ("rd_support",)):
         rs = [r for r in rs if not r["info"].get("no_rd_features") and not r["info"].get("no_rdx_features")
-              and not r["info"].get("no_sib_features")]
+              and not r["info"].get("no_sib_features") and not r["info"].get("no_hg_features")]
     if args.track == "kg":                         # the kg track needs the spot measurements
         rs = [r for r in rs if not r["info"].get("no_spot_features") and not r["info"].get("no_mask_features")
               and not r["info"].get("no_annot_features") and not r["info"].get("no_gatkonly_features")]

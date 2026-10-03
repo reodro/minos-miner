@@ -24,6 +24,15 @@ RD_1BP_FACTOR = float(os.environ.get("MINOS_RD1BP", "0.5"))
 # k2/107 machine: inserted 1-bp indels 94.9% found instead of 96.9%).
 RD_ATTEMPTS, RD_WAIT_S = 3, 10
 RD_BUDGET_S = 900               # the whole read comparison, every try: past it the build goes on without it
+# GIAB local haplotype genotyper (hapgeno.py): the two local DNA sequences the person most likely carries at each
+# spot, as events (new candidates) and per-candidate posteriors. On only for models trained with it (meta
+# hap_genotyper; build.py sets it from the model before extracting), so a model trained without it is never fed
+# candidates it has not seen. prepare.py turns it on (--no-hap: off).
+HAP_GENOTYPER = int(os.environ.get("MINOS_HAPGENO", "0"))     # 0 off, else the hapgeno.VERSION it was trained with
+HG_CALL = 0.5                   # genotyper events at least this likely become candidates,
+HG_EDIT_ORI = 2                 # and so do events carried by edited reads from at least this many originals
+HG_FEATS = ("hg_post", "hg_hom", "hg_reads", "hg_anchored", "hg_lr", "hg_n_haps", "hg_edit", "hg_edit_ori", "hg_unedit",
+            "hg_win_edit_other", "hg_edit_q")
 
 FEATURES = [
     "is_indel", "indel_len", "abs_len", "dp", "ref_n", "alt_n", "alt_frac", "alt_frac_ra",
@@ -70,6 +79,17 @@ FEATURES = [
     "only_rd", "rd_orig", "rd_orig_frac",
     # read comparison: strongest competing change within 10 bp (broken/shifted versions of one event)
     "rd_sib_max", "rd_sib_ratio",
+    # local haplotype genotyper (hapgeno.py): found only by it (only_hg); P(carried), P(hom), reads best explained by a
+    # sequence carrying it, reads anchored around the window, log-likelihood margin, candidate sequences in the window
+    "only_hg", "hg_post", "hg_hom", "hg_reads", "hg_anchored", "hg_lr", "hg_n_haps",
+    # read comparison anywhere in the candidate's genotyped window, whatever the spelling: strongest edit (reads) and
+    # the distinct original reads it came from (an inserted mutation is an edit of many originals; donor variants
+    # and noise already in the originals are not)
+    "hg_rd_sup", "hg_rd_ori",
+    # edit-aware genotyper (each read against its Google original): edited reads best explained by a sequence carrying
+    # the event, the distinct originals they came from, unedited reads carrying it (the donor's own DNA), and edited
+    # reads in the window carrying other sequences (local Minos noise)
+    "hg_edit", "hg_edit_ori", "hg_unedit", "hg_win_edit_other", "hg_edit_q",
 ]
 
 
@@ -379,6 +399,7 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
         return set(out.items())
 
     rdiff, hap, rd_info = {}, {}, {}
+    hg, hg_window = {}, None
     if mode_giab:
         from answer_set.k2 import giab_origin, localhap, readdiff
 
@@ -422,6 +443,42 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             cands[k] = f
             n_rd_only += 1
         rd_info["candidates_added"] = n_rd_only
+        if HAP_GENOTYPER:
+            from answer_set.k2 import hapcand, hapgeno
+            seeds = [(k[0], k[0] + len(k[1])) for k, f in cands.items()
+                     if len(k[1]) != len(k[2]) or (f.get("alt_n", 0) >= 2 and f.get("alt_frac_ra", 0) >= 0.08)]
+            seeds += [(k[0], k[0] + len(k[1])) for k, v in rdiff.items() if v[0] >= 2]
+            orig_bam = giab_origin.path(mode_donor, chrom, a, b)
+            hg = hapgeno.genotype(str(bam), str(ref_path(chrom)), chrom, seeds, threads, known=set(cands) | set(rdiff),
+                                  orig_bam=orig_bam if "error" not in rd_info and orig_bam.exists() else None)
+            from answer_set.k2 import hapwin
+            hapwin.save_windows(workdir / "hg_windows.pkl.gz", hg)        # for window decisions (hapwin.py)
+            wins = sorted((k[1], k[2], v) for k, v in hg.items() if k[0] == "window")
+            w_starts = [w[0] for w in wins]
+
+            def hg_window(pos):
+                """the genotyped window around pos (start, end, summary), or None"""
+                i = bisect.bisect_right(w_starts, pos) - 1
+                return wins[i] if i >= 0 and wins[i][0] <= pos <= wins[i][1] else None
+            n_hg_only = 0
+            for k, v in hg.items():
+                if (k[0] == "window" or (v["hg_post"] < HG_CALL and not v["hg_edit_ori"] >= HG_EDIT_ORI)
+                        or k in cands or k in own or not (a <= k[0] <= b)
+                        or abs(len(k[1]) - len(k[2])) > hapcand.MAX_INDEL
+                        or not (dbed.contains(k[0]) and dbed.contains(k[0] + len(k[1]) - 1))):
+                    continue
+                L = len(k[2]) - len(k[1])
+                f = {n: np.nan for n in FEATURES}
+                f.update(is_indel=float(L != 0), indel_len=float(L), abs_len=float(abs(L)), alt_n=0.0, only_hg=1.0)
+                i = k[0] - lo
+                f["hp_len"], f["hp_len_after"] = _hp(seq, i)
+                f["str_period2"] = _str2(seq, i)
+                w = seq[max(0, i - 50): i + 51]
+                f["gc50"] = (w.count("G") + w.count("C")) / max(1, len(w))
+                cands[k] = f
+                n_hg_only += 1
+            rd_info["hg_candidates_added"] = n_hg_only
+            rd_info["hg_windows"] = len(wins)
     keys = list(cands)
     prof = tract_profiles(bam, chrom, lo, seq, [k for k in keys if len(k[1]) != len(k[2])])
     if mode_giab:
@@ -515,6 +572,31 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
                    "rd_sib_ratio") \
                 if not mode_giab or "error" in rd_info else ():
             f[n_] = np.nan
+        if hg_window is not None:
+            ev_, w_ = hg.get(k), hg_window(k[0])
+            if ev_ is not None:                      # an event of a likely pair
+                f.update({n_: ev_[n_] for n_ in HG_FEATS})
+            elif w_ is not None:                     # genotyped, but no likely pair carries it
+                ws_ = w_[2]
+                no_orig = np.isnan(ws_["hg_win_edit_other"])
+                f.update(hg_post=0.0, hg_hom=0.0, hg_reads=0.0, hg_anchored=ws_["hg_anchored"], hg_lr=np.nan,
+                         hg_n_haps=ws_["hg_n_haps"], hg_edit=np.nan if no_orig else 0.0,
+                         hg_edit_ori=np.nan if no_orig else 0.0, hg_unedit=np.nan if no_orig else 0.0,
+                         hg_win_edit_other=ws_["hg_win_edit_other"], hg_edit_q=np.nan)
+            else:
+                for n_ in HG_FEATS:
+                    f[n_] = np.nan
+            if w_ is not None and "error" not in rd_info:
+                j0, j1 = bisect.bisect_left(rd_pos, w_[0]), bisect.bisect_right(rd_pos, w_[1])
+                f["hg_rd_sup"] = float(max([rdiff[o][0] for o in rd_keys[j0:j1]] or [0]))
+                f["hg_rd_ori"] = float(max([rdiff[o][2] for o in rd_keys[j0:j1]] or [0]))
+            else:
+                f["hg_rd_sup"] = f["hg_rd_ori"] = np.nan
+            if np.isnan(f.get("only_hg", np.nan)):
+                f["only_hg"] = 0.0
+        else:
+            for n_ in ("only_hg", "hg_rd_sup", "hg_rd_ori") + HG_FEATS:
+                f[n_] = np.nan
         h_ = hap.get(k)
         for n_ in localhap.FEATS if mode_giab else ("hap_alt", "hap_ref", "hap_n", "hap_frac", "hap_rank",
                                                       "hap_margin", "hap_cluster"):

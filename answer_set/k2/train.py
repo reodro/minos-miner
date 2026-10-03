@@ -21,6 +21,7 @@ N_BEFORE_RD = FEATURES.index("rd_support")
 N_BEFORE_GATKONLY = FEATURES.index("only_gatk")
 N_BEFORE_RDX = FEATURES.index("only_rd")
 N_BEFORE_SIB = FEATURES.index("rd_sib_max")
+N_BEFORE_HG = FEATURES.index("only_hg")
 
 
 def load(names=None):
@@ -34,11 +35,13 @@ def load(names=None):
         d = {k: z[k] for k in z.files}
         n = d["X"].shape[1]
         if n > len(FEATURES) or (n < len(FEATURES) and n not in (N_BEFORE_SPOT, N_BEFORE_MASK, N_BEFORE_ANNOT, N_BEFORE_RD,
-                                                                   N_BEFORE_GATKONLY, N_BEFORE_RDX, N_BEFORE_SIB)):
+                                                                   N_BEFORE_GATKONLY, N_BEFORE_RDX, N_BEFORE_SIB,
+                                                                   N_BEFORE_HG)):
             continue                               # prepared with an older feature set (re-run prepare)
         if n < len(FEATURES):                      # prepared before later measurements: unknown (NaN)
             d["X"] = np.hstack([d["X"], np.full((len(d["X"]), len(FEATURES) - n), np.nan)])
-            info["no_sib_features"] = True
+            info["no_hg_features"] = True
+            info["no_sib_features"] = n < N_BEFORE_HG
             info["no_rdx_features"] = n < N_BEFORE_SIB
             info["no_gatkonly_features"] = n < N_BEFORE_RDX
             info["no_rd_features"] = n < N_BEFORE_GATKONLY

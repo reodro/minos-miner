@@ -40,7 +40,9 @@ PREFIX = {"giab": "g", "kg": "k"}
 GIAB_ONLY = ["in_mode_donor", "in_donor_bed", "donor_dist_log", "donor_indel_near",
              "rd_support", "rd_cover", "rd_frac",
              "hap_alt", "hap_ref", "hap_n", "hap_frac", "hap_rank", "hap_margin", "hap_cluster",
-             "only_rd", "rd_orig", "rd_orig_frac", "rd_sib_max", "rd_sib_ratio"]
+             "only_rd", "rd_orig", "rd_orig_frac", "rd_sib_max", "rd_sib_ratio",
+             "only_hg", "hg_post", "hg_hom", "hg_reads", "hg_anchored", "hg_lr", "hg_n_haps", "hg_rd_sup", "hg_rd_ori",
+             "hg_edit", "hg_edit_ori", "hg_unedit", "hg_win_edit_other", "hg_edit_q"]
 KG_ONLY = ["kg_mode", "in_dragen", "dragen_qual", "dragen_gq", "dragen_hom", "in_panel", "only_dragen",
            "dragen_and_gatk", "gatk_person_checked", "gatk_person_called", "gatk_person_same_gt",
            "spot_gt_same", "disagree10", "disagree30", "disagree100", "gatk_alleles_near",
@@ -49,6 +51,23 @@ KG_ONLY = ["kg_mode", "in_dragen", "dragen_qual", "dragen_gq", "dragen_hom", "in
            "gatk_fs", "gatk_sor", "gatk_site_dp_log", "gatk_inbreeding", "panel_site",
            "gatk_rec_nalt", "gatk_allele_idx", "gatk_rec_overlap", "only_gatk", "gatk_person_hom"]
 DROP = ["mode_giab"]                       # constant within a track
+
+
+def apply_class_thr(meta, keys, p_any):
+    """Per-class cut-offs meta['thr_class'] {snp, ind1, ind2_3, ind4_7, ind8+: cut-off} (chosen for points: the
+    validator weighs classes very differently), expressed by moving each score across the main cut-off."""
+    import numpy as np
+    from answer_set.k2.train import cls
+    tc = meta.get("thr_class")
+    if not tc or not len(keys):
+        return p_any
+    thr = meta["threshold"]
+    t = np.array([tc.get(cls(k), thr) for k in keys])
+    out = p_any.copy()
+    keep = p_any >= t
+    out[keep] = np.maximum(p_any[keep], thr)
+    out[~keep] = np.minimum(p_any[~keep], thr - 1e-6)
+    return out
 
 
 def apply_gt_rule(meta, X, p_hom):
@@ -62,9 +81,10 @@ def apply_gt_rule(meta, X, p_hom):
     return np.where(np.isnan(v), p_hom, v)
 
 
-def apply_source_thr(meta, X, p_any):
+def apply_source_thr(meta, X, p_any, p_raw=None):
     """giab track: candidates found ONLY by the read comparison must pass their own (stricter)
-    cut-off meta['thr_only_rd']; expressed by moving their score across the main cut-off."""
+    cut-off meta['thr_only_rd'] (tested on p_raw, the model's own score, when given); expressed by moving their score
+    across the main cut-off."""
     import numpy as np
     from answer_set.k2.features import FEATURES
     t2 = meta.get("thr_only_rd")
@@ -72,9 +92,10 @@ def apply_source_thr(meta, X, p_any):
         return p_any
     thr = meta["threshold"]
     o = X[:, FEATURES.index("only_rd")] == 1
+    q = p_any if p_raw is None else p_raw
     out = p_any.copy()
-    out[o & (p_any >= t2)] = np.maximum(p_any[o & (p_any >= t2)], thr)
-    out[o & (p_any < t2)] = np.minimum(p_any[o & (p_any < t2)], thr - 1e-6)
+    out[o & (q >= t2)] = np.maximum(p_any[o & (q >= t2)], thr)
+    out[o & (q < t2)] = np.minimum(p_any[o & (q < t2)], thr - 1e-6)
     return out
 
 
@@ -136,7 +157,7 @@ def release(track, name):
     if (dst / "meta.json").exists():
         return dst
     dst.mkdir(parents=True, exist_ok=True)
-    for f in RELEASE_FILES:
+    for f in list(RELEASE_FILES) + (["window.joblib"] if (src / "window.joblib").exists() else []):
         shutil.copy2(src / f, dst / f)
     return dst
 
@@ -193,6 +214,20 @@ def load(track, name=None, exclude_round=None):
         return (joblib.load(d / "model.joblib"), joblib.load(d / "hom.joblib"), m,
                 f"{track} track {name}: all its rounds (fold model not on this machine - it saw this round)")
     return (joblib.load(d / "model.joblib"), joblib.load(d / "hom.joblib"), m, f"{track} track {name}: all its rounds")
+
+
+def load_window(track, name, exclude_round=None):
+    """The version's window-decision model (hapwin.py), or None; the leave-out fold model for a released round it
+    trained on, like load()."""
+    import joblib
+    m = meta(track, name)
+    if m.get("window_thr") is None:
+        return None
+    if exclude_round and exclude_round in m.get("fold_of", {}):
+        fd = dev_dir(track, name) / f"fold{m['fold_of'][exclude_round]}_window.joblib"
+        if fd.exists():
+            return joblib.load(fd)
+    return joblib.load(vdir(track, name) / "window.joblib")
 
 
 def main():
