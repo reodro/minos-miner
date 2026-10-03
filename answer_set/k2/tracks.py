@@ -157,7 +157,7 @@ def release(track, name):
     if (dst / "meta.json").exists():
         return dst
     dst.mkdir(parents=True, exist_ok=True)
-    for f in list(RELEASE_FILES) + (["window.joblib"] if (src / "window.joblib").exists() else []):
+    for f in list(RELEASE_FILES) + [x for x in ("window.joblib", "spelling.joblib") if (src / x).exists()]:
         shutil.copy2(src / f, dst / f)
     return dst
 
@@ -216,18 +216,22 @@ def load(track, name=None, exclude_round=None):
     return (joblib.load(d / "model.joblib"), joblib.load(d / "hom.joblib"), m, f"{track} track {name}: all its rounds")
 
 
-def load_window(track, name, exclude_round=None):
-    """The version's window-decision model (hapwin.py), or None; the leave-out fold model for a released round it
-    trained on, like load()."""
+def load_aux(track, name, kind, exclude_round=None):
+    """A version's extra model - kind "window" (hapwin.py window decisions) or "spelling" (spelling of replaced
+    windows) - or None; the leave-out fold model for a released round the version trained on, like load()."""
     import joblib
     m = meta(track, name)
-    if m.get("window_thr") is None:
+    if not m.get({"window": "window_thr", "spelling": "spelling"}[kind]):
         return None
     if exclude_round and exclude_round in m.get("fold_of", {}):
-        fd = dev_dir(track, name) / f"fold{m['fold_of'][exclude_round]}_window.joblib"
+        fd = dev_dir(track, name) / f"fold{m['fold_of'][exclude_round]}_{kind}.joblib"
         if fd.exists():
             return joblib.load(fd)
-    return joblib.load(vdir(track, name) / "window.joblib")
+    return joblib.load(vdir(track, name) / f"{kind}.joblib")
+
+
+def load_window(track, name, exclude_round=None):
+    return load_aux(track, name, "window", exclude_round)
 
 
 def main():

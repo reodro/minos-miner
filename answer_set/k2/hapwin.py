@@ -83,6 +83,37 @@ def _inside(sorted_keys, pos, s, e):
     return out
 
 
+def pair_spellings(fa, chrom, s, ref, hap, max_len=10):
+    """Every insertion + deletion pair (each <= max_len bp, the insertion's bases taken from hap) that turns ref
+    (window starting at 1-based s) into hap exactly, left-aligned like bcftools norm. Minos often makes an insertion
+    and a deletion 10-20 bp apart in a repeat: the DNA between them is only shifted, so an aligner puts the two
+    indels elsewhere (2026-10-03: all 42 replaced windows whose spelling no alignment scheme reached were such pairs)."""
+    from answer_set.k2 import hapcand
+    d = len(hap) - len(ref)
+    out = set()
+    for a in range(0, max_len + 1):
+        b = a - d
+        if b < 1 or b > max_len or a < 1:
+            continue                                       # single indels: the alignment schemes cover them
+        for i in range(1, len(ref)):                       # insertion of hap[i:i+a] before ref[i]
+            if hap[:i] != ref[:i]:
+                break
+            ins = hap[i:i + a]
+            for j in range(i, len(ref) - b):               # deletion of ref[j:j+b] after the insertion
+                if ref[i:j] + ref[j + b:] == hap[i + a:]:
+                    ev = {(s + i - 1, ref[i - 1], ref[i - 1] + ins), (s + j - 1, ref[j - 1:j + b], ref[j - 1])}
+                    out.add(tuple(sorted(hapcand.left_align(fa, chrom, *x) for x in ev)))
+        for j in range(1, len(ref) - b):                   # deletion first, insertion after it
+            if hap[:j] != ref[:j]:
+                break
+            for i in range(j + b, len(ref) + 1):
+                ins = hap[i - b:i - b + a]
+                if ref[j + b:i] == hap[j:i - b] and ref[i:] == hap[i - b + a:]:
+                    ev = {(s + j - 1, ref[j - 1:j + b], ref[j - 1]), (s + i - 1, ref[i - 1], ref[i - 1] + ins)}
+                    out.add(tuple(sorted(hapcand.left_align(fa, chrom, *x) for x in ev)))
+    return [list(x) for x in sorted(out)]                 # a fixed order: the spelling chooser breaks ties by position
+
+
 def _hp_max(seq):
     best = run = 1
     for a, b in zip(seq, seq[1:]):
@@ -162,11 +193,91 @@ def label(cands, truth):
     return np.array(y, dtype=np.int8), answer_ok
 
 
-def apply(recs, cands, p, thr):
+# Spelling of replaced windows. The validator's scorer gives each truth record a class (SNP, 1-bp indel, ...) from
+# its spelling, so where our answer set stands in for the truth, a window written as one SNP where Minos wrote a
+# deletion + an insertion is scored in the wrong class. Options: the decompositions of several alignment schemes and
+# every insertion + deletion pair (pair_spellings); a model trained on released rounds (train_spelling.py) picks the
+# one Minos most likely wrote. 2026-10-03, windows the window decision fixes, 108 rounds held out: exactly Minos's
+# records 59.9% (fewest events) -> 72.0% (learned); reachable 83.3%.
+SPELL_SCHEMES = [(6, 3, 1), (8, 2, 1), (4, 6, 1), (12, 1, 1), (20, 1, 1), (10, 2, 0), (5, 4, 1), (16, 3, 1)]
+SPELL_FEATS = ["n_ev", "n_indel", "n_snp", "n_known", "p_sum", "p_max", "p_min", "scheme", "n_ins", "n_del",
+               "len_max", "span", "del_ins_pair", "unknown_indel", "n_options", "rank_fewest"]
+
+
+def _clean(ev, s, ref, hap):
+    """A usable spelling: events that do not overlap one another after left-alignment and give exactly hap.
+    Overlapping records (an insertion inside a deletion, two events at one position) are the same DNA but hap.py
+    cannot match them (2026-10-03: 4 of 28 rounds scored up to 0.05 lower with them)."""
+    ev = sorted(ev)
+    for x, y in zip(ev, ev[1:]):
+        if y[0] <= x[0] + len(x[1]) - 1:
+            return False
+    return _apply(ref, s, ev) == hap
+
+
+def spelling_options(fa, chrom, s, ref, hap):
+    """[(events, scheme index; 99 = insertion + deletion pair)] - every distinct usable spelling of hap."""
+    import parasail
+    from answer_set.k2 import hapcand, hapgeno
+    out, seen = [], set()
+    for i, (mm, go, ge) in enumerate(SPELL_SCHEMES):
+        hapgeno._MATRICES.setdefault(mm, parasail.matrix_create("ACGTN", 1, -mm))
+        ev = hapgeno._decompose(ref, hap, s, mm, go, ge)
+        if not ev or any(abs(len(x[1]) - len(x[2])) > hapcand.MAX_INDEL for x in ev):
+            continue
+        ev = tuple(sorted({hapcand.left_align(fa, chrom, *x) for x in ev}))
+        if ev not in seen and _clean(ev, s, ref, hap):
+            seen.add(ev); out.append((ev, i))
+    for ev in pair_spellings(fa, chrom, s, ref, hap):
+        ev = tuple(ev)
+        if ev not in seen and _clean(ev, s, ref, hap):
+            seen.add(ev); out.append((ev, 99))
+    return out
+
+
+def spelling_features(opts, p_of):
+    """Feature rows (SPELL_FEATS) for the options of one sequence."""
+    order = sorted(range(len(opts)), key=lambda j: (len(opts[j][0]), opts[j][1]))
+    rows = []
+    for j, (ev, i) in enumerate(opts):
+        ind = [k for k in ev if len(k[1]) != len(k[2])]
+        ps = [p_of[k] for k in ev if k in p_of]
+        ins = [k for k in ind if len(k[2]) > len(k[1])]
+        dels = [k for k in ind if len(k[1]) > len(k[2])]
+        rows.append([len(ev), len(ind), len(ev) - len(ind), len(ps), sum(ps), max(ps, default=math.nan),
+                     min(ps, default=math.nan), i, len(ins), len(dels),
+                     max([abs(len(k[1]) - len(k[2])) for k in ind], default=0), max(k[0] for k in ev) - min(k[0] for k in ev),
+                     float(any(abs(a[0] - b[0]) <= 20 for a in ins for b in dels)), float(sum(k not in p_of for k in ind)),
+                     len(opts), order.index(j)])
+    return np.array(rows, dtype=float)
+
+
+def respell(fa, chrom, s, w, p_of, chooser):
+    """The window's called pair as events in the spelling the chooser prefers {key: zyg}; None if a sequence has no
+    usable spelling."""
+    ref = w["ref"]
+    picked = []
+    for h in sorted(set(w["pair"]) - {ref}):
+        opts = spelling_options(fa, chrom, s, ref, h)
+        if not opts:
+            return None
+        q = chooser.predict_proba(spelling_features(opts, p_of))[:, 1]
+        picked.append(set(opts[int(np.argmax(q))][0]))
+    hom = w["pair"][0] == w["pair"][1]
+    out = {}
+    for ev in picked:
+        for k in ev:
+            out[k] = "hom" if hom or k in out else "het"
+    return out
+
+
+def apply(recs, cands, p, thr, respell_fn=None):
     """recs (assemble_records output: (pos, ref, alt, zyg, synthetic, confidence)) with the windows scored >= thr
-    replaced by their called events (most confident first; overlapping windows skipped)."""
+    replaced by their called events (most confident first; overlapping windows skipped). respell_fn(cand) -> events in
+    another spelling (or None to keep the genotyper's); windows holding the person's own records keep theirs."""
     order = sorted(range(len(cands)), key=lambda i: -p[i])
     taken, drop, add = [], set(), []
+    own = {(r[0], r[1], r[2]) for r in recs if not r[4]}
     for i in order:
         if p[i] < thr:
             break
@@ -175,6 +286,8 @@ def apply(recs, cands, p, thr):
             continue
         taken.append((s, e))
         drop.update(k for k, _ in A)
+        if respell_fn is not None and not any(k in own for k in ev):
+            ev = respell_fn(cands[i]) or ev
         add.extend((k[0], k[1], k[2], z, True, float(p[i])) for k, z in ev.items())
     # the person's own GIAB records (synthetic False) stay exactly as published, het/hom included
     kept = [r for r in recs if (r[0], r[1], r[2]) not in drop or not r[4]]

@@ -28,18 +28,19 @@ the released truth.
 | `k2/kg.py`, `k2/masks.py` | 1000G person, DRAGEN / GATK lookups, panel index; region masks |
 | `k2/giab_origin.py`, `k2/readdiff.py`, `k2/localhap.py` | GIAB original reads, read-vs-original comparison, local haplotypes |
 | `k2/hapgeno.py`, `k2/hapcand.py` | edit-aware local haplotype genotyper (GIAB): the person's two local sequences per spot |
-| `k2/hapwin.py`, `k2/train_window.py` | window decisions: where the genotyper's whole-window answer replaces the per-variant one |
+| `k2/hapwin.py`, `k2/train_window.py`, `k2/train_spelling.py` | window decisions: where the genotyper's whole-window answer replaces the per-variant one, and how it is spelled |
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g013_20261003T1402, 1000G k006) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g017_20261003T1904, 1000G k006) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
 Inputs, under `SETTINGS.data_dir` (listed in `k2/util.py`): the shared `reference/`, `giab/<donor>.vcf.gz|.bed` and
 `1kg/{phased,index,gatk_sites,masks}` (the last three: the builder's 1000G inputs). This clone's `cache/answer_set/k2/`: one build per
 round, downloads (Google originals, per-person GATK), mask intervals, trained versions with their leave-out models,
-prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/train_track.py` (GIAB: then `k2/train_window.py --base <version>`).
+prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/train_track.py` (GIAB: then `k2/train_window.py --base <version>`, then
+`k2/train_spelling.py --version <that version>`).
 
 - Needs Docker (the validator's bcftools 1.20 image), internet (S3 DRAGEN, EBI GATK, Google NovaSeq originals),
   `edlib` and `parasail` (requirements.txt). ~1-1.5 min per round on 16 cores.
@@ -77,14 +78,22 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   On 28 rounds (22 unseen + 6 leave-out), hap.py vs the released truth: median 99.682 -> 99.731, mean 99.667 ->
   99.732 (better than its base g011 in 27/28); inserted 1-bp indels missed 12.1 -> 8.9 per round, extras 7.3 -> 5.5;
   points lost per round 0.231 -> 0.179 (1-bp indels 0.154 -> 0.113; before the genotyper, g007: 0.296 / 0.199).
-  Replaced windows are written in the genotyper's spelling: hap.py compares DNA, so the score counts them, but a
-  record-level comparison shows them as other spellings / het-hom mismatches.
+- g017 (released 2026-10-03) = g013 + the spelling of replaced windows. The validator's scorer classes each truth
+  record by its spelling, so where our answer set stands in for the truth (local scoring of configs), a window
+  written as one SNP where Minos wrote a deletion + an insertion lands in the wrong class (weight 0.18 instead of
+  0.40). Options: the decompositions of 8 alignment schemes and every insertion + deletion pair (Minos often shifts
+  a repeat that way, 10-20 bp apart); a model trained on the same rounds picks the one Minos most likely wrote.
+  Options whose records overlap after left-alignment (an insertion inside a deletion) are dropped: hap.py cannot
+  match them. Held out on 108 rounds, windows the window decision fixes: exactly Minos's records 59.9% -> ~72%
+  (reachable 83.3%). 28 rounds: hap.py score unchanged (identical to g013 in 27/28, mean 99.732 -> 99.731);
+  inserted 1-bp indel records missed 375 -> 354, wrong het/hom 148 -> 131, extra 127 -> 97. Fresh round 2026-10-03
+  16:41 (HG003): 99.483 -> 99.508.
 
 ## Open work
 
 - **Inserted 1-bp indels** still cause most of the remaining loss (~9 missed + 5.5 extra per round with g013): the
   ~40% of fixable windows the window model leaves alone, sequences noise splits so the genotyper never lists them,
   spots with no window.
-- **Spelling of replaced windows**: write them the way Minos does, so local scoring of miners' callsets classifies
-  those records like the validator.
+- **Spelling**: ~28% of replaced windows are still not spelled exactly like Minos (~17% need spellings no option
+  produces yet).
 - **`update()` during a live round** (parked by the user).

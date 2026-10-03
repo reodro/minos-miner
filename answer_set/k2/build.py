@@ -127,7 +127,14 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
                                   dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]])
         if cands:
             pw = wm.predict_proba(np.vstack([c[5] for c in cands]))[:, 1]
-            recs, n_windows = hapwin.apply(recs, cands, pw, meta["window_thr"])
+            vname = (track_versions or {}).get(track) or tracks.active_name(track)
+            sm = tracks.load_aux(track, vname, "spelling", exclude_round)
+            respell_fn = None
+            if sm is not None:                           # write replaced windows the way Minos most likely did
+                fa_ = pysam.FastaFile(str(ref_path(chrom)))
+                p_of = dict(zip(keys, p_raw))
+                respell_fn = lambda c: hapwin.respell(fa_, chrom, c[0], c[2], p_of, sm)  # noqa: E731
+            recs, n_windows = hapwin.apply(recs, cands, pw, meta["window_thr"], respell_fn)
     write_vcf(out / "truth.vcf.gz", chrom, [r[:5] for r in recs])
     write_scores(out / "scores.tsv.gz", keys, p_any, donor, allowed)
 

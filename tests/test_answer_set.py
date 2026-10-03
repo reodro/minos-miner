@@ -356,6 +356,73 @@ class K2HapwinTest(unittest.TestCase):
         self.assertEqual(sum(1 for r in out if r[:3] == self.ins), 1)
 
 
+class K2SpellingTest(unittest.TestCase):
+    """Spelling of replaced windows: options include Minos's insertion + deletion pairs; the chooser's pick is written."""
+
+    def setUp(self):
+        import random
+        import tempfile
+        import pysam
+        self.tmp = tempfile.TemporaryDirectory()
+        rnd = random.Random(5)
+        body = "".join(rnd.choice("CG") for _ in range(400))
+        self.ref_full = body[:200] + "ATATATATATATATATAT" + body[218:]     # an AT repeat at 201-218
+        with open(f"{self.tmp.name}/chrS.fa", "w") as f:
+            f.write(">chrS\n" + self.ref_full + "\n")
+        pysam.faidx(f"{self.tmp.name}/chrS.fa")
+        self.fa = pysam.FastaFile(f"{self.tmp.name}/chrS.fa")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pair_spellings_find_minos_pair(self):
+        from answer_set.k2 import hapwin
+        s = 190
+        ref = self.ref_full[s - 1:s + 39]
+        pair = [(195, ref[5], ref[5] + "T"), (210, "TA", "T")]        # an insertion and a deletion 15 bp apart
+        hap = hapwin._apply(ref, s, pair)
+        from answer_set.k2 import hapcand
+        got = [sorted(x) for x in hapwin.pair_spellings(self.fa, "chrS", s, ref, hap)]
+        self.assertTrue(got)
+        self.assertTrue(all(hapwin._apply(ref, s, g) == hap for g in got))          # every option: the same DNA
+        self.assertIn(sorted(hapcand.left_align(self.fa, "chrS", *k) for k in pair), got)   # Minos's own pair
+
+    def test_overlapping_spellings_are_dropped(self):
+        from answer_set.k2 import hapwin
+        s, ref = 190, self.ref_full[189:229]
+        hap = hapwin._apply(ref, s, [(195, ref[5], ref[5] + "T"), (210, "TA", "T")])
+        for ev, _ in hapwin.spelling_options(self.fa, "chrS", s, ref, hap):
+            ev = sorted(ev)
+            self.assertTrue(all(y[0] > x[0] + len(x[1]) - 1 for x, y in zip(ev, ev[1:])))   # no overlapping records
+            self.assertEqual(hapwin._apply(ref, s, ev), hap)                                # the called DNA
+        self.assertFalse(hapwin._clean([(200, "TAT", "T"), (201, "A", "AG")], s, ref, hap))  # insertion inside a deletion
+
+    def test_respell_writes_the_chosen_spelling(self):
+        import numpy as np
+        from answer_set.k2 import hapwin
+
+        class PreferPairs:                                            # a chooser that always picks a pair spelling
+            def predict_proba(self, X):
+                q = (X[:, hapwin.SPELL_FEATS.index("scheme")] == 99).astype(float)
+                return np.c_[1 - q, q]
+        s = 190
+        ref = self.ref_full[s - 1:s + 39]
+        hap = hapwin._apply(ref, s, [(195, ref[5], ref[5] + "T"), (210, "TA", "T")])
+        ev = hapwin.respell(self.fa, "chrS", s, {"ref": ref, "pair": (hap, hap)}, {}, PreferPairs())
+        self.assertEqual(len(ev), 2)
+        self.assertEqual(set(ev.values()), {"hom"})                   # both copies carry it
+        self.assertEqual(hapwin._apply(ref, s, list(ev)), hap)        # same DNA as called
+
+    def test_own_records_keep_their_spelling(self):
+        import numpy as np
+        from answer_set.k2 import hapwin
+        own = (195, "C", "CT")
+        recs = [(195, "C", "CT", "het", False, 2.0)]
+        cand = (190, 230, {}, [(own, "het")], {own: "het"}, np.zeros(len(hapwin.FEATS)))
+        out, n = hapwin.apply(recs, [cand], np.array([0.9]), 0.4, respell_fn=lambda c: {(201, "A", "G"): "het"})
+        self.assertEqual((out, n), (recs, 1))                         # not respelled, the person's record kept
+
+
 class K2AssembleTest(unittest.TestCase):
     """Model scores -> truth records: donor background copied, threshold, <= 2 alleles per position, BED rule."""
 
