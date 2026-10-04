@@ -46,7 +46,9 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
 - Needs Docker (the validator's bcftools 1.20 image), internet (S3 DRAGEN, EBI GATK, Google NovaSeq originals),
   `edlib` and `parasail` (requirements.txt). ~1-1.5 min per round on 16 cores.
 - Released rounds (`round.released_dir` set) use the leave-out fold model that never saw the round.
-- 1000G rounds: nothing is flagged `SYNTHETIC`, so every record is `germline` (the score uses all records).
+- 1000G rounds: Minos flags the inserted mutations `SYNTHETIC` here too (all 45 rounds checked 2026-10-04); k012+ builds
+  flag the model's calls (everything not copied by the person's rule) the same way. The validator scores with
+  mutations.vcf and ignores the flag, so scores do not depend on it; `main/review.py` / `status.py` use the split.
 - Never silently weaker, never stuck: the GIAB read comparison (Google originals) gets up to 3 tries within 900 s
   (a bug is not retried); if it still fails the build goes on without it (inserted 1-bp indels ~2 points worse).
   Every download and Docker call has a time limit, because main builds the answer set before it can submit.
@@ -114,7 +116,7 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   false-positive part (extras ~110 -> ~83 per round); indel F1 slightly lower.
 - 1000G truth, measured on the released rounds: the person's public calls that BOTH DRAGEN and GATK made (DRAGEN-only
   calls are never kept), minus a soft, quality-dependent share Minos drops (indels kept 89%, SNPs 97%; by GATK
-  VQSLOD), plus ~6,700 inserted mutations per round with no `SYNTHETIC` flag. The reads are the person's real public
+  VQSLOD), plus ~6,700 inserted mutations per round (flagged `SYNTHETIC`). The reads are the person's real public
   1000G reads (2x150, ~34x): ~82% of pairs kept, each read cut to its first 128 bases, mutations and some noise
   added, names hashed, realigned.
 - k010 (1000G, released 2026-10-04) = k007 + the read comparison: each round read against the person's public

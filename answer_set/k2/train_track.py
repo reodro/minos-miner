@@ -38,6 +38,9 @@ IN_BED = FEATURES.index("in_donor_bed")
 # ~110 extras per round, ~0.7 points).
 CLASS_W = {"snp": 0.20, "ind1": 0.40, "ind2_3": 0.16, "ind4_7": 0.10, "ind8+": 0.14}
 POINT_ALPHA = 1.0
+# kg track with Minos's exact rule for the person's part (kg.gatk_person_own, meta kg_own_rule): that part is copied
+# and the person's other GATK calls are never written, so the model learns and is judged only on the rest
+KG_OWN_RULE = False
 THR_GRID = [round(0.1 + 0.05 * i, 2) for i in range(17)]
 
 
@@ -55,6 +58,8 @@ def model():
 def rows(track, r, for_hom=False):
     if track == "giab":
         m = r["X"][:, IN_DONOR] == 0                  # candidates the person's list does not explain
+    elif KG_OWN_RULE:
+        m = np.nan_to_num(r["X"][:, FEATURES.index("gatk_person_called")]) != 1
     else:
         m = np.ones(len(r["X"]), dtype=bool)
     if for_hom:
@@ -107,7 +112,8 @@ def class_points(rs, oof, truths, c, t, track="giab"):
         pred = m & (pa >= t)
         tp = int(np.sum(pred & (r["y_any"] == 1) & ((ph >= 0.5) == (r["y_hom"] == 1))))
         t_ = truths[r["name"]]
-        own = sum(1 for k, (z, syn) in t_.items() if not syn and cls(k) == c) if track == "giab" else 0
+        own = (sum(1 for k, (z, syn) in t_.items() if not syn and cls(k) == c) if track == "giab" else
+               sum(1 for k in t_ if cls(k) == c and k in r["_own"]) if KG_OWN_RULE else 0)
         n_truth = sum(1 for k in t_ if cls(k) == c)
         v = CLASS_W[c] * 2 * (own + tp) / max(1, own + int(pred.sum()) + n_truth)
         if track == "kg":
@@ -151,6 +157,12 @@ def train(track, rs, name):
                                   for r in rs)
     feats = tracks.features_for(track, kg_rd)
     cols = [FEATURES.index(f) for f in feats]
+    if track == "kg" and KG_OWN_RULE:                # the person's part of each round's truth, by the rule
+        from answer_set.k2 import kg
+        from answer_set.k2.util import parse_region
+        for r in rs:
+            ch, a_, b_ = parse_region(r["info"]["region"])
+            r["_own"] = set(kg.gatk_person_own(ch, a_, b_, r["info"]["kg"]["person"])[0])
     out = tracks.vdir(track, name)
     out.mkdir(parents=True, exist_ok=True)
     buf = io.StringIO()
@@ -224,6 +236,8 @@ def train(track, rs, name):
                 "rounds": names, "fold_of": fold_of, "threshold": thr, "heldout_f1": round(table[thr], 5),
                 "bed_rule": bed_rule, "n_targets_median": 580.0, "gt_from_gatk": track == "kg",
                 "thr_only_rd": thr_rd, "thr_class": thr_class, "point_alpha": POINT_ALPHA if cost else None}
+        if track == "kg" and KG_OWN_RULE:
+            meta["kg_own_rule"] = 1
         if track == "giab":
             from answer_set.k2 import features as _features
             meta["rd_1bp_factor"] = _features.RD_1BP_FACTOR
@@ -234,7 +248,7 @@ def train(track, rs, name):
 
 
 def main():
-    global POINT_ALPHA
+    global POINT_ALPHA, KG_OWN_RULE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--track", required=True, choices=tracks.TRACKS)
     ap.add_argument("--same-rounds-as", help="train on the rounds (of this track) that a track version used")
@@ -242,8 +256,11 @@ def main():
     ap.add_argument("--exclude-rounds", help="file with round dirs to leave out (e.g. a test set)")
     ap.add_argument("--point-alpha", type=float, default=POINT_ALPHA,
                     help="weight rows by class error cost ** alpha (0: unweighted)")
+    ap.add_argument("--kg-own-rule", action="store_true",
+                    help="kg: the person's part is copied by Minos's exact rule; learn only the rest")
     args = ap.parse_args()
     POINT_ALPHA = args.point_alpha
+    KG_OWN_RULE = args.kg_own_rule
     want = None
     if args.same_rounds_as:
         n = args.same_rounds_as

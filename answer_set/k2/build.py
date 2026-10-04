@@ -153,6 +153,8 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         bed = beds[info["mode_donor"]]
         allowed = lambda k: bed.contains(k[0]) and bed.contains(k[0] + len(k[1]) - 1)  # noqa: E731
     recs = assemble_records(keys, p_any, p_hom, thr, info["mode_giab"], donor, allowed)
+    if isinstance(kg_own, int):                       # 1000G: the model's calls are the inserted mutations, flagged
+        recs = [r[:4] + (k_ not in donor,) + r[5:] for r in recs for k_ in [(r[0], r[1], r[2])]]  # as Minos does
     n_windows = None
     if info["mode_giab"] and meta.get("window_thr") is not None and (out / "work" / "hg_windows.pkl.gz").exists():
         # window decisions: where the genotyper's whole-window answer replaces the per-variant one (hapwin.py)
