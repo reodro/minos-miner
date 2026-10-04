@@ -423,6 +423,33 @@ class K2SpellingTest(unittest.TestCase):
         self.assertEqual((out, n), (recs, 1))                         # not respelled, the person's record kept
 
 
+class K2WriteTest(unittest.TestCase):
+    """The person's own records are written exactly as Minos's truth writes them: NIST's REF, ALT order and genotype
+    order (2|1 -> 2/1). The validator classes a two-allele record by the allele its genotype names first."""
+
+    def test_donor_genotype_order_kept(self):
+        import gzip
+        import tempfile
+        from unittest import mock
+        import pysam
+        from answer_set.k2 import build
+        with tempfile.TemporaryDirectory() as d:
+            ref = "A" * 100 + "CGTGTGTGTGTGTGT" + "A" * 100
+            with open(f"{d}/chrW.fa", "w") as f:
+                f.write(">chrW\n" + ref + "\n")
+            pysam.faidx(f"{d}/chrW.fa")
+            raw = {101: ("CGTGTGTGTGTGTGT", ("CGT", "C"), "2/1")}            # NIST 2|1: a 12-bp and a 14-bp deletion
+            from answer_set.k2.util import trim
+            recs = [trim(101, "CGTGTGTGTGTGTGT", a_) + ("het", False) for a_ in ("CGT", "C")]   # as read_alleles gives them
+            recs.append((50, "A", "G", "het", True))                             # + an inserted SNP
+            with mock.patch.object(build, "ref_path", lambda c: __import__("pathlib").Path(f"{d}/chrW.fa")):
+                build.write_vcf(f"{d}/t.vcf.gz", "chrW", recs, raw)
+            lines = [l.rstrip("\n").split("\t") for l in gzip.open(f"{d}/t.vcf.gz", "rt") if not l.startswith("#")]
+        self.assertEqual([l[1] for l in lines], ["50", "101"])                # sorted
+        self.assertEqual(lines[1][3:5] + [lines[1][9]], ["CGTGTGTGTGTGTGT", "CGT,C", "2/1"])
+        self.assertEqual(lines[0][7], "SYNTHETIC")
+
+
 class K2AssembleTest(unittest.TestCase):
     """Model scores -> truth records: donor background copied, threshold, <= 2 alleles per position, BED rule."""
 

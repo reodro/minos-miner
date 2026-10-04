@@ -14,6 +14,7 @@ How it works:
   3. The format's model track decides which remaining candidates are real, and whether each is het or hom.
 """
 import json
+from collections import Counter
 import time
 from pathlib import Path
 
@@ -41,17 +42,34 @@ def write_scores(path, keys, p_any, donor, allowed):
             fh.write(f"{k[0]}\t{k[1]}\t{k[2]}\t{p:.4f}\n")
 
 
-def write_vcf(path, chrom, records):
+def write_vcf(path, chrom, records, donor_raw=None):
     """records: list of (pos, ref, alt, zyg, synthetic). Writes bgzipped + indexed VCF.
 
     Alleles sharing a position are merged into one record (genotype 1/2), expressed
     against the longest REF among them, as a person carries at most two alleles.
+    donor_raw {pos: (REF, ALTs, GT)} (util.donor_records): where every allele at a position is one of the person's
+    own and they are exactly that record's, the record is written as Minos's truth writes it (NIST's REF, ALT order
+    and genotype order).
     """
+    from answer_set.k2.util import trim
     fai = {l.split()[0]: int(l.split()[1]) for l in open(str(ref_path(chrom)) + ".fai")}
+    lines = []
+    if donor_raw:                                  # the person's own records, exactly as Minos's truth writes them
+        allele_of = {}                             # minimal allele -> its NIST record's position
+        for rp, (R0, alts, gt) in donor_raw.items():
+            for g in {int(x) for x in gt.split("/") if x not in ("0", ".")}:
+                allele_of[trim(rp, R0, alts[g - 1])] = rp
+        have = Counter(allele_of.get(trim(*r[:3])) for r in records if not r[4])
+        raw_done = set()
+        for rp, (R0, alts, gt) in donor_raw.items():
+            n = len({int(x) for x in gt.split("/") if x not in ("0", ".")})
+            if have.get(rp) == n:
+                lines.append((rp, f"{chrom}\t{rp}\t.\t{R0}\t{','.join(alts)}\t60\tPASS\t.\tGT\t{gt}\n"))
+                raw_done.add(rp)
+        records = [r for r in records if r[4] or allele_of.get(trim(*r[:3])) not in raw_done]
     by_pos = {}
     for r in records:
         by_pos.setdefault(r[0], []).append(r)
-    lines = []
     for pos in sorted(by_pos):
         rs = by_pos[pos][:2]
         R = max((r[1] for r in rs), key=len)
@@ -62,8 +80,9 @@ def write_vcf(path, chrom, records):
         else:
             alts = alts[:1]
             gt = "1/1" if rs[0][3] == "hom" else "0/1"
-        lines.append(f"{chrom}\t{pos}\t.\t{R}\t{','.join(alts)}\t60\tPASS\t"
-                     f"{'SYNTHETIC' if syn else '.'}\tGT\t{gt}\n")
+        lines.append((pos, f"{chrom}\t{pos}\t.\t{R}\t{','.join(alts)}\t60\tPASS\t"
+                           f"{'SYNTHETIC' if syn else '.'}\tGT\t{gt}\n"))
+    lines = [l for _, l in sorted(lines, key=lambda t: t[0])]
     plain = Path(str(path)[:-3]) if str(path).endswith(".gz") else Path(path)
     with open(plain, "w") as fh:
         fh.write("##fileformat=VCFv4.2\n##FILTER=<ID=PASS,Description=\"All filters passed\">\n")
@@ -135,7 +154,11 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
                 p_of = dict(zip(keys, p_raw))
                 respell_fn = lambda c: hapwin.respell(fa_, chrom, c[0], c[2], p_of, sm)  # noqa: E731
             recs, n_windows = hapwin.apply(recs, cands, pw, meta["window_thr"], respell_fn)
-    write_vcf(out / "truth.vcf.gz", chrom, [r[:5] for r in recs])
+    donor_raw = None
+    if info["mode_giab"]:
+        from answer_set.k2.util import donor_records
+        donor_raw = donor_records(info["mode_donor"], chrom, a, b)
+    write_vcf(out / "truth.vcf.gz", chrom, [r[:5] for r in recs], donor_raw)
     write_scores(out / "scores.tsv.gz", keys, p_any, donor, allowed)
 
     # mutations file: only its entry count N matters to the v2 score (false-call divisor).

@@ -32,7 +32,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g017_20261003T1904, 1000G k006) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g024_20261004T0101, 1000G k006) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -88,6 +88,17 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   (reachable 83.3%). 28 rounds: hap.py score unchanged (identical to g013 in 27/28, mean 99.732 -> 99.731);
   inserted 1-bp indel records missed 375 -> 354, wrong het/hom 148 -> 131, extra 127 -> 97. Fresh round 2026-10-03
   16:41 (HG003): 99.483 -> 99.508.
+- g024 (released 2026-10-04) = g017's models with per-class cut-offs chosen by the validator's FULL score (core +
+  false-positive part), not weight x F1: an extra call costs its class's F1 and ~0.0065 points of the false-positive
+  part, a missed one only the F1 - so extra SNPs cost ~14x a missed one. SNP 0.80, 1 bp 0.60, 2-3 bp 0.75, 4-7 bp
+  0.60, >= 8 bp 0.30. 28 rounds: +0.016 per round (better 20/28; SNP het missed 7.9 -> 11.0, extra calls in the
+  region 13.5 -> 11.3); 6 fresh rounds (2026-10-03 16:41-22:41, unused in any choice): +0.025 (5/6).
+- Writing the person's records: exactly as Minos's truth writes them - NIST's REF, ALT order and genotype order
+  (2|1 -> 2/1, `util.donor_records`). The validator classes a two-allele record by the allele its genotype names
+  first; writing 1/2 for NIST's 2/1 moved ~20 records per round out of the >= 8 bp class (found by the search
+  agent's top-band ranking test on 2026-10-02 11:53: local scores under-rated configs with better 4-7 / >= 8 bp
+  calling). 28 rounds, truth records per class vs the released truth: >= 8 bp shift 19.8 -> 0.2, 4-7 bp 6.0 -> 1.4,
+  2-3 bp 5.1 -> 2.2; our own score unchanged.
 
 ## Open work
 

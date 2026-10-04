@@ -170,6 +170,23 @@ class Bed:
         return sum(max(0, min(y, b) - max(x, a - 1)) for x, y in self.iv if y > a - 1 and x < b)
 
 
+def donor_records(d, chrom, a, b):
+    """{pos: (REF, ALTs, GT)} of the donor's GIAB records in the window, written the way Minos's truth writes them:
+    NIST's own REF, ALT order and genotype order, phased '|' as '/'. The validator classes a two-allele record by
+    the allele its genotype names first (2/1 vs 1/2), so the order matters for the score (2026-10-04: writing 1/2 for
+    NIST's 2/1 moved ~14 records per round from the >= 8 bp class to shorter classes)."""
+    import pysam
+    out = {}
+    f = pysam.VariantFile(str(donor_vcf(d)))
+    for rec in f.fetch(chrom, max(0, a - 1), b):
+        s = rec.samples[0]
+        gt = s.get("GT")
+        if not gt or any(g is None for g in gt):
+            continue
+        out[rec.pos] = (rec.ref, tuple(rec.alts or ()), "/".join(str(g) for g in gt))
+    return out
+
+
 def load_donor_alleles(chrom, a, b):
     """{donor: {key: zygosity}} for each GIAB donor in the window."""
     out = {}
