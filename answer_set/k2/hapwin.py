@@ -271,16 +271,24 @@ def respell(fa, chrom, s, w, p_of, chooser):
     return out
 
 
+def window_group(c):
+    """what a candidate window changes: "1-3 bp indel" (any), "SNP only", or "longer indel" - for per-group cut-offs"""
+    L = [abs(len(k[1]) - len(k[2])) for k in list(c[4]) + [k for k, _ in c[3]]]
+    return "1-3 bp indel" if any(1 <= x <= 3 for x in L) else "SNP only" if all(x == 0 for x in L) else "longer indel"
+
+
 def apply(recs, cands, p, thr, respell_fn=None):
     """recs (assemble_records output: (pos, ref, alt, zyg, synthetic, confidence)) with the windows scored >= thr
-    replaced by their called events (most confident first; overlapping windows skipped). respell_fn(cand) -> events in
+    replaced by their called events (most confident first; overlapping windows skipped). thr: one cut-off, or
+    {window_group: cut-off} (meta window_thr_group; "default" for a group not listed). respell_fn(cand) -> events in
     another spelling (or None to keep the genotyper's); windows holding the person's own records keep theirs."""
     order = sorted(range(len(cands)), key=lambda i: -p[i])
+    t_of = (lambda i: thr.get(window_group(cands[i]), thr.get("default", 0.5))) if isinstance(thr, dict) else (lambda i: thr)
     taken, drop, add = [], set(), []
     own = {(r[0], r[1], r[2]) for r in recs if not r[4]}
     for i in order:
-        if p[i] < thr:
-            break
+        if p[i] < t_of(i):
+            continue
         s, e, w, A, ev, _ = cands[i]
         if any(not (e < a or s > b) for a, b in taken):
             continue

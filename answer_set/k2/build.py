@@ -153,7 +153,9 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
                 fa_ = pysam.FastaFile(str(ref_path(chrom)))
                 p_of = dict(zip(keys, p_raw))
                 respell_fn = lambda c: hapwin.respell(fa_, chrom, c[0], c[2], p_of, sm)  # noqa: E731
-            recs, n_windows = hapwin.apply(recs, cands, pw, meta["window_thr"], respell_fn)
+            wthr = dict(meta["window_thr_group"], default=meta["window_thr"]) if meta.get("window_thr_group") \
+                else meta["window_thr"]
+            recs, n_windows = hapwin.apply(recs, cands, pw, wthr, respell_fn)
     donor_raw = None
     if info["mode_giab"]:
         from answer_set.k2.util import donor_records

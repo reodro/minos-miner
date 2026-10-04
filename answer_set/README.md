@@ -32,7 +32,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g024_20261004T0101, 1000G k006) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k006) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -93,6 +93,11 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   part, a missed one only the F1 - so extra SNPs cost ~14x a missed one. SNP 0.80, 1 bp 0.60, 2-3 bp 0.75, 4-7 bp
   0.60, >= 8 bp 0.30. 28 rounds: +0.016 per round (better 20/28; SNP het missed 7.9 -> 11.0, extra calls in the
   region 13.5 -> 11.3); 6 fresh rounds (2026-10-03 16:41-22:41, unused in any choice): +0.025 (5/6).
+- g026 (released 2026-10-04) = g024 + window cut-offs per group of windows, chosen by validator points on held-out
+  training rounds (a replaced window gains or loses its records' class costs and the false-positive part's cost of
+  extra calls): 1-3 bp indel windows 0.55, SNP-only 0.85 (at 0.40 they lost points), longer indels 0.75. 28 rounds
+  +0.006 per round (better in 15, worse in 8); fresh rounds not used for tuning: 2026-10-03 +0.029 (6/6), 2026-10-04
+  +0.016 (4/5); ~3 fewer windows replaced and 1-3 fewer extra calls per round.
 - Writing the person's records: exactly as Minos's truth writes them - NIST's REF, ALT order and genotype order
   (2|1 -> 2/1, `util.donor_records`). The validator classes a two-allele record by the allele its genotype names
   first; writing 1/2 for NIST's 2/1 moved ~20 records per round out of the >= 8 bp class (found by the search
