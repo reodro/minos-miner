@@ -264,6 +264,37 @@ def gatk_person_layout(chrom, a, b, sample):
     return out
 
 
+def gatk_person_own(chrom, a, b, sample):
+    """The person's part of Minos's 1000G truth, exactly: their GATK calls (raw high-coverage callset) whose site
+    FILTER is PASS, with the person's DP >= 10 and GQ >= 20, at GATK's genotype (measured 2026-10-04 on 590,556
+    calls in 43 rounds: every call passing is in the truth, none failing is; DRAGEN plays no part).
+    Returns ({key: 'het'|'hom'} of those calls, every key of the person's GATK calls in [a, b])."""
+    import pysam
+    gatk_person_region(chrom, a, b, sample)
+    own, every = {}, set()
+    for rec in pysam.VariantFile(str(_person_path(chrom, a, b, sample))):
+        s = rec.samples[0]
+        gt = s.get("GT")
+        if not gt or any(g is None for g in gt):
+            continue
+        ok = list(rec.filter.keys()) in (["PASS"], []) and (s.get("DP") or 0) >= OWN_MIN_DP \
+            and (s.get("GQ") or 0) >= OWN_MIN_GQ
+        for i_ in {g for g in gt if g}:
+            alt = rec.alleles[i_]
+            if alt.startswith("<") or alt == "*":
+                continue
+            k = trim(rec.pos, rec.ref, alt)
+            if not a <= k[0] <= b:
+                continue
+            every.add(k)
+            if ok:
+                own[k] = "hom" if len(set(gt)) == 1 else "het"
+    return own, every
+
+
+OWN_MIN_DP, OWN_MIN_GQ = 10, 20
+
+
 def gatk_person_region(chrom, a, b, sample, chunks=8, attempts=10):
     """The person's GATK calls for the WHOLE region (all SNPs and indels), fetched as `chunks`
     parallel pieces of the indexed remote callset; cached. Returns {key: 'het'|'hom'}."""

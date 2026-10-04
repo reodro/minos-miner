@@ -33,7 +33,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k010_20261004T1318) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k012_20261004T1750) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -126,6 +126,16 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   neither trained on +0.189 (16/16); a new round (2026-10-04 10:41) +0.141. Gains: 1-bp indels +0.065 (extras 30 ->
   24), the false-positive part +0.067, longer indels +0.064. If the originals cannot be had, the build goes on
   without them (NaN measurements), as for GIAB.
+- k011 (1000G) = k010 trained on all 43 past 1000G rounds: +0.064 per round over k010 (better 33/43).
+- **1000G truth, the person's part, exactly** (found 2026-10-04): the person's calls in the raw 1000G high-coverage
+  GATK callset whose site FILTER is PASS, with the person's DP >= 10 and GQ >= 20, at GATK's genotype - DRAGEN plays
+  no part. 590,556 calls in 43 rounds: every call passing is in the truth, none failing is. The earlier "soft,
+  quality-dependent drop" was these per-person fields, which no measurement carried.
+- k012 (1000G, released 2026-10-04) = k011's model + that rule (`kg.gatk_person_own`, meta `kg_own_rule`): the
+  person's part is copied like GIAB's NIST list and the person's other GATK calls are never written; the model decides
+  only the rest (the inserted mutations). If the person's GATK calls cannot be had, the model decides everything, as
+  before. All 44 1000G rounds: 99.924 vs k011 98.297, +1.627 per round (better 44/44, worst round 99.700); the new
+  round 2026-10-04 10:41 99.865. Left: ~4 missed + ~2 extra inserted 1-bp indels per round (~0.08 points).
 
 ## Open work
 
@@ -134,7 +144,8 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   spots with no window.
 - **Spelling**: ~28% of replaced windows are still not spelled exactly like Minos (~17% need spellings no option
   produces yet).
-- **1000G**: ~75% of indel errors are keep/drop guesses on the person's DRAGEN+GATK calls; ~9 inserted 1-bp indels
-  missed per round (read comparison: k010). A new round (2026-10-04 10:41) had fewer extras (62) and more inserted
+- **1000G**: the person's part is exact (k012); what is left is the inserted mutations (~4 missed + ~2 extra 1-bp
+  indels per round) - the model still trains on every candidate; training it only on candidates outside the person's
+  list (as GIAB) may help. A new round (2026-10-04 10:41) had fewer extras (62) and more inserted
   1-bp indels (19% of inserted, before ~11%) - watch whether Minos changed its 1000G mix.
 - **`update()` during a live round** (parked by the user).

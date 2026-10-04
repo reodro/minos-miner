@@ -133,6 +133,21 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         p_hom = tracks.apply_gt_rule(meta, X_full, p_hom)
 
     donor = donors[info["mode_donor"]] if info["mode_giab"] else {}
+    kg_own = None
+    kgi = info.get("kg") or {}
+    if (not info["mode_giab"] and meta.get("kg_own_rule") and kgi.get("gatk_person_checked")
+            and not kgi.get("gatk_person_error")):
+        # 1000G: the person's part of the truth is copied by Minos's exact rule (kg.gatk_person_own), like GIAB's
+        # NIST list; the model decides only the rest (the inserted mutations). Any failure: the model decides all.
+        from answer_set.k2 import kg
+        try:
+            own, every = kg.gatk_person_own(chrom, a, b, kgi["person"])
+            if own:
+                kg_own = len(own)
+                donor = own
+                p_any = np.where([k in every for k in keys], 0.0, p_any) if len(keys) else p_any
+        except Exception as e:  # noqa: BLE001  (never stuck: fall back to the model)
+            kg_own = f"error: {e}"[:300]
     allowed = None
     if info["mode_giab"] and meta.get("giab_bed_rule"):
         bed = beds[info["mode_donor"]]
@@ -189,7 +204,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "background_from_donor": len(donor), "model_calls": len(recs) - len(donor),
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
-        "readdiff": info.get("readdiff"), "inputs": changed_inputs or "ok", "windows_replaced": n_windows,
+        "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok", "windows_replaced": n_windows,
     }
     (out / "report.json").write_text(json.dumps(report, indent=1))
     return report
