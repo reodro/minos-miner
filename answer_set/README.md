@@ -26,13 +26,14 @@ the released truth.
 | `k2/build.py` | candidates -> features -> track model -> `truth.vcf.gz`, `mutations.vcf.gz` (N=580), `scores.tsv.gz`, `report.json` |
 | `k2/features.py` | read scan, format detection (GIAB / 1000G), every measurement |
 | `k2/kg.py`, `k2/masks.py` | 1000G person, DRAGEN / GATK lookups, panel index; region masks |
+| `k2/kg_origin.py` | 1000G original reads: the person's public 1000 Genomes CRAM (EBI), round region only |
 | `k2/giab_origin.py`, `k2/readdiff.py`, `k2/localhap.py` | GIAB original reads, read-vs-original comparison, local haplotypes |
 | `k2/hapgeno.py`, `k2/hapcand.py` | edit-aware local haplotype genotyper (GIAB): the person's two local sequences per spot |
 | `k2/hapwin.py`, `k2/train_window.py`, `k2/train_spelling.py` | window decisions: where the genotyper's whole-window answer replaces the per-variant one, and how it is spelled |
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k007_20261004T0856) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k010_20261004T1318) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -116,6 +117,15 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   VQSLOD), plus ~6,700 inserted mutations per round with no `SYNTHETIC` flag. The reads are the person's real public
   1000G reads (2x150, ~34x): ~82% of pairs kept, each read cut to its first 128 bases, mutations and some noise
   added, names hashed, realigned.
+- k010 (1000G, released 2026-10-04) = k007 + the read comparison: each round read against the person's public
+  original read (`k2/kg_origin.py`, ~4 s for a region; `readdiff.py` unchanged, ~6 s), as for GIAB - it sees every
+  inserted mutation (one round checked: 641/641 inserted 1-bp indels, 6,653 of its 6,740 strong changes in the
+  truth). Its measurements (`tracks.RD_FEATS`) and read-comparison-only candidates are on only for 1000G models
+  trained with them (meta `kg_readdiff`; `build.py` sets `features.KG_READDIFF`). Same 27 rounds and folds as k007.
+  All 43 past 1000G rounds: 98.223 vs k007 98.018, +0.205 per round (better 42/43, worst -0.015); the 16 rounds
+  neither trained on +0.189 (16/16); a new round (2026-10-04 10:41) +0.141. Gains: 1-bp indels +0.065 (extras 30 ->
+  24), the false-positive part +0.067, longer indels +0.064. If the originals cannot be had, the build goes on
+  without them (NaN measurements), as for GIAB.
 
 ## Open work
 
@@ -125,5 +135,6 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
 - **Spelling**: ~28% of replaced windows are still not spelled exactly like Minos (~17% need spellings no option
   produces yet).
 - **1000G**: ~75% of indel errors are keep/drop guesses on the person's DRAGEN+GATK calls; ~9 inserted 1-bp indels
-  missed per round. The public originals would allow the read comparison (as GIAB's readdiff) for 1000G.
+  missed per round (read comparison: k010). A new round (2026-10-04 10:41) had fewer extras (62) and more inserted
+  1-bp indels (19% of inserted, before ~11%) - watch whether Minos changed its 1000G mix.
 - **`update()` during a live round** (parked by the user).

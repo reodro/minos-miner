@@ -146,7 +146,11 @@ def evaluate(track, name, rs):
 
 
 def train(track, rs, name):
-    cols = [FEATURES.index(f) for f in tracks.features_for(track)]
+    # kg: the read comparison's measurements when every round was prepared with it (and it worked)
+    kg_rd = track == "kg" and all(r["info"].get("kg_readdiff") and "error" not in (r["info"].get("readdiff") or {})
+                                  for r in rs)
+    feats = tracks.features_for(track, kg_rd)
+    cols = [FEATURES.index(f) for f in feats]
     out = tracks.vdir(track, name)
     out.mkdir(parents=True, exist_ok=True)
     buf = io.StringIO()
@@ -216,7 +220,7 @@ def train(track, rs, name):
         final = fit(track, rs, cols, cost)
         joblib.dump(final[0], out / "model.joblib")
         joblib.dump(final[1], out / "hom.joblib")
-        meta = {"track": track, "created": tracks.now(), "features": tracks.features_for(track),
+        meta = {"track": track, "created": tracks.now(), "features": feats, "kg_readdiff": int(kg_rd),
                 "rounds": names, "fold_of": fold_of, "threshold": thr, "heldout_f1": round(table[thr], 5),
                 "bed_rule": bed_rule, "n_targets_median": 580.0, "gt_from_gatk": track == "kg",
                 "thr_only_rd": thr_rd, "thr_class": thr_class, "point_alpha": POINT_ALPHA if cost else None}

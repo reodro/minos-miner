@@ -99,8 +99,12 @@ def apply_source_thr(meta, X, p_any, p_raw=None):
     return out
 
 
-def features_for(track):
-    other = KG_ONLY if track == "giab" else GIAB_ONLY
+# the read comparison's measurements, used by 1000G versions trained with it (meta kg_readdiff)
+RD_FEATS = ["rd_support", "rd_cover", "rd_frac", "only_rd", "rd_orig", "rd_orig_frac", "rd_sib_max", "rd_sib_ratio"]
+
+
+def features_for(track, kg_readdiff=False):
+    other = KG_ONLY if track == "giab" else [f for f in GIAB_ONLY if not (kg_readdiff and f in RD_FEATS)]
     return [f for f in FEATURES if f not in other and f not in DROP]
 
 

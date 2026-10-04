@@ -29,6 +29,9 @@ RD_BUDGET_S = 900               # the whole read comparison, every try: past it 
 # hap_genotyper; build.py sets it from the model before extracting), so a model trained without it is never fed
 # candidates it has not seen. prepare.py turns it on (--no-hap: off).
 HAP_GENOTYPER = int(os.environ.get("MINOS_HAPGENO", "0"))     # 0 off, else the hapgeno.VERSION it was trained with
+# 1000G rounds: compare each round read with the person's public original read (kg_origin.py), as for GIAB. Like
+# HAP_GENOTYPER it changes the candidates, so it follows the 1000G model (meta kg_readdiff; build.py sets it).
+KG_READDIFF = int(os.environ.get("MINOS_KG_RD", "0"))
 HG_CALL = 0.5                   # genotyper events at least this likely become candidates,
 HG_EDIT_ORI = 2                 # and so do events carried by edited reads from at least this many originals
 HG_FEATS = ("hg_post", "hg_hom", "hg_reads", "hg_anchored", "hg_lr", "hg_n_haps", "hg_edit", "hg_edit_ori", "hg_unedit",
@@ -400,13 +403,16 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
 
     rdiff, hap, rd_info = {}, {}, {}
     hg, hg_window = {}, None
-    if mode_giab:
-        from answer_set.k2 import giab_origin, localhap, readdiff
+    rd_on = mode_giab or bool(KG_READDIFF and dragen)          # 1000G: once the person is known
+    if rd_on:
+        from answer_set.k2 import giab_origin, kg_origin, localhap, readdiff
 
         rd_end = time.monotonic() + RD_BUDGET_S
 
         def compare():
-            orig = giab_origin.fetch(mode_donor, chrom, a, b, budget_s=max(0.0, rd_end - time.monotonic()))
+            left = max(0.0, rd_end - time.monotonic())
+            orig = (giab_origin.fetch(mode_donor, chrom, a, b, budget_s=left) if mode_giab else
+                    kg_origin.fetch(kg_info["person"], chrom, a, b, budget_s=left))
             found, stats = readdiff.recover(bam, orig, chrom, a, b, workers=threads)
             return readdiff.normalised(found, chrom, workdir), stats
         try:
@@ -415,7 +421,7 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
                 rd_info["failed_tries"] = failed
         except RuntimeError as e:               # no originals after every try: the model sees NaN
             rd_info = {"error": str(e)[:1000]}
-        own = donors[mode_donor]
+        own = donors[mode_donor] if mode_giab else {}
         # changes the read comparison sees but the read scan missed (mostly indels Minos inserted:
         # 74% of never-candidate insertions are visible here) become candidates too
         rd_keys = sorted(rdiff)
@@ -430,7 +436,7 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             # 1-bp indels: half the strongest neighbour is enough (g005's "must be strongest" rule lost real ones)
             need = RD_1BP_FACTOR * sib_max(k) if abs(len(k[1]) - len(k[2])) == 1 else sib_max(k)
             if (k in cands or k in own or not (a <= k[0] <= b) or sup < 2 or sup < 0.25 * cov or sup < need
-                    or not (dbed.contains(k[0]) and dbed.contains(k[0] + len(k[1]) - 1))):
+                    or (mode_giab and not (dbed.contains(k[0]) and dbed.contains(k[0] + len(k[1]) - 1)))):
                 continue
             L = len(k[2]) - len(k[1])
             f = {n: np.nan for n in FEATURES}
@@ -443,7 +449,7 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             cands[k] = f
             n_rd_only += 1
         rd_info["candidates_added"] = n_rd_only
-        if HAP_GENOTYPER:
+        if HAP_GENOTYPER and mode_giab:
             from answer_set.k2 import hapcand, hapgeno
             seeds = [(k[0], k[0] + len(k[1])) for k, f in cands.items()
                      if len(k[1]) != len(k[2]) or (f.get("alt_n", 0) >= 2 and f.get("alt_frac_ra", 0) >= 0.08)]
@@ -556,7 +562,7 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             f["donor_indel_near"] = float(nearest(dind, k[0]) <= 10)
         else:
             f["in_donor_bed"] = f["donor_dist_log"] = f["donor_indel_near"] = np.nan
-        if mode_giab and "error" not in rd_info:
+        if rd_on and "error" not in rd_info:
             sup, cov, ori = rdiff.get(k, (0, 0, 0))
             f["rd_support"], f["rd_cover"] = float(sup), float(cov)
             f["rd_frac"] = sup / cov if cov else 0.0
@@ -570,7 +576,7 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             f["rd_sib_ratio"] = sup / (sup + sm) if sup + sm else np.nan
         for n_ in ("rd_support", "rd_cover", "rd_frac", "rd_orig", "rd_orig_frac", "only_rd", "rd_sib_max",
                    "rd_sib_ratio") \
-                if not mode_giab or "error" in rd_info else ():
+                if not rd_on or "error" in rd_info else ():
             f[n_] = np.nan
         if hg_window is not None:
             ev_, w_ = hg.get(k), hg_window(k[0])
@@ -606,4 +612,5 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             "n_candidates": len(keys), "median_dp": med_dp, "kg": kg_info, "n_dragen": len(dragen)}
     info["giab_bed"] = mode_donor if mode_giab else None
     info["readdiff"] = rd_info
+    info["kg_readdiff"] = int(bool(KG_READDIFF) and not mode_giab)
     return keys, X, info, donors, beds
