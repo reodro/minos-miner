@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from common.scoring import v2_score
+from common.scoring import score_from_parts, v2_score
 from common.types import CLASSES, ClassCounts, Config, Round, ScoreResult
 from tests.helpers import ranges
 
@@ -66,6 +66,10 @@ class ScoringTest(unittest.TestCase):
     def test_region_fp_enters_germline_term(self):
         _, score, _ = v2_score(self.counts(), region_fp=600, n_targets=600)
         self.assertAlmostEqual(score, 100 * (0.70 + 0.30 * math.exp(-1 / 8)))
+
+    def test_score_from_parts_uses_the_upstream_weights(self):
+        _, score, _ = v2_score(self.counts(), region_fp=600, n_targets=600)
+        self.assertAlmostEqual(score_from_parts(1.0, 1.0), score)
 
     def test_failed_gate_scores_zero(self):
         ratios = {"titv_truth_snp": 2.0, "titv_query_snp": 1.0, "hethom_truth_snp": 1.5, "hethom_query_snp": 1.5}

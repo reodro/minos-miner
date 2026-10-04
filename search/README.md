@@ -5,7 +5,7 @@ through `EvalClient` (the evaluator evaluates them) and reads their scores; seve
 **submits**, to the platform - strategies never do.
 
 Public API: `strategies`, `STRATEGY_NAMES`, `EvalClient`, `Outcome`, `Strategy`, `RandomSampler`, `random_stream`,
-`rf_ucb`.
+`rf_ucb`, `tpe`, `gradient_regions`.
 
 ## The contract with main and the evaluator
 
@@ -41,22 +41,32 @@ GATK job:
 So: explore genotyping/PairHMM settings densely around good configs, move assembly/activity/other settings more
 sparingly. On about half of current rounds, variants diverge and need a ~34 s repair; still far cheaper than solo.
 
-**Choose configs by score, never for the evaluator's convenience.** The only exclusions are settings that can never
-score: `space.PINNED` pins `emit_ref_confidence` to `NONE` (GVCF / BP_RESOLUTION output is rejected by hap.py on
-the validator too).
+**Choose configs by score, never for the evaluator's convenience.** `space.PINNED` holds three values out of the
+search. `emit_ref_confidence` is `NONE` because GVCF / BP_RESOLUTION output is rejected by hap.py on the validator
+too. `adaptive_pruning_initial_error_rate` and `pruning_lod_threshold` stay at the GATK defaults because
+HaplotypeCaller does not read them unless `--adaptive-pruning` is on, and that switch is not a search parameter.
 
-## What exists (2026-09-30)
+## What exists (2026-10-01)
 
-- `space.py`: config <-> unit-cube features (log scale for wide ranges), valid random sampling, local moves.
+- `space.py`: config <-> unit-cube features (log scale for wide ranges), valid random sampling, local moves, and
+  GATK cost tiers (expensive / PairHMM / genotyping). `initial_design` starts at the GATK default, takes one step
+  off it on each expensive axis, then places two starts outside that neighborhood. Cheap parameters stay at defaults.
 - `base.py`: `RandomSampler`, `random_stream` - the baseline every real strategy must beat.
-- `rf_ucb.py`: **RF_UCB v1** - scikit-learn ExtraTrees surrogate, upper-confidence picks (mean + kappa x spread of
-  the trees), mostly local moves around the top configs plus some random ones, and a small family of cheap variants
-  with every pick. Proposes whenever a worker is free; the configs it keeps pending are capped at
-  max(256, (family + 1) x the executor's total workers), so a big fleet is never starved (a family fills one worker).
-  - Fake landscape (6 seeds): 200 evals - mean best 93.2 vs random 91.7, RF_UCB better on 6/6 seeds; at 120 evals
-    it is still warming up (91.8 vs 91.7).
-  - Real replay, 092900Z, 20 min on 16 cores: 296 configs, true score 87.22, rank 44 of 60 (field best 88.96).
-  - **Not tuned on real rounds**: `kappa`, family size, candidate mix, refit frequency are all first guesses.
+- `rf_ucb.py`: **tiered RF-UCB**. Two ExtraTrees, on `core` and on `fp_per_target`. Candidates are ranked by the v2
+  formula of those predictions (mean + kappa x spread of the trees) divided by variant cost. Kappa decays toward
+  exploitation. Each pick is proposed with a designed genotyping / PairHMM family. After ~100 scores, parameters
+  the trees barely use freeze at the incumbent. In the last three minutes only genotyping variants of the incumbent
+  are proposed. Previous rounds' best expensive keys are seeded with cheap parameters back at defaults; their
+  scores are not reused. Gate failures are labelled like a crashed config.
+  Pending configs are capped at max(256, (family + 1) x workers), so a big fleet is never starved.
+  v1 reference (not this loop): fake landscape 200 evals, mean best 93.2 vs random 91.7; replay 092900Z, 20 min,
+  16 cores, true 87.22, rank 44/60.
+- `tpe.py`: Optuna multivariate TPE beside the forest. Each suggestion uses the same designed family. The default
+  lineup (`strategies("rf_ucb", ...)`, in `lineup.py`) starts both.
+- `regions.py`: several trust regions. Inside a region the next step is one or two parameters, ranked by a
+  forest on core and false positives, not by a finite-difference slope. A gate failure is discarded. The radius
+  shrinks only after a run of local scores with no improvement. Restarts must land outside every live radius.
+  Select it with `--strategy regions`. It is not the default lineup.
 
 ## How to work on a strategy
 
@@ -70,14 +80,9 @@ logic; `replay` is the ground truth. Compare strategies on several rounds and re
 
 ## Open work
 
-- **Move RF_UCB onto a standard library.** The surrogate is scikit-learn, but the loop around it (candidate
-  generation, UCB scoring, refit timing) is hand-made. Candidates: SMAC3 (random-forest Bayesian optimization,
-  ask/tell, mixed spaces; check that `pyrfr` builds), scikit-optimize `forest_minimize` (simple, barely
-  maintained), Optuna (TPE/CMA-ES, the base for other strategies). Keep our part: expanding each asked config into
-  a family of cheap variants for `propose_many`, and telling every result back.
-- Tune RF_UCB on real rounds (replays), then add the other strategies and run them concurrently.
+- Tune kappa, family size and the freeze cutoff on replicated replays. v1 was not tuned on real rounds either.
+- SMAC3 only if tiered RF-UCB plateaus and `pyrfr` builds. scikit-optimize is unmaintained.
 - Scale: at tens of thousands of results, refit on a subsample (recent + best) or less often.
-- Warm start: seed each round with good configs from past rounds (a portfolio).
 
 ## Ideas (not planned)
 

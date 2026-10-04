@@ -8,10 +8,10 @@ from answer_set import OracleProvider
 from backtest.kpi import oracle_gap, rank_in_field, would_win
 from common.settings import SETTINGS
 from common.store import ResultStore
-from common.types import FULL, AnswerSet, CallSet, ClassCounts, Config, EvalJob, Regime, Round, ScoreResult, Variant
+from common.types import FULL, CLASSES, AnswerSet, CallSet, ClassCounts, Config, EvalJob, Regime, Round, ScoreResult, Variant
 from evaluator import FakeRunner, FakeScorer, LocalExecutor, SimExecutor
 from main import DryRunSubmitter, LoopSettings, run_round
-from search import EvalClient, RandomSampler, random_stream, rf_ucb
+from search import EvalClient, RandomSampler, random_stream, rf_ucb, tpe
 from tests.helpers import ranges
 
 ROUND_0817 = os.path.join(SETTINGS.rounds_dir, "20260928T081700Z")
@@ -444,8 +444,158 @@ class SpaceTest(unittest.TestCase):
         sp, rng = Space(ranges()), _r.Random(0)
         cs = [sp.random(rng) for _ in range(200)] + RandomSampler(ranges(), seed=0).sample(200)
         cs += [sp.neighbour(c, rng, n_params=4) for c in cs[:100]]
+        cs += sp.initial_design(rng, 32)
         self.assertEqual({c.params["emit_ref_confidence"] for c in cs if c}, {"NONE"})
         self.assertNotIn("emit_ref_confidence", sp.names)
+        self.assertEqual({c.params["adaptive_pruning_initial_error_rate"] for c in cs if c}, {0.001})
+        self.assertEqual({c.params["pruning_lod_threshold"] for c in cs if c}, {2.302585})
+        self.assertNotIn("adaptive_pruning_initial_error_rate", sp.names)
+        self.assertNotIn("pruning_lod_threshold", sp.names)
+
+    def test_tiers_partition_the_free_parameters(self):
+        from search.space import Space
+        sp = Space(ranges())
+        self.assertEqual(set(sp.genotyping) | set(sp.pairhmm) | set(sp.expensive), set(sp.names))
+        self.assertFalse(set(sp.genotyping) & set(sp.pairhmm))
+        self.assertFalse(set(sp.expensive) & (set(sp.genotyping) | set(sp.pairhmm)))
+        self.assertIn("heterozygosity", sp.expensive)
+        self.assertIn("min_pruning", sp.expensive)
+        self.assertIn("pcr_indel_model", sp.pairhmm)
+        self.assertIn("standard_min_confidence_threshold_for_calling", sp.genotyping)
+
+    def test_sobol_init_keeps_cheap_parameters_at_defaults(self):
+        import random as _r
+        from search.space import Space
+        sp, rng = Space(ranges()), _r.Random(1)
+        design = sp.initial_design(rng, 16)
+        self.assertEqual(len(design), 16)
+        self.assertEqual(len({c.key for c in design}), 16)
+        self.assertEqual(design[0].key, ranges().defaults("gatk").key)
+        changed = [n for n in sp.names if design[1].params[n] != design[0].params[n]]
+        self.assertEqual(changed, ["min_pruning"])
+        self.assertEqual(design[1].params["min_pruning"], 3)
+        for c in design:
+            self.assertEqual(ranges().errors(c), [])
+            for name in sp.genotyping + sp.pairhmm:
+                self.assertEqual(c.params[name], sp.specs[name].default, name)
+
+    def test_designed_variants_touch_one_cheap_axis(self):
+        from search.space import Space
+        sp = Space(ranges())
+        base = ranges().defaults("gatk")
+        for c in sp.genotyping_variants(base):
+            changed = [n for n in sp.names if c.params[n] != base.params[n]]
+            self.assertEqual(len(changed), 1)
+            self.assertIn(changed[0], sp.genotyping)
+        models = {c.params["pcr_indel_model"] for c in sp.pairhmm_variants(base)}
+        self.assertEqual(models, set(sp.specs["pcr_indel_model"].allowed) - {base.params["pcr_indel_model"]})
+
+
+class LineupTest(unittest.TestCase):
+    def test_default_name_runs_the_forest_and_tpe_together(self):
+        from search import STRATEGY_NAMES, strategies
+        r = ranges()
+        self.assertEqual(STRATEGY_NAMES[0], "rf_ucb")
+        self.assertEqual(len(strategies("rf_ucb", r, 8)), 2)
+        self.assertEqual(len(strategies("tpe", r, 8)), 1)
+        self.assertEqual(len(strategies("regions", r, 8)), 1)
+        self.assertEqual(len(strategies("random", r, 8)), 1)
+        with self.assertRaises(ValueError):
+            strategies("nope", r, 8)
+
+
+class GradientRegionTest(unittest.TestCase):
+    def test_beats_random_on_the_fake_landscape_and_keeps_regions(self):
+        from search import gradient_regions
+        r = ranges()
+        best = {"regions": [], "random": []}
+        born = []
+        alive = []
+        for seed in range(3):
+            for name, strat in (("random", random_stream(r, in_flight=8, seed=seed)),
+                                ("regions", gradient_regions(r, in_flight=8, seed=seed))):
+                runner = FakeRunner(r, seed=seed)
+                out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [strat],
+                                DryRunSubmitter(), r, LoopSettings(max_evals=800), baselines=[])
+                self.assertLessEqual(out.evaluated + out.failed, 800 + 8)
+                best[name].append(out.best.score)
+                if name == "regions":
+                    born.append(strat.state["born"])
+                    alive.append(strat.state["alive"])
+        self.assertGreater(sum(best["regions"]), sum(best["random"]), msg=str(best))
+        self.assertTrue(all(n >= 2 for n in born), msg=str(born))
+        self.assertTrue(all(n >= 1 for n in alive), msg=str(list(zip(born, alive))))
+
+    def test_restarts_leave_a_local_basin(self):
+        import math
+        from search import gradient_regions
+        from search.space import Space
+        r = ranges()
+
+        class TwoBasin(FakeRunner):
+            def quality(self, config):
+                specs = self.ranges.tools[config.tool]
+
+                def unit(name):
+                    spec = specs[name]
+                    v = float(config.params.get(name, spec.default))
+                    return (v - spec.min) / (spec.max - spec.min)
+
+                up, uh = unit("min_pruning"), unit("heterozygosity")
+                local = math.exp(-((up - 0.125) ** 2 + (uh - 0.0909) ** 2) / 0.08)
+                glob = math.exp(-((up - 0.875) ** 2 + (uh - 0.8485) ** 2) / 0.08)
+                return 0.50 * local + 0.99 * glob
+
+        params = dict(r.defaults("gatk").params)
+        params["min_pruning"] = 3
+        params["heterozygosity"] = 0.001
+        local = Space(r)._assemble(params)
+        self.assertIsNotNone(local)
+
+        def once(strat, evals):
+            runner = TwoBasin(r)
+            out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [strat],
+                            DryRunSubmitter(), r, LoopSettings(max_evals=evals), baselines=[])
+            return out.best.score
+
+        trapped = once(gradient_regions(r, n_regions=1, restart_frac=0.0, pair_frac=0.0, start=[local], seed=0), 80)
+        escaped = once(gradient_regions(r, in_flight=8, seed=1), 240)
+        self.assertGreater(escaped, trapped)
+
+
+class LateWindowTest(unittest.TestCase):
+    def test_last_minutes_do_not_start_full_runs_the_executor_cannot_batch(self):
+        r = ranges()
+        runner = FakeRunner(r)
+        out = run_round(ROUND, StubProvider(), SimExecutor(runner, 4), FakeScorer(runner),
+                        [rf_ucb(r, late_s=1e9, seed=0)], DryRunSubmitter(), r,
+                        LoopSettings(max_evals=40), baselines=[], deadline_ts=10_000)
+        self.assertEqual(out.evaluated, 0)
+
+
+class TpeTest(unittest.TestCase):
+    def test_runs_inside_the_budget(self):
+        r = ranges()
+        runner = FakeRunner(r)
+        out = run_round(ROUND, StubProvider(), SimExecutor(runner, 4), FakeScorer(runner),
+                        [tpe(r, seed=0, in_flight=4)], DryRunSubmitter(), r,
+                        LoopSettings(max_evals=40), baselines=[])
+        self.assertGreater(out.evaluated, 10)
+        self.assertLessEqual(out.evaluated + out.failed, 40 + 8)
+
+
+class PortfolioTest(unittest.TestCase):
+    def test_other_rounds_configs_are_readable_and_this_file_is_not(self):
+        import os
+        import tempfile
+        from common.scoring import finalize
+        d = tempfile.mkdtemp()
+        past = ResultStore(os.path.join(d, "past.sqlite"))
+        current = ResultStore(os.path.join(d, "current.sqlite"))
+        cfg = ranges().defaults("gatk")
+        past.add(finalize(ScoreResult("old", cfg.key, 1, {k: ClassCounts(1, 0, 0) for k in CLASSES}, 0, 600)), cfg)
+        self.assertEqual([c.key for c in current.portfolio()], [cfg.key])
+        self.assertEqual(past.portfolio(), [])
 
 
 class RoundSafetyTest(unittest.TestCase):

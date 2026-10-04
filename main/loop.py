@@ -60,11 +60,41 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
     last_refused = [float("-inf")]                # a refused submission (platform down, fee) is retried after 30 s
     since_update: List[CallSet] = []
 
+    def submission_choice() -> Optional[ScoreResult]:
+        """Config to send. Without a strategy rule, that is the local best.
+
+        A strategy may set `client.choose_submission` to refuse a fine local-score step inside the same
+        structural basin. The local best is still recorded on the outcome, so a review can see the pick gap.
+        """
+        chooser = getattr(client, "choose_submission", None)
+        if chooser is None:
+            return client.best(FULL)
+        pairs = []
+        results = []
+        for (key, fid), result in client.latest.items():
+            if fid != FULL or result.score is None or result.gate_passed is False:
+                continue
+            config = client.configs.get(key)
+            if config is None:
+                continue
+            pairs.append((config, float(result.score)))
+            results.append(result)
+        picked = chooser(pairs) if pairs else None
+        if picked is None:
+            return client.best(FULL)
+        for result in results:
+            if result.config_key == picked.key:
+                return result
+        return client.best(FULL)
+
     def maybe_submit(force: bool = False):
-        best = client.best(FULL)
+        local_best = client.best(FULL)
+        if local_best is None:
+            return
+        out.best = local_best
+        best = submission_choice()
         if best is None:
             return
-        out.best = best
         key = submitted[0]
         if best.config_key == key:
             return

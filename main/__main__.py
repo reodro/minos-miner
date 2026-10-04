@@ -144,7 +144,7 @@ def main() -> None:
             from main.miner import PlatformSubmitter, UpstreamPlatform, run_forever
             platform = UpstreamPlatform(args.wallet, args.hotkey, demo=args.demo)
             r = ranges()
-            run_forever(platform, lambda rnd: make_parts(rnd, r, "rf_ucb", PlatformSubmitter(platform), args.workers,
+            run_forever(platform, lambda rnd: make_parts(rnd, r, "pattern", PlatformSubmitter(platform), args.workers,
                                                          fleet), reference_for)
     finally:
         if fleet is not None:

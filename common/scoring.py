@@ -6,6 +6,7 @@ Matching calls against an answer set (producing the counts) is evaluator's job.
 """
 from __future__ import annotations
 
+import math
 import sys
 from typing import Dict, Optional, Tuple
 
@@ -17,6 +18,9 @@ if SETTINGS.minos_subnet_dir not in sys.path:
 
 from utils.scoring import (  # noqa: E402  (upstream minos_subnet)
     DIFFICULTY_WEIGHTS,
+    GERMLINE_FP_SCALE,
+    V2_CORE_WEIGHT,
+    V2_GERMLINE_WEIGHT,
     AdvancedScorer,
     difficulty_weighted_f1,
     plausibility_gate,
@@ -36,6 +40,22 @@ def v2_score(counts: Dict[str, ClassCounts], region_fp: int, n_targets: int,
     cd = {k: {"tp": c.tp, "fp": c.fp, "fn": c.fn} for k, c in counts.items()}
     metrics = {"fp_per_target": region_fp / max(float(n_targets), 1.0), **(ratios or {})}
     return difficulty_weighted_f1(cd), AdvancedScorer.compute_score_v2(metrics, cd), plausibility_gate(metrics)
+
+
+def score_from_parts(core: float, fp_per_target: float) -> float:
+    """v2 score from a core and an FP rate, using the upstream weights.
+
+    Search ranks predicted (core, fp_per_target) with this instead of fitting the scalar score, because the
+    FP term is exponential and a calling threshold moves the two parts in opposite directions. The plausibility
+    gate is not applied here: a config that failed it is withheld by the caller, the same way a crashed config is.
+    """
+    rate, core_v = float(fp_per_target), float(core)
+    if not math.isfinite(rate) or rate < 0:
+        rate = 0.0
+    if not math.isfinite(core_v):
+        core_v = 0.0
+    germline = math.exp(-rate / GERMLINE_FP_SCALE)
+    return 100.0 * (V2_CORE_WEIGHT * core_v + V2_GERMLINE_WEIGHT * germline)
 
 
 def finalize(result: ScoreResult) -> ScoreResult:

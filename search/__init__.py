@@ -8,4 +8,8 @@ submitted). The lineup lives in search/lineup.py: adding or retuning strategies 
 from search.base import RandomSampler, Strategy, random_stream  # noqa: F401
 from search.client import EvalClient, Outcome  # noqa: F401
 from search.lineup import STRATEGY_NAMES, strategies  # noqa: F401
+from search.basin import basin_race  # noqa: F401
+from search.pattern import pattern, pattern_regions  # noqa: F401
+from search.regions import gradient_regions  # noqa: F401
 from search.rf_ucb import rf_ucb  # noqa: F401
+from search.tpe import tpe  # noqa: F401
