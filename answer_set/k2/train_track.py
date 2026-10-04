@@ -33,7 +33,9 @@ IN_BED = FEATURES.index("in_donor_bed")
 # The validator's v2 core weighs classes (SNP het 0.18 + hom 0.02, indel 1 bp 0.40, 2-3 bp 0.16, 4-7 bp 0.10, >= 8 bp
 # 0.14); per class, one error costs ~ weight / (2 x truth records of the class). giab track: training rows are
 # weighted by that cost (POINT_ALPHA: 0 = every row alike) and each class gets its own cut-off, chosen on held-out
-# folds for weight x F1 - points, not counts: a missed 1-bp indel costs ~20 SNP errors.
+# folds for weight x F1 - points, not counts: a missed 1-bp indel costs ~20 SNP errors. kg track: the same, and its
+# cut-offs also count each extra record's cost in the false-positive part (~3.75 / N points; 1000G answers carry
+# ~110 extras per round, ~0.7 points).
 CLASS_W = {"snp": 0.20, "ind1": 0.40, "ind2_3": 0.16, "ind4_7": 0.10, "ind8+": 0.14}
 POINT_ALPHA = 1.0
 THR_GRID = [round(0.1 + 0.05 * i, 2) for i in range(17)]
@@ -92,19 +94,25 @@ def fit(track, rs, cols, cost=None):
     return model().fit(X, y, sample_weight=sw), model().fit(Xh, yh, sample_weight=swh)
 
 
-def class_points(rs, oof, truths, c, t):
-    """Mean over rounds of weight x F1 of class c with cut-off t (held-out scores; the person's own records are
-    copied, so they count as found; a record of ours counts only with the right het/hom)."""
+def class_points(rs, oof, truths, c, t, track="giab"):
+    """Mean over rounds of weight x F1 of class c with cut-off t (held-out scores; giab: the person's own records are
+    copied, so they count as found; a record of ours counts only with the right het/hom). kg: minus each extra
+    record's false-positive cost (in core units, 3.75 / 580 points / 70)."""
     vals = []
     for r in rs:
         pa, ph = oof[r["name"]]
-        m = rows("giab", r) & (classes_of(r) == c) & (r["X"][:, IN_BED] == 1)
+        m = rows(track, r) & (classes_of(r) == c)
+        if track == "giab":
+            m = m & (r["X"][:, IN_BED] == 1)
         pred = m & (pa >= t)
         tp = int(np.sum(pred & (r["y_any"] == 1) & ((ph >= 0.5) == (r["y_hom"] == 1))))
         t_ = truths[r["name"]]
-        own = sum(1 for k, (z, syn) in t_.items() if not syn and cls(k) == c)
+        own = sum(1 for k, (z, syn) in t_.items() if not syn and cls(k) == c) if track == "giab" else 0
         n_truth = sum(1 for k in t_ if cls(k) == c)
-        vals.append(CLASS_W[c] * 2 * (own + tp) / max(1, own + int(pred.sum()) + n_truth))
+        v = CLASS_W[c] * 2 * (own + tp) / max(1, own + int(pred.sum()) + n_truth)
+        if track == "kg":
+            v -= int(np.sum(pred & (r["y_any"] == 0))) * 3.75 / 580 / 70
+        vals.append(v)
     return float(np.mean(vals))
 
 
@@ -147,7 +155,7 @@ def train(track, rs, name):
         names = sorted(r["name"] for r in rs)
         fold_of = {names[i]: n % FOLDS for n, i in enumerate(np.random.default_rng(0).permutation(len(names)))}
         oof = {}
-        cost = class_cost(rs) if track == "giab" else None
+        cost = class_cost(rs)
         if cost:
             print("error cost per class (SNP = 1):", {c: round(v, 1) for c, v in cost.items()}, "alpha", POINT_ALPHA)
         for f in range(FOLDS):
@@ -175,15 +183,13 @@ def train(track, rs, name):
             thr_rd = max(t2tab, key=t2tab.get)
             print("held-out median F1 by cut-off for read-comparison-only candidates",
                   {k: round(v, 5) for k, v in t2tab.items()})
-        thr_class = None
-        if track == "giab":
-            thr_class = {}
-            print("held-out points by class cut-off (weight x F1, mean per round):")
-            for c in CLASS_W:
-                tab = {t: class_points(rs, oof, truths, c, t) for t in THR_GRID}
-                thr_class[c] = max(tab, key=tab.get)
-                print(f"   {c:7s} at {thr}: {tab[min(THR_GRID, key=lambda x: abs(x - thr))]:.6f}  best {thr_class[c]}: "
-                      f"{tab[thr_class[c]]:.6f}  (+{70 * (tab[thr_class[c]] - tab[min(THR_GRID, key=lambda x: abs(x - thr))]):.4f} pts)")
+        thr_class = {}
+        print("held-out points by class cut-off (weight x F1, mean per round):")
+        for c in CLASS_W:
+            tab = {t: class_points(rs, oof, truths, c, t, track) for t in THR_GRID}
+            thr_class[c] = max(tab, key=tab.get)
+            print(f"   {c:7s} at {thr}: {tab[min(THR_GRID, key=lambda x: abs(x - thr))]:.6f}  best {thr_class[c]}: "
+                  f"{tab[thr_class[c]]:.6f}  (+{70 * (tab[thr_class[c]] - tab[min(THR_GRID, key=lambda x: abs(x - thr))]):.4f} pts)")
         agg = defaultdict(Counter)
         print(f"\n{'region':28s} {'person':8s} {'precision':>9s} {'recall':>7s} {'F1':>7s}")
         mt = {"threshold": thr, "thr_only_rd": thr_rd, "thr_class": thr_class}
@@ -231,7 +237,7 @@ def main():
     ap.add_argument("--promote", action="store_true")
     ap.add_argument("--exclude-rounds", help="file with round dirs to leave out (e.g. a test set)")
     ap.add_argument("--point-alpha", type=float, default=POINT_ALPHA,
-                    help="giab: weight rows by class error cost ** alpha (0: unweighted)")
+                    help="weight rows by class error cost ** alpha (0: unweighted)")
     args = ap.parse_args()
     POINT_ALPHA = args.point_alpha
     want = None

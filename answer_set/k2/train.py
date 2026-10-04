@@ -22,6 +22,7 @@ N_BEFORE_GATKONLY = FEATURES.index("only_gatk")
 N_BEFORE_RDX = FEATURES.index("only_rd")
 N_BEFORE_SIB = FEATURES.index("rd_sib_max")
 N_BEFORE_HG = FEATURES.index("only_hg")
+N_DROPPED_AT_END = 2                               # noise_lambda, noise_logp: prepared, then dropped (hurt new rounds)
 
 
 def load(names=None):
@@ -34,6 +35,9 @@ def load(names=None):
         z = np.load(f, allow_pickle=False)
         d = {k: z[k] for k in z.files}
         n = d["X"].shape[1]
+        if n == len(FEATURES) + N_DROPPED_AT_END:
+            d["X"] = d["X"][:, :len(FEATURES)]
+            n = len(FEATURES)
         if n > len(FEATURES) or (n < len(FEATURES) and n not in (N_BEFORE_SPOT, N_BEFORE_MASK, N_BEFORE_ANNOT, N_BEFORE_RD,
                                                                    N_BEFORE_GATKONLY, N_BEFORE_RDX, N_BEFORE_SIB,
                                                                    N_BEFORE_HG)):

@@ -32,7 +32,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k006) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k007_20261004T0856) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -105,6 +105,18 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   calling). 28 rounds, truth records per class vs the released truth: >= 8 bp shift 19.8 -> 0.2, 4-7 bp 6.0 -> 1.4,
   2-3 bp 5.1 -> 2.2; our own score unchanged.
 
+- k007 (1000G, released 2026-10-04) = k006's rounds, folds and measurements, with per-class cut-offs chosen on
+  held-out folds by weight x F1 minus each extra record's false-positive cost (~3.75 / N points; 1000G answers
+  carried ~110 extras per round): SNP 0.90, 1 bp 0.65, 2-3 bp 0.65, 4-7 bp 0.75, >= 8 bp 0.55. Point weighting
+  (alpha 0.5 / 1) did not help on 1000G. Scored like the validator on all 43 past 1000G rounds: 98.018 vs k006
+  97.896, +0.122 per round (better 35/43); on the 16 rounds neither model trained on +0.120 (14/16). The gain is the
+  false-positive part (extras ~110 -> ~83 per round); indel F1 slightly lower.
+- 1000G truth, measured on the released rounds: the person's public calls that BOTH DRAGEN and GATK made (DRAGEN-only
+  calls are never kept), minus a soft, quality-dependent share Minos drops (indels kept 89%, SNPs 97%; by GATK
+  VQSLOD), plus ~6,700 inserted mutations per round with no `SYNTHETIC` flag. The reads are the person's real public
+  1000G reads (2x150, ~34x): ~82% of pairs kept, each read cut to its first 128 bases, mutations and some noise
+  added, names hashed, realigned.
+
 ## Open work
 
 - **Inserted 1-bp indels** still cause most of the remaining loss (~9 missed + 5.5 extra per round with g013): the
@@ -112,4 +124,6 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   spots with no window.
 - **Spelling**: ~28% of replaced windows are still not spelled exactly like Minos (~17% need spellings no option
   produces yet).
+- **1000G**: ~75% of indel errors are keep/drop guesses on the person's DRAGEN+GATK calls; ~9 inserted 1-bp indels
+  missed per round. The public originals would allow the read comparison (as GIAB's readdiff) for 1000G.
 - **`update()` during a live round** (parked by the user).
