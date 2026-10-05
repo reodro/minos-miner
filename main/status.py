@@ -207,6 +207,10 @@ class StatusBoard:
                           "submissions": len(out.submissions) if out else 0}}
         self._append(row)
         self._save_run(r.get("run_id"), row, client, final, out)
+        if ex:                                                # the round is over: nothing runs on any node for it
+            ex.update(running=0, queued=0)
+            for n in ex.get("nodes") or []:
+                n.update(busy=0, jobs=0, small=0)
         self._write(force=True)
 
     def _save_run(self, run_id, row, client, final, out=None):

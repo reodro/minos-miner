@@ -15,9 +15,9 @@
   --open: #1a7f37;
   --merge: #bc4c00;
   --final: #8250df;
-  --scout: #9a6700;
+  --scout: #1b7c83;
   --good: #1a7f37;
-  --warn: #bc4c00;
+  --warn: #bf8700;
   --bad: #cf222e;
   --retired: #c3cad3;
   --on-strong: #ffffff;
@@ -29,12 +29,14 @@
   --open-soft: #dfede3;
   --merge-soft: #f6e6db;
   --final-soft: #eee6fb;
-  --scout-soft: #f1eadb;
+  --scout-soft: #ddeeef;
   --good-soft: #dfede3;
-  --warn-soft: #f6e6db;
+  --warn-soft: #f7efdb;
   --bad-soft: #f8e0e2;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+  --axis-l: 46px;                /* the round's time axis: the schedule bar and the domain tree share these margins */
+  --axis-r: 66px;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -54,7 +56,7 @@
     --final: #f472b6;
     --scout: #a3e635;
     --good: #34d399;
-    --warn: #fbbf24;
+    --warn: #f97316;
     --bad: #f87171;
     --retired: #3a4275;
     --on-strong: #080b1d;
@@ -68,7 +70,7 @@
     --final-soft: #40274d;
     --scout-soft: #2e4131;
     --good-soft: #163c47;
-    --warn-soft: #41382d;
+    --warn-soft: #432c22;
     --bad-soft: #41273e;
     color-scheme: dark;
   }
@@ -89,7 +91,7 @@
   --final: #f472b6;
   --scout: #a3e635;
   --good: #34d399;
-  --warn: #fbbf24;
+  --warn: #f97316;
   --bad: #f87171;
   --retired: #3a4275;
   --on-strong: #080b1d;
@@ -103,7 +105,7 @@
   --final-soft: #40274d;
   --scout-soft: #2e4131;
   --good-soft: #163c47;
-  --warn-soft: #41382d;
+  --warn-soft: #432c22;
   --bad-soft: #41273e;
   color-scheme: dark;
 }
@@ -184,6 +186,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .bar.scout > span { background: var(--scout); } .bar.final > span { background: var(--final); }
 
 /* schedule */
+.schedule, .ticks { margin-left: var(--axis-l); margin-right: var(--axis-r); }
 .schedule { position: relative; height: 44px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: var(--panel-2); }
 .schedule .seg { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; padding: 0 8px; font-size: 12px;
   font-weight: 600; white-space: nowrap; overflow: hidden; border-right: 1px solid var(--panel); }
@@ -198,7 +201,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
 
 /* domain cards */
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
 .card { border: 1px solid var(--line); border-top: 3px solid var(--accent); border-radius: 9px; padding: 10px 12px; display: grid;
   gap: 6px; background: var(--panel-2); min-width: 0; }
 .card.final { border-top-color: var(--final); } .card.merging { border-top-color: var(--merge); }
@@ -247,8 +250,11 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .chart .u-legend { font-size: 12px; color: var(--muted); }
 
 /* settings */
-.settings-head { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
-.settings-head .spacer { flex: 1; }
+.settings-bar { position: sticky; top: var(--top-h, 58px); z-index: 4; align-self: start; display: flex; flex-wrap: wrap;
+  gap: 10px 18px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 16px; box-shadow: 0 6px 14px -8px rgba(0, 0, 0, .35); }
+.settings-bar h2 { margin: 0; font-size: 15px; font-weight: 700; }
+.settings-bar .spacer { flex: 1; }
 .group { display: grid; gap: 8px; }
 .group h3 { margin: 0; font-size: 13.5px; font-weight: 650; }
 .stable-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 9px; }

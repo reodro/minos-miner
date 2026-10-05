@@ -5,7 +5,7 @@ so it can never slow down or break mining; main applies settings itself (common/
   GET  /login            the login page
   POST /api/login        {"user", "password"} -> a session cookie; 5 failures from one address lock it for 15 min
   POST /api/logout
-  GET  /api/status       main's live.json as it is, plus the server's clock
+  GET  /api/status       main's live.json as it is, the server's clock, and the run's review/rank rows when they exist
   GET  /api/settings     every setting's metadata and default, the file's overrides and what main would reject
   PUT  /api/settings     {"set": {name: value}, "reset": [name]} -> checked, then the file is replaced atomically
 
@@ -38,6 +38,7 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' 
 def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = None, auth_file: Optional[Path] = None,
                secure_cookie: bool = True, fail_delay_s: float = 1.0) -> FastAPI:
     status_file = Path(status_dir or SETTINGS.status_dir) / "live.json"
+    history_file = status_file.with_name("rounds.jsonl")
     tuning_path = Path(tuning_file or TUNING_FILE)
     auth = Auth(Path(auth_file or AUTH_FILE))
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -130,7 +131,28 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
             live = None
         except (OSError, ValueError):
             live = None                                   # main is replacing it right now: the next poll gets it
-        return {"now": time.time(), "live": live}
+        return {"now": time.time(), "live": live, "result": result_of(live)}
+
+    def result_of(live: Optional[dict]) -> Optional[dict]:
+        """The round, review and rank rows main appended for the run on screen (rounds.jsonl), newest of each."""
+        run_id = ((live or {}).get("round") or {}).get("run_id")
+        if not run_id:
+            return None
+        out: dict = {}
+        try:
+            with open(history_file) as f:
+                for line in f:
+                    if run_id not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if row.get("run_id") == run_id and row.get("type") in ("round", "review", "rank"):
+                        out[row["type"]] = row
+        except OSError:
+            return None
+        return out or None
 
     def settings_view() -> dict:
         raw, error = read_overrides(tuning_path)

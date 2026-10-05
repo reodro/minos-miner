@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Minos dashboard</title>
-<script src="/static/theme.js?v=4"></script>
+<script src="/static/theme.js?v=14"></script>
 <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
-<link rel="stylesheet" href="/static/app.css?v=4">
+<link rel="stylesheet" href="/static/app.css?v=14">
 <script src="/static/vendor/uPlot.iife.min.js" defer></script>
-<script src="/static/app.js?v=4" defer></script>
+<script src="/static/app.js?v=14" defer></script>
 </head>
 <body>
 <header class="top">
@@ -26,27 +26,31 @@
   <div id="banners"></div>
   <section class="kpis" id="kpis" aria-label="Round summary"></section>
 
+  <section class="panel" id="result-panel" aria-labelledby="h-result" hidden>
+    <h2 id="h-result">Result <span class="sub" id="result-sub"></span></h2>
+    <div class="kpis" id="result"></div>
+  </section>
+
   <section class="panel" aria-labelledby="h-schedule">
     <h2 id="h-schedule">Round schedule <span class="sub" id="schedule-sub"></span></h2>
     <div class="schedule" id="schedule"></div>
     <div class="ticks" id="schedule-ticks"></div>
   </section>
 
-  <div class="grid2">
-    <section class="panel" aria-labelledby="h-tree">
-      <h2 id="h-tree">Domain tree <span class="sub">each row is a domain over time; merges join their parents</span></h2>
-      <div class="lineage" id="lineage"></div>
-      <div class="legend" id="lineage-legend">
-        <span><i class="live"></i>climbing</span><span><i class="perturb"></i>perturbing</span>
-        <span><i class="merging"></i>merging</span><span><i class="final"></i>final</span>
-        <span><i class="retired"></i>retired</span><span><i class="find"></i>founded from a scout find</span>
-      </div>
-    </section>
-    <section class="panel" aria-labelledby="h-domains">
-      <h2 id="h-domains">Live domains <span class="sub" id="domains-sub"></span></h2>
-      <div class="cards" id="domains"></div>
-    </section>
-  </div>
+  <section class="panel" aria-labelledby="h-tree">
+    <h2 id="h-tree">Domain tree <span class="sub">each row is a domain over time; merges join their parents</span></h2>
+    <div class="lineage" id="lineage"></div>
+    <div class="legend" id="lineage-legend">
+      <span><i class="live"></i>climbing</span><span><i class="perturb"></i>perturbing</span>
+      <span><i class="merging"></i>merging</span><span><i class="final"></i>final</span>
+      <span><i class="retired"></i>retired</span><span><i class="find"></i>founded from a scout find</span>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-domains">
+    <h2 id="h-domains">Live domains <span class="sub" id="domains-sub"></span></h2>
+    <div class="cards" id="domains"></div>
+  </section>
 
   <div class="grid3">
     <section class="panel" aria-labelledby="h-merges">
@@ -80,14 +84,14 @@
 </main>
 
 <main id="view-settings" hidden>
+  <div class="settings-bar" role="toolbar" aria-label="Settings actions">
+    <h2>Settings</h2>
+    <span class="muted" id="settings-state"></span>
+    <div class="spacer"></div>
+    <button class="btn" id="discard" type="button" disabled>Discard edits</button>
+    <button class="btn primary" id="save" type="button" disabled>Save changes</button>
+  </div>
   <section class="panel">
-    <div class="settings-head">
-      <h2>Settings</h2>
-      <span class="muted" id="settings-state"></span>
-      <div class="spacer"></div>
-      <button class="btn" id="discard" type="button" disabled>Discard edits</button>
-      <button class="btn primary" id="save" type="button" disabled>Save changes</button>
-    </div>
     <div class="muted" id="settings-help">Live settings take effect on main within about a second. Round settings wait for the next round. A value main cannot use is rejected with a reason, and the value in force stays.</div>
     <div id="settings-banner"></div>
   </section>

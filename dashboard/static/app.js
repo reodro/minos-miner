@@ -9,6 +9,7 @@ const SVG = "http://www.w3.org/2000/svg";
 
 let serverOffset = 0;          // server clock - browser clock, seconds
 let last = null;               // the last /api/status payload
+let lastResult = null;         // the run's round/review/rank rows (rounds.jsonl), once main has written them
 let chart = null, chartKey = "";
 let settingsMeta = null;       // /api/settings
 const draft = {};              // setting name -> text typed but not saved
@@ -90,6 +91,12 @@ function showTab() {
 }
 window.addEventListener("hashchange", showTab);
 
+// the Settings bar sticks just under the top bar, whose height depends on how it wraps
+const topBar = document.querySelector(".top");
+function setTopHeight() { document.documentElement.style.setProperty("--top-h", `${topBar.offsetHeight}px`); }
+setTopHeight();
+if (window.ResizeObserver) new ResizeObserver(setTopHeight).observe(topBar);
+
 // ---- theme: the system setting until the toggle is used; the choice is remembered in this browser ----
 const darkQuery = matchMedia("(prefers-color-scheme: dark)");
 function effectiveTheme() {
@@ -125,6 +132,7 @@ async function poll() {
     const data = await r.json();
     serverOffset = data.now - Date.now() / 1000;
     last = data.live;
+    lastResult = data.result || null;
     render();
   } catch (e) {
     if (e.message !== "logged out") $("updated").textContent = "server not answering";
@@ -156,20 +164,21 @@ function render() {
   if (!finished && age > STALE_S) {
     banners.append(h("div", {class: "banner bad", text: `Main has not updated the status for ${dur(age)}. It may have stopped, or the round ended without a final write.`}));
   }
-  if (finished) banners.append(h("div", {class: "banner info", text: `Round ${R.mode}. The next round appears when main starts it.`}));
+  if (finished) banners.append(h("div", {class: "banner info", text: `Round ${R.mode}. The panels below show the round as it ended; the next round appears when main starts it.`}));
   if (L.schema !== 2) banners.append(h("div", {class: "banner", text: "This status file comes from an older main. Some panels stay empty until main runs the new code."}));
   const set = L.settings || {};
   if (set.error) banners.append(h("div", {class: "banner bad", text: `Settings file: ${set.error}`}));
 
   renderKpis(L, R, S, E, X, finished);
+  renderResult(lastResult, finished);
   renderSchedule(E, finished);
   renderLineage(E);
-  renderDomains(E);
+  renderDomains(E, finished);
   renderMerges(E);
   renderWaves(E, R);
-  renderScout(E, S);
+  renderScout(E, S, finished);
   renderChart(S, L.submissions || []);
-  renderNodes(X);
+  renderNodes(X, finished);
   renderFeed(L, E);
   renderSettingsState();
 }
@@ -183,7 +192,8 @@ function renderKpis(L, R, S, E, X, finished) {
   const subs = L.submissions || [];
   const lastSub = subs.length ? subs[subs.length - 1] : null;
   const left = R.deadline_ts ? R.deadline_ts - now() : null;
-  const live = E ? E.domains.filter((d) => d.status !== "retired").length : 0;
+  const live = E ? E.domains.filter((d) => d.status === "live").length : 0;
+  const merging = E ? E.domains.filter((d) => d.status === "merging").length : 0;
   const perRun = S.gatk_runs_done ? (S.delivered || 0) / S.gatk_runs_done : null;
   const A = L.answer_set;
   $("kpis").replaceChildren(
@@ -192,11 +202,14 @@ function renderKpis(L, R, S, E, X, finished) {
     kpi("Best local", fix(S.best), E && E.pick ? `pick ${fix(E.pick.score)}` : S.best_config ? `config ${S.best_config.slice(0, 8)}` : "", "k-best"),
     kpi("Submitted", lastSub ? fix(lastSub[2]) : "–", lastSub ? `${subs.length} so far · ${ago(lastSub[0])}` : "nothing yet", "k-sub"),
     kpi("Configs scored", int(S.scored), `${int(S.evaluated)} run · ${int(S.failed)} failed · ${int(S.zero)} scored 0`, "k-configs"),
-    kpi("Workers busy", X ? int(X.running) : "–", X ? `of ${int(X.workers)} · ${int(X.queued)} queued · ${int(S.in_flight)} in flight` : "", "k-workers"),
-    kpi("Domains", E ? `${live} / ${E.max_domains}` : "–", E ? `${E.domains.length} so far · ${E.merges.length} merging` : "", "k-domains"),
+    finished ? kpi("Workers busy", "–", "round over", "k-workers")
+      : kpi("Workers busy", X ? int(X.running) : "–", X ? `of ${int(X.workers)} · ${int(X.queued)} queued · ${int(S.in_flight)} in flight` : "", "k-workers"),
+    finished ? kpi("Domains", E ? `${E.domains.filter((d) => d.status !== "retired").length}` : "–", E ? `at the end · ${E.domains.length} in the round` : "", "k-domains")
+      : kpi("Domains", E ? `${live} / ${E.max_domains}` : "–",
+        E ? `climbing · ${merging} merging in ${E.merges.length} merge${E.merges.length === 1 ? "" : "s"} · ${E.domains.length} so far` : "", "k-domains"),
     kpi("GATK runs", int(S.gatk_runs), perRun ? `${perRun.toFixed(2)} configs per run` : "", "k-gatk"),
-    kpi("Answer set", A ? `${int(A.germline)} + ${int(A.synthetic)}` : "building",
-      A ? `${A.regime || ""} · donor ${A.donor || "?"} · ${int(A.n_targets)} targets` : "", "k-answer"),
+    kpi("Answer set", A ? int(A.germline) : "building",
+      A ? `germline + ${int(A.synthetic)} synthetic · ${A.regime || ""} · donor ${A.donor || "?"} · ${int(A.n_targets)} targets` : "", "k-answer"),
   );
 }
 
@@ -218,7 +231,9 @@ function segments(E) {
 function renderSchedule(E, finished) {
   const box = $("schedule"), ticks = $("schedule-ticks");
   if (!E) {
-    box.replaceChildren(h("div", {class: "seg opening", style: {left: "0", width: "100%"}, text: "building the answer set, then the opening"}));
+    const R = (last && last.round) || {};
+    const what = R.mode === "building answer set" ? "building the answer set, then the opening" : "waiting for the fleet to settle, then the opening";
+    box.replaceChildren(h("div", {class: "seg opening", style: {left: "0", width: "100%"}, text: what}));
     ticks.replaceChildren();
     $("schedule-sub").textContent = "";
     return;
@@ -251,7 +266,8 @@ function renderLineage(E) {
   }
   const doms = [...E.domains].sort((a, b) => a.born_s - b.born_s || a.id - b.id);
   const row = new Map(doms.map((d, i) => [d.id, i]));
-  const W = Math.max(520, box.clientWidth || 640), left = 46, right = 66, top = 22, rh = 22;
+  const W = Math.max(520, box.clientWidth || 640), top = 22, rh = 22;
+  const left = parseFloat(css("--axis-l")) || 46, right = parseFloat(css("--axis-r")) || 66;   // same axis as the schedule
   const H = top + doms.length * rh + 8;
   const L = E.schedule.length_s;
   const x = (t) => left + ((W - left - right) * Math.max(0, Math.min(L, t))) / L;
@@ -285,10 +301,39 @@ function renderLineage(E) {
   box.replaceChildren(svg);
 }
 
-function renderDomains(E) {
+function renderResult(res, finished) {
+  const panel = $("result-panel");
+  const rev = res && res.review, rank = res && res.rank;
+  if (!finished && !rev && !rank) { panel.hidden = true; return; }
+  panel.hidden = false;
+  const box = $("result");
+  if (!rev && !rank) {
+    $("result-sub").textContent = "";
+    box.replaceChildren(h("div", {class: "empty", text: "The truth review runs once the round's truth is released (a replay: right after the search; a live round: about one round later)."}));
+    return;
+  }
+  const s = (rev && rev.search) || {}, a = (rev && rev.answer_set) || {};
+  const syn = a.synthetic || {}, ger = a.germline_exact || {};
+  $("result-sub").textContent = rank ? `reviewed ${ago(rank.at)}` : "review done; the rank follows";
+  box.replaceChildren(
+    kpi("True score", rank ? fix(rank.true_score) : s.final_true != null ? fix(s.final_true) : "–",
+      s.final_local != null ? `local ${fix(s.final_local)} · pick gap ${fix(s.pick_gap)}` : "", "k-best"),
+    kpi("Rank", rank ? `${rank.rank} / ${rank.field}` : "pending",
+      rank ? `field best ${fix(rank.field_best)} · gap ${fix(rank.gap_to_best)}` : "", "k-sub"),
+    kpi("Vs the field median", rank ? `${rank.vs_median >= 0 ? "+" : ""}${fix(rank.vs_median)}` : "–",
+      rank ? `median ${fix(rank.field_median)}` : "", "k-configs"),
+    kpi("Over the baseline", s.gain_over_baseline != null ? `+${fix(s.gain_over_baseline)}` : "–",
+      s.spearman != null ? `local vs true order: Spearman ${fix(s.spearman, 2)}` : "", "k-gatk"),
+    kpi("Answer set", syn.precision != null ? `${fix(syn.precision, 3)} / ${fix(syn.recall, 3)}` : "–",
+      `synthetic precision / recall · germline ${ger.precision != null ? fix(ger.precision, 3) : "–"} / ${ger.recall != null ? fix(ger.recall, 3) : "–"}`, "k-answer"),
+  );
+}
+
+function renderDomains(E, finished) {
   const box = $("domains");
   if (!E) { box.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); $("domains-sub").textContent = ""; return; }
-  const live = E.domains.filter((d) => d.status !== "retired").sort((a, b) => b.best - a.best);
+  const live = E.domains.filter((d) => d.status !== "retired").sort((a, b) => a.id - b.id);   // stable order, as in the tree
+  $("h-domains").firstChild.textContent = finished ? "Final domains " : "Live domains ";
   const gone = E.domains.filter((d) => d.status === "retired");
   $("domains-sub").textContent = gone.length ? `${gone.length} retired` : "";
   if (!live.length) { box.replaceChildren(h("div", {class: "empty", text: E.phase === "opening" ? "The opening is still running." : "No live domain."})); return; }
@@ -296,12 +341,13 @@ function renderDomains(E) {
     const cls = d.status === "merging" ? "merging" : d.state === "final" ? "final" : "";
     return h("div", {class: `card ${cls}`},
       h("div", {class: "head"}, h("b", {text: `Domain ${d.id}`}),
-        chip(d.status === "merging" ? "merging" : d.state, d.status === "merging" ? "merging" : d.state), chip(d.mode)),
+        finished ? chip("finished", "final") : chip(d.status === "merging" ? "merging" : d.state, d.status === "merging" ? "merging" : d.state),
+        finished ? null : chip(d.mode)),
       h("div", {class: "big", text: fix(d.best)}),
       bar(d.allotted ? d.inflight / Math.max(d.allotted, d.inflight) : 0, "", null),
       kv([
         ["climbing", `${d.progress_per_min >= 0 ? "+" : ""}${fix(d.progress_per_min)} / min`],
-        ["in flight", `${d.inflight} of ${fix(d.allotted, 0)} allotted`],
+        finished ? null : ["in flight", d.status === "merging" ? `${d.inflight}, merging` : `${d.inflight} of ${fix(d.allotted, 0)} allotted`],
         ["configs tried", int(d.tried)],
         ["born at", mins(d.born_s)],
         d.parents.length ? ["merged from", d.parents.map((p) => `D${p}`).join(", ")] : null,
@@ -335,15 +381,16 @@ function renderWaves(E, R) {
   }), h("div", {class: "muted", text: E.phase === "opening" ? "Domains are founded when the opening ends." : `Founded ${E.domains.filter((d) => d.origin === "the opening").length} domains.`}));
 }
 
-function renderScout(E, S) {
+function renderScout(E, S, finished) {
   const box = $("scout");
   if (!E) { box.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); return; }
   const target = Math.max(1, Math.floor(E.capacity * E.scout.share));
   const finds = E.domains.filter((d) => d.origin.startsWith("a scout find")).length;
   box.replaceChildren(
     h("div", {class: "rowline"},
-      h("div", {class: "top-line"}, h("b", {text: "Scout"}), h("span", {class: "num muted", text: `${int(E.scout.in_flight)} / ${int(target)} in flight`})),
-      bar(E.scout.in_flight / target, "scout", null)),
+      h("div", {class: "top-line"}, h("b", {text: "Scout"}),
+        h("span", {class: "num muted", text: finished ? "stopped" : `${int(E.scout.in_flight)} / ${int(target)} in flight`})),
+      bar(finished ? 0 : E.scout.in_flight / target, "scout", null)),
     kv([
       ["finds tested", int(E.scout.finds_tested)],
       ["finds being tested", int(E.scout.finds_testing)],
@@ -387,7 +434,8 @@ function renderChart(S, subs) {
     const axis = {stroke: css("--muted"), grid: {stroke: css("--line"), width: 1}, ticks: {stroke: css("--line")}};
     chart = new uPlot({
       width: el.clientWidth || 800, height: 300,
-      scales: {y: {range: (u, lo, hi) => {
+      scales: {x: {time: true, range: (u, lo, hi) => (hi - lo < 120 ? [lo - 60, hi + 60] : [lo, hi])},
+               y: {range: (u, lo, hi) => {
         const top = Math.max(hi, best);
         return [Math.max(lo, top - 3), top + 0.15];
       }}},
@@ -405,17 +453,22 @@ function renderChart(S, subs) {
 }
 window.addEventListener("resize", () => { sizeChart(); if (last) renderLineage((last.search || {}).engine); });
 
-function renderNodes(X) {
+function renderNodes(X, finished) {
   const box = $("nodes");
   if (!X) { box.replaceChildren(h("div", {class: "empty", text: "No evaluator yet."})); $("nodes-sub").textContent = ""; return; }
   const extra = X.kind === "fleet" ? ` · ${int(X.speculated || 0)} slow runs duplicated, ${int(X.speculation_won || 0)} won` : "";
-  $("nodes-sub").textContent = `${X.kind} · ${int(X.running)} of ${int(X.workers)} workers busy · ${int(X.queued)} queued${extra}`;
+  $("nodes-sub").textContent = finished ? `${X.kind} · round over: no work on any node${extra}`
+    : `${X.kind} · ${int(X.running)} of ${int(X.workers)} workers busy · ${int(X.queued)} queued${extra}`;
   const nodes = X.nodes && X.nodes.length ? X.nodes : [{node: "this machine", ready: true, workers: X.workers, busy: X.running, small: null, solo_s: X.solo_s}];
-  box.replaceChildren(...nodes.map((n) => h("div", {class: `node ${n.ready ? "" : "down"}`},
-    h("div", {class: "head"}, h("span", {text: n.node}),
-      n.rejected ? chip("rejected", "bad") : !n.ready ? chip("not ready", "warn") : n.slow ? chip("slow", "warn") : chip("ready", "good")),
-    bar(n.workers ? n.busy / n.workers : 0, "", null),
-    h("div", {class: "num muted", text: `${int(n.busy)} / ${int(n.workers)} busy${n.small != null ? ` · ${int(n.small)} small` : ""}${n.solo_s ? ` · ${int(n.solo_s)} s per run` : ""}`}))));
+  box.replaceChildren(...nodes.map((n) => {
+    const busy = finished ? 0 : n.busy;                    // a finished round has no work anywhere
+    const state = n.rejected ? chip("rejected", "bad") : finished ? chip("idle") : !n.ready ? chip("not ready", "warn")
+      : n.slow ? chip("slow", "warn") : chip("ready", "good");
+    return h("div", {class: `node ${n.ready && !finished ? "" : "down"}`},
+      h("div", {class: "head"}, h("span", {text: n.node}), state),
+      bar(n.workers ? busy / n.workers : 0, "", null),
+      h("div", {class: "num muted", text: `${int(busy)} / ${int(n.workers)} busy${!finished && n.small != null ? ` · ${int(n.small)} small` : ""}${n.solo_s ? ` · ${int(n.solo_s)} s per run` : ""}`}));
+  }));
 }
 
 function renderFeed(L, E) {
