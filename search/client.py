@@ -15,7 +15,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from common.params import ParamRanges
 from common.store import ResultStore
@@ -43,10 +43,10 @@ class Outcome:
 
 class EvalClient:
     def __init__(self, round: Round, executor: Executor, scorer: Scorer, ranges: ParamRanges, store: ResultStore,
-                 answer_set: AnswerSet, budget: Optional[int] = None, deadline_ts: Optional[float] = None,
+                 answer_set: Optional[AnswerSet], budget: Optional[int] = None, deadline_ts: Optional[float] = None,
                  clock: Optional[Callable[[], float]] = None):
         self.round, self.executor, self.scorer, self.ranges, self.store = round, executor, scorer, ranges, store
-        self.answer_set = answer_set
+        self.answer_set = answer_set                                # None until main has built it (nothing is scored before)
         self.budget = budget
         self.deadline_ts = deadline_ts                              # when main stops the search (None: no deadline)
         self.clock = clock or time.time                             # the round's clock (virtual in simulations)
@@ -58,6 +58,8 @@ class EvalClient:
         self.latest: Dict[Tuple[str, str], ScoreResult] = {}         # scored against the current answer set
         self.on_result: List[Callable[[Outcome], None]] = []
         self.on_rescore: List[Callable[[], None]] = []
+        self._best: Dict[str, ScoreResult] = {}                     # fidelity -> best scored result so far
+        self.notes: Dict[str, object] = {}                          # what the search wants shown (dashboard)
 
     # ---- strategy-facing API -------------------------------------------------------------------------------
     def time_left(self) -> Optional[float]:
@@ -68,17 +70,24 @@ class EvalClient:
     def exhausted(self) -> bool:
         return self.budget is not None and self.spent >= self.budget
 
-    def propose(self, config: Config, *, fidelity: str = FULL, priority: int = 0, tag: str = "") -> asyncio.Future:
-        return self.propose_many([config], fidelity=fidelity, priority=priority, tag=tag)[0]
+    def propose(self, config: Config, *, fidelity: str = FULL, priority: int = 0, tag: str = "",
+                lane: str = "throughput") -> asyncio.Future:
+        return self.propose_many([config], fidelity=fidelity, priority=priority, tag=tag, lane=lane)[0]
 
     def propose_many(self, configs: Iterable[Config], *, fidelity: str = FULL, priority: int = 0,
-                    tag: str = "") -> List[asyncio.Future]:
+                    tag: str = "", lane: str = "throughput",
+                    lanes: Optional[Sequence[str]] = None) -> List[asyncio.Future]:
         """Several configs in ONE executor call, so related ones (a family: same config except cheap
         parameters) are queued together and can share one GATK run. Budget: each is charged the executor's
-        cost for it as part of this group (a batch rider costs a fraction of a full run)."""
+        cost for it as part of this group (a batch rider costs a fraction of a full run).
+        `lane`: "latency" for a result the search is waiting on (run on the fastest free node, cheap riders only),
+        "throughput" (default) for everything else (packed fully, run anywhere). `lanes`: one lane per config
+        instead (a latency head with throughput riders in the same call, so they queue together and pack)."""
         loop = asyncio.get_running_loop()
         futs, jobs = [], []
-        for config in configs:
+        configs = list(configs)
+        per_config = list(lanes) if lanes is not None else [lane] * len(configs)
+        for config, lane in zip(configs, per_config):
             fut = loop.create_future()
             futs.append(fut)
             errs = self.ranges.errors(config)
@@ -89,7 +98,8 @@ class EvalClient:
             if cached is not None:
                 fut.set_result(Outcome(config, cached, None, tag))
                 continue
-            jobs.append((fut, EvalJob(f"{self.round.tag}-j{next(self._ids)}", self.round, config, fidelity, priority, tag)))
+            jobs.append((fut, EvalJob(f"{self.round.tag}-j{next(self._ids)}", self.round, config, fidelity, priority, tag,
+                                      lane)))
         if not jobs:
             return futs
         hints = getattr(self.executor, "cost_hints", None)
@@ -128,14 +138,28 @@ class EvalClient:
         return [f.result() if f.done() else None for f in futs]
 
     def best(self, fidelity: str = FULL) -> Optional[ScoreResult]:
-        ok = [r for (k, fid), r in self.latest.items()
-              if fid == fidelity and r.score is not None and r.gate_passed is not False]
-        return max(ok, key=lambda r: r.score) if ok else None
+        return self._best.get(fidelity)
+
+    def _note_best(self, r: ScoreResult) -> None:
+        if r.score is None or r.gate_passed is False:
+            return
+        cur = self._best.get(r.fidelity)
+        if cur is None or r.score > cur.score:
+            self._best[r.fidelity] = r
+
+    def _rebuild_best(self) -> None:
+        self._best = {}
+        for (k, fid), r in self.latest.items():
+            self._note_best(r)
 
     # ---- driven by the round loop ----------------------------------------------------------------------------
     @property
     def in_flight(self) -> int:
         return len(self._pending)
+
+    def set_answer_set(self, answer_set: AnswerSet) -> None:
+        """The round's first answer set: scoring can start."""
+        self.answer_set = answer_set
 
     def deliver(self, cs: CallSet) -> None:
         """Score one callset now (unless its machine already did) and hand the outcome to the waiting strategy."""
@@ -150,6 +174,9 @@ class EvalClient:
         thread."""
         out = []
         for cs in callsets:
+            if self.answer_set is None:
+                out.append((None, "no answer set yet"))
+                continue
             try:
                 out.append((self.scorer.score(cs, self.answer_set), None))
             except Exception as e:  # a scorer failure is that config's failure, not the round's
@@ -167,6 +194,7 @@ class EvalClient:
             self.callsets[(cs.config_key, cs.fidelity)] = cs
             if result is not None:
                 self.latest[(cs.config_key, cs.fidelity)] = result
+                self._note_best(result)
                 self.store.add(result, config, cs.runtime_s, tag)
                 outcome.result = result
         if fut is not None and not fut.done():
@@ -198,5 +226,6 @@ class EvalClient:
                 continue
             self.latest[(key, fid)] = r
             self.store.add(r, self.configs[key], cs.runtime_s, "rescore")
+        self._rebuild_best()
         for cb in self.on_rescore:
             cb()

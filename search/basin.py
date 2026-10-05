@@ -1,8 +1,8 @@
 """Basin racing for a large fleet.
 
-Local score decides which structural neighborhood is worth a look. It does not pick a winner inside that
-neighborhood. A submission changes only when a different structural signature is ahead by the band. Official
-scores are not available during the round; a known official config is only the first seed.
+Local score decides which structural neighborhoods are worth a race (the leaders within the band of the best).
+Main submits the round's local best, as for every strategy. Official scores are not available during the round; a
+known official config is only the first seed.
 
 One family is one HaplotypeCaller traversal. The other members change only genotyping parameters, so they
 re-genotype in about a second and a half instead of starting another traversal.
@@ -20,8 +20,8 @@ from search.client import EvalClient
 from search.schedule import run_streaming
 from search.space import (CALL_CONF_GRID, CONTAMINATION_GRID, GENOTYPING_PARAMS, PINNED, Space)
 
-# Measured on 20260928T092900Z: local 87.4 and local 85.1 were different official bands (~88.16 vs ~86.04).
-# Inside 87.38–87.41 the official scores did not separate. A gain below this does not change the submission.
+# Local-score band of the basins worth racing (leaders within BAND of the best). Not a submission rule: with the
+# k2 answer set the top band ranks like the released truth (0% inversions at gaps >= 0.005 on 20261002T115300Z).
 BAND = 0.15
 # Unit-space bucket. Padding 25 and 100 land apart; a one-step confidence change does not, because
 # genotyping parameters are not part of the signature.
@@ -216,33 +216,11 @@ def farthest(space: Space, seeds: Sequence[Config], pool: Sequence[Config], n: i
     return chosen
 
 
-def choose_submission(pairs: Sequence[Tuple[Config, float]], family_only: Set[str],
-                     sign_of, margin: float) -> Optional[Config]:
-    """First skeleton stays. A later one replaces it only when its signature differs and it leads by `margin`.
-
-    `pairs` is completion order. Family members are never the submission.
-    """
-    chosen: Optional[Config] = None
-    chosen_score = 0.0
-    for config, score in pairs:
-        if config.key in family_only:
-            continue
-        if chosen is None:
-            chosen, chosen_score = config, score
-            continue
-        if sign_of(config) == sign_of(chosen):
-            continue
-        if score >= chosen_score + margin:
-            chosen, chosen_score = config, score
-    return chosen
-
-
 def basin_race(ranges: ParamRanges, *, tool: str = "gatk", in_flight: int = 8, family: int = 6,
                seed: int = 0, band: float = BAND) -> Strategy:
     """Scout structurally different skeletons, then a short race inside the top local band.
 
-    The submission rule is installed on the client: same signature never replaces the submission, and a
-    different signature replaces it only when it leads by `band`. Family members are not submissions.
+    `band`: how far below the best local score a basin may be and still be raced.
     """
     pinned = dict(PINNED.get(tool, {}))
     if tool == "gatk":
@@ -255,11 +233,6 @@ def basin_race(ranges: ParamRanges, *, tool: str = "gatk", in_flight: int = 8, f
         skel_score: Dict[Tuple, Tuple[float, Config]] = {}
         race_used: Dict[Tuple, int] = {}
         margin = [band]
-
-        def choose(pairs: List[Tuple[Config, float]]) -> Optional[Config]:
-            return choose_submission(pairs, family_only, lambda config: signature(space, config), margin[0])
-
-        client.choose_submission = choose  # type: ignore[attr-defined]
 
         seeds: List[Config] = []
         seen: Set[str] = set()
