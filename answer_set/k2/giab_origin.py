@@ -114,6 +114,21 @@ def fetch(person, chrom, a, b, pad=500, chunks=8, attempts=4, budget_s=None):
     try:
         with cf.ThreadPoolExecutor(len(pieces)) as ex:
             counts = list(ex.map(one, range(len(pieces))))
+        # a remote read can end early without an error and leave a piece nearly empty (seen once in 216 downloads:
+        # 31 reads instead of ~195,000, so a twelfth of a round's reads had no original). Such a piece is fetched
+        # again within the budget; if it stays nearly empty, it is reported (the build goes on with the rest).
+        for _ in range(attempts):
+            med = sorted(counts)[len(counts) // 2]
+            weak = [i for i, c in enumerate(counts) if med > 1000 and c < 0.2 * med]
+            if not weak or time.monotonic() >= deadline:
+                break
+            for i in weak:
+                counts[i] = one(i)
+        med = sorted(counts)[len(counts) // 2]
+        weak = [i for i, c in enumerate(counts) if med > 1000 and c < 0.2 * med]
+        if weak:
+            print(f"WARNING original reads {person} {chrom}:{a}-{b}: piece(s) {weak} still nearly empty "
+                  f"({[counts[i] for i in weak]} reads vs median {med})", file=sys.stderr)
         parts = [str(tmp / f"p{i}.bam") for i in range(len(pieces))]
         pysam.cat("-o", str(out) + ".part", *parts)
         Path(str(out) + ".part").rename(out)
