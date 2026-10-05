@@ -1,9 +1,9 @@
 # main
 
-The miner process: watch for a round, fetch it, build the answer set, run the search, keep the best config
+The miner process: watch for a round, fetch it, run the search while the answer set is built, keep the best config
 submitted. Wires the other parts together through their public APIs.
 
-Main builds nothing of another part: it asks `search.strategies(...)`, `evaluator.local_executor(...)` /
+Main builds nothing of another part: it asks `search.searcher(...)`, `evaluator.local_executor(...)` /
 `evaluator.fleet_executor(...)` / `evaluator.scorer()` and `answer_set.builder()` for the pieces of a round (`make_parts`).
 
 Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatform`, `PlatformSubmitter`,
@@ -11,20 +11,26 @@ Public API: `mine_round`, `run_forever`, `Parts`, `MinedRound`, `UpstreamPlatfor
 
 ## One round (`miner.mine_round`)
 
-1. **Answer set** (`provider.build`). If it fails, or no donor is identified -> submit the first valid **baseline**
-   and stop (searching without a truth is noise). A round never ends without a valid submission.
-2. **Search** (`loop.run_round_async`): the baselines (highest priority, so they run first) and all strategies start
-   together, so every worker is busy from the first minute; baselines are tried in order until one is submitted (or a
-   better config is), so a round never ends empty. Strategies run until `deadline - stop_before_deadline_s`.
-3. **Submissions**: a better config is resubmitted at most every `resubmit_interval_s` (300 s live - on-chain
+1. **Publish** (fleet only): the round (BAM location, region) goes to the nodes before anything else; they fetch the
+   BAM and run the first wave while main works.
+2. **Search** (`loop.run_round_async`) starts at once: the baselines (highest priority, so they run first) and the
+   search's opening wave fill every worker from the first minute. Baselines are tried in order until one is
+   submitted (or a better config is), so a round never ends empty. The search runs until
+   `deadline - stop_before_deadline_s`.
+3. **Answer set** (`provider.build`) is built in a thread meanwhile (minutes on a live round); results made before it
+   exists wait and are scored the moment it does - on main and on the nodes (`publish_answer_set`, again on every
+   newer version). If it fails, or no donor is identified -> the round's work is dropped and the first valid
+   **baseline** is submitted, unsearched (searching without a truth is noise). A round never ends without a valid
+   submission.
+4. **Submissions**: a better config is resubmitted at most every `resubmit_interval_s` (300 s live - on-chain
    commitments are rate-limited); the best config found is submitted once more just before the loop stops.
-4. Scoring (one upstream hap.py run per config) runs in a background thread, so GATK workers stay fed while
-   hap.py runs (with a
-   fleet, the nodes score).
-5. Last minutes: at round start main tells the executor when the final submission happens
+5. Scoring (one upstream hap.py run per config) runs off the loop in `evaluator.ScoringPool`'s processes - one per
+   GATK worker, as a fleet node scores its own results - so GATK workers stay fed while hap.py runs (with a fleet,
+   the nodes score and main scores nothing).
+6. Last minutes: at round start main tells the executor when the final submission happens
    (`set_finish_by(deadline - stop_before_deadline_s - score_margin_s)`), so it starts no GATK work that could not be
    scored by then.
-6. Round end: after the final submission the executor ends the round (`end_round`): its queued jobs are dropped and
+7. Round end: after the final submission the executor ends the round (`end_round`): its queued jobs are dropped and
    its running GATK containers killed, locally or on every fleet node, so the next round starts with every worker free.
 
 ## Status and post-round review (`main.status`, `main.review`)
@@ -61,16 +67,16 @@ Try `python -m main live --wallet W --hotkey H --demo` first.
 ## Commands
 
 ```bash
-.venv/bin/python -m main replay <round_tag> --minutes 20 [--strategy NAME]   # names: search.STRATEGY_NAMES
+.venv/bin/python -m main replay <round_tag> --minutes 20                    # runs the search part's searcher, as live does
 .venv/bin/python -m main live --wallet W --hotkey H [--demo]
 # either one with a fleet: main only proposes, sub-VPS nodes run GATK and score (see evaluator/README.md)
 .venv/bin/python -m main replay <tag> --fleet            # sub-VPSs from fleet.json (repo folder), controlled over ssh
 .venv/bin/python -m main review <run_id|tag>             # review one stored run now (answer-set accuracy, TRUE, rank)
 ```
 
-With `--fleet`, `mine_round` publishes each round (truth files, BAM location) to the nodes once the answer set
-exists; when main stops, every node agent stops. The review then re-runs the configs it scores on main (their
-VCFs are on the nodes).
+With `--fleet`, `mine_round` publishes each round (BAM location, region) to the nodes first and the loop publishes
+the answer set when it exists; when main stops, every node agent stops. The review then re-runs the configs it
+scores on main (their VCFs are on the nodes).
 
 ## Open work
 

@@ -1,9 +1,9 @@
-"""python -m main replay <round_tag> [--minutes 15] [--strategy NAME]      (names: search.STRATEGY_NAMES)
+"""python -m main replay <round_tag> [--minutes 15]
        python -m main live --wallet NAME --hotkey NAME [--demo]
        python -m main review <run_id|round_tag>
 
 replay  the whole miner on a stored round, as if live: real answer set, real GATK (batched), real scoring, the
-        chosen strategy, dry-run submissions, a deadline `--minutes` from now. Then reports what it would have
+        search part's searcher, dry-run submissions, a deadline `--minutes` from now. Then reports what it would have
         submitted, and reviews the run (main.review): answer-set accuracy, TRUE scores, rank.
 live    the real miner (needs bittensor, httpx and a registered wallet; untested - try --demo first). Next to it
         main.review checks every 5 min whether a mined round's truth is out / the round is finalized, and reviews
@@ -24,7 +24,6 @@ from common.params import ParamRanges
 from common.settings import SETTINGS, default_workers
 from common.store import ResultStore
 from common.types import Round
-from search.lineup import STRATEGY_NAMES
 
 
 def ranges() -> ParamRanges:
@@ -56,7 +55,7 @@ def _board():
     return _BOARD["b"]
 
 
-def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: int, fleet=None):
+def make_parts(rnd: Round, r: ParamRanges, submitter, workers: int, fleet=None, scoring=None):
     """The pieces of one round, each from its own part's factory: main never builds another part's internals."""
     import evaluator
     import search
@@ -66,19 +65,19 @@ def make_parts(rnd: Round, r: ParamRanges, strategy: str, submitter, workers: in
     executor = fleet if fleet is not None else evaluator.local_executor(workers)
     os.makedirs(os.path.join(SETTINGS.cache_dir, "results"), exist_ok=True)
     store = ResultStore(os.path.join(SETTINGS.cache_dir, "results", f"{rnd.tag}.sqlite"))
-    return Parts(answer_set.builder(), executor, evaluator.scorer(), search.strategies(strategy, r, workers), submitter, r,
+    return Parts(answer_set.builder(), executor, evaluator.scorer(), search.searcher(r, workers), submitter, r,
                  [r.defaults("gatk")], LoopSettings(resubmit_interval_s=300.0, stop_before_deadline_s=60.0), store,
-                 status=_board())
+                 status=_board(), scoring=scoring)
 
 
-def replay(tag: str, minutes: float, strategy: str, workers: int, fleet=None) -> None:
+def replay(tag: str, minutes: float, workers: int, fleet=None, scoring=None) -> None:
     from backtest.data import load
     from main.miner import mine_round
     from main.submitter import DryRunSubmitter
     rnd = load(tag, reference=reference_for(load(tag).chrom))
     r = ranges()
     sub = DryRunSubmitter()
-    parts = make_parts(rnd, r, strategy, sub, workers, fleet)
+    parts = make_parts(rnd, r, sub, workers, fleet, scoring)
     t0 = time.time()
     mined = mine_round(rnd, parts, deadline_ts=t0 + minutes * 60)
     print(f"\n{tag}: {mined.mode} {mined.note} | {time.time() - t0:.0f}s")
@@ -118,7 +117,6 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="python -m main")
     sp = ap.add_subparsers(dest="cmd", required=True)
     a = sp.add_parser("replay"); a.add_argument("tag"); a.add_argument("--minutes", type=float, default=15)
-    a.add_argument("--strategy", default=STRATEGY_NAMES[0], choices=STRATEGY_NAMES)
     a.add_argument("--workers", type=int, default=default_workers())
     b = sp.add_parser("live"); b.add_argument("--wallet", required=True); b.add_argument("--hotkey", required=True)
     b.add_argument("--demo", action="store_true"); b.add_argument("--workers", type=int, default=default_workers())
@@ -135,20 +133,23 @@ def main() -> None:
     _board().kind = args.cmd
     import evaluator
     fleet = evaluator.fleet_executor(args.fleet) if args.fleet else None
+    scoring = None if fleet is not None else evaluator.scoring_pool(args.workers)   # the nodes score on a fleet
     try:
         if args.cmd == "replay":
-            replay(args.tag, args.minutes, args.strategy, args.workers, fleet)
+            replay(args.tag, args.minutes, args.workers, fleet, scoring)
         else:
             from main.review import Reviewer
             Reviewer(board=_board()).start()                  # every 5 min: truth out? finalized? -> review / rank
             from main.miner import PlatformSubmitter, UpstreamPlatform, run_forever
             platform = UpstreamPlatform(args.wallet, args.hotkey, demo=args.demo)
             r = ranges()
-            run_forever(platform, lambda rnd: make_parts(rnd, r, "pattern", PlatformSubmitter(platform), args.workers,
-                                                         fleet), reference_for)
+            run_forever(platform, lambda rnd: make_parts(rnd, r, PlatformSubmitter(platform), args.workers,
+                                                         fleet, scoring), reference_for)
     finally:
         if fleet is not None:
             fleet.close()                         # every node agent stops and kills its GATK containers
+        if scoring is not None:
+            scoring.close()
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
-"""The miner process: watch for a round, fetch it, build the answer set, search, submit. Owner: main.
+"""The miner process: watch for a round, fetch it, search it while the answer set is built, submit. Owner: main.
 
     run_forever(source, make_parts, reference_for)   live: poll the platform, mine every new round (needs a wallet)
     mine_round(round, parts, ...)     one round with the fallback chain, used by live and replay
 
 Fallback chain (a round must never end without a valid submission):
-  1. a known-good baseline is submitted as soon as it has run (main.loop does this first)
-  2. answer set failed, or no donor identified -> the baseline alone, unsearched (search without a truth is noise)
+  1. a known-good baseline is submitted as soon as it has run and been scored (main.loop does this first)
+  2. answer set failed, or no donor identified -> the baseline alone, unsearched (search without a truth is noise;
+     what the executor ran before the answer set was known is dropped)
   3. otherwise search until the deadline, resubmitting at most every `resubmit_interval_s` (chain commitments are
      rate-limited), and the best config found is submitted once more just before the loop stops.
 
@@ -26,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional, Protocol, Tuple
+from typing import Awaitable, Callable, List, Optional, Protocol, Tuple
 
 from answer_set.base import AnswerSetProvider
 from common.params import ParamRanges
@@ -34,9 +35,9 @@ from common.settings import SETTINGS
 from common.store import ResultStore
 from common.types import Config, Regime, Round
 from evaluator.base import Executor, Scorer
-from main.loop import LoopSettings, RoundOutcome, run_round_async
+from main.loop import AnswerSetUnavailable, LoopSettings, RoundOutcome, run_round_async
 from main.submitter import Submitter
-from search.base import Strategy
+from search.client import EvalClient
 
 log = logging.getLogger(__name__)
 
@@ -47,13 +48,14 @@ class Parts:
     provider: AnswerSetProvider
     executor: Executor
     scorer: Scorer
-    strategies: List[Strategy]
+    searcher: Callable[[EvalClient], Awaitable[None]]   # search's one search for the round
     submitter: Submitter
     ranges: ParamRanges
     baselines: List[Config]                       # known-good configs, best first; [0] is the static fallback
     settings: LoopSettings = field(default_factory=LoopSettings)
     store: Optional[ResultStore] = None
     status: Optional[object] = None               # main.status.StatusBoard: what the dashboard shows
+    scoring: Optional[object] = None              # evaluator.ScoringPool when this machine scores (no fleet)
 
 
 @dataclass
@@ -76,38 +78,33 @@ def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url
 
 def _mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url: Optional[str] = None,
                 bai_url: Optional[str] = None) -> MinedRound:
-    """One round with the fallback chain. Never raises. With a fleet executor, the round (truth files, BAM location)
-    is published to the nodes once the answer set exists."""
-    try:
-        answer_set = parts.provider.build(round)
-    except Exception as e:  # noqa: BLE001 - the round still gets the static baseline
-        log.exception("answer set failed for %s", round.round_id)
-        return _static(round, parts, f"answer set failed: {e}")
-    if parts.status:
-        parts.status.answer_set(answer_set)
-    if answer_set.regime == Regime.UNKNOWN or not answer_set.germline:
-        return _static(round, parts, "no donor identified: searching without a truth would be noise")
+    """One round with the fallback chain. Never raises. With a fleet executor the round (BAM location, region) is
+    published first: the nodes fetch the BAM and run the opening wave while main builds the answer set, which the
+    loop publishes to them the moment it exists."""
     publish = getattr(parts.executor, "publish_round", None)
     if publish:
         try:
-            publish(round, answer_set, bam_url, bai_url)
+            publish(round, bam_url, bai_url)
         except Exception as e:  # noqa: BLE001 - no fleet for this round: still submit something
             log.exception("publishing %s to the fleet failed", round.round_id)
             return _static(round, parts, f"fleet publish failed: {e}")
 
-    class Built:                                  # the loop builds once; hand it the answer set we already have
-        def build(self, _round):
-            return answer_set
-
-        def update(self, a, callsets):
-            return parts.provider.update(a, callsets)
+    def accept(answer_set) -> Optional[str]:      # the loop built it: show it, and refuse one nothing can be scored on
+        if parts.status:
+            parts.status.answer_set(answer_set)
+        if answer_set.regime == Regime.UNKNOWN or not answer_set.germline:
+            return "no donor identified: searching without a truth would be noise"
+        return None
 
     try:
-        out = asyncio.run(run_round_async(round, Built(), parts.executor, parts.scorer, parts.strategies,
+        out = asyncio.run(run_round_async(round, parts.provider, parts.executor, parts.scorer, parts.searcher,
                                           parts.submitter, parts.ranges, parts.settings, parts.baselines,
                                           store=parts.store, deadline_ts=deadline_ts,
-                                          on_tick=parts.status.tick if parts.status else None))
+                                          on_tick=parts.status.tick if parts.status else None, accept=accept,
+                                          scoring=parts.scoring))
         return MinedRound(round.round_id, "searched", out)
+    except AnswerSetUnavailable as e:
+        return _static(round, parts, str(e))
     except Exception as e:  # noqa: BLE001
         log.exception("round loop failed for %s", round.round_id)
         if _submitted(parts, round):              # a better config already went out: the baseline must not replace it
@@ -197,7 +194,7 @@ class UpstreamPlatform:
 
     def __init__(self, wallet_name: str, hotkey: str, netuid: int = 107, network: str = "finney", demo: bool = False):
         import sys
-        sys.path.insert(0, SETTINGS.minos_subnet_dir)
+        sys.path.append(SETTINGS.minos_subnet_dir)
         import bittensor as bt  # noqa: F401 - imported here so the rest of the project runs without it
         import utils.bt_compat  # noqa: F401 - like upstream's miner: bt.wallet / bt.subtensor on SDK 10.x, SDK check
         from utils.platform_client import MinerPlatformClient, PlatformConfig

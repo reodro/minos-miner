@@ -115,6 +115,8 @@ class StatusBoard:
                 self._seen.add(k)
                 s.setdefault("points", []).append([now, round(r.score, 4), k])
         s["points"] = s["points"][-5000:]
+        s["failure_reasons"] = sorted(out.failures.items(), key=lambda kv: -kv[1])[:8]
+        s["engine"] = (getattr(client, "notes", None) or {}).get("engine")
         s.update(evaluated=out.evaluated, failed=out.failed, in_flight=client.in_flight,
                  scored=sum(1 for r in full.values() if r.score is not None),
                  zero=sum(1 for r in full.values() if r.score is not None and r.score <= 0),
@@ -195,11 +197,12 @@ class StatusBoard:
                           "zero_scored": sum(1 for x in scores if x <= 0), "scored": len(scores),
                           "submissions": len(out.submissions) if out else 0}}
         self._append(row)
-        self._save_run(r.get("run_id"), row, client, final)
+        self._save_run(r.get("run_id"), row, client, final, out)
         self._write(force=True)
 
-    def _save_run(self, run_id, row, client, final):
-        """What main.review needs later: the configs (params + local score) and our answer set."""
+    def _save_run(self, run_id, row, client, final, out=None):
+        """What main.review needs later: the configs (params + local score), the configs that failed (what to
+        exclude from the space) and our answer set."""
         if not run_id:
             return
         d = self.dir / "runs" / run_id
@@ -212,8 +215,9 @@ class StatusBoard:
                     configs[k] = {"config": cfg.to_dict(), "local": res.score, "gate_passed": res.gate_passed}
         if self._baseline and self._baseline not in configs and self._baseline_cfg:   # e.g. a static fallback
             configs[self._baseline] = {"config": self._baseline_cfg, "local": None, "gate_passed": None}
+        failed = dict(getattr(out, "failed_configs", None) or {})
         manifest = {k: row[k] for k in ("run_id", "kind", "round_id", "tag", "region", "mode", "started", "ended")}
-        manifest.update(final_config=final, baseline_config=self._baseline, configs=configs)
+        manifest.update(final_config=final, baseline_config=self._baseline, configs=configs, failed=failed)
         (d / "manifest.json").write_text(json.dumps(manifest))
         a = client.answer_set if client else self._answer
         if a is not None:
