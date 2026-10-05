@@ -18,6 +18,8 @@ behind a login. History is not shown here yet (main still records it in `status/
   climbing rate, work in flight against its allotment, origin); merges in progress; the opening's waves; the scout
   and the pick; every score over time with the best line and submissions; one block per fleet node; an event feed
   of engine decisions, setting changes and warnings.
+- **Themes**: "clean white" for light and "midnight" for dark. The page follows the system setting until the
+  Light/Dark button in the top bar is used; the choice is remembered in that browser.
 - **Settings tab**: every setting in `common/tuning.py` by group, with the value in force on main, the default and
   your value. Live settings apply on main within about a second; round settings wait for the next round. Values are
   checked before the file is written, and main checks them again; a rejected value keeps the one in force.

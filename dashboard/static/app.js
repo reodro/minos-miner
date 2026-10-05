@@ -89,6 +89,30 @@ function showTab() {
   else if (chart) setTimeout(sizeChart, 0);
 }
 window.addEventListener("hashchange", showTab);
+
+// ---- theme: the system setting until the toggle is used; the choice is remembered in this browser ----
+const darkQuery = matchMedia("(prefers-color-scheme: dark)");
+function effectiveTheme() {
+  const t = document.documentElement.dataset.theme;
+  return t === "dark" || t === "light" ? t : darkQuery.matches ? "dark" : "light";
+}
+function showThemeButton() {
+  const t = effectiveTheme(), other = t === "dark" ? "light" : "dark";
+  $("theme").textContent = other === "dark" ? "Dark" : "Light";
+  $("theme").setAttribute("aria-label", `Switch to the ${other} theme`);
+}
+function themeChanged() {
+  showThemeButton();
+  if (last) render();                           // the chart takes its colors from the theme when it is drawn
+}
+$("theme").addEventListener("click", () => {
+  const next = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("minos-theme", next); } catch (e) { /* not remembered, still switched */ }
+  themeChanged();
+});
+darkQuery.addEventListener("change", themeChanged);
+showThemeButton();
 $("logout").addEventListener("click", async () => {
   await fetch("/api/logout", {method: "POST", headers: {"X-Minos": "1"}}).catch(() => {});
   location.replace("/login");
@@ -150,8 +174,8 @@ function render() {
   renderSettingsState();
 }
 
-function kpi(label, value, note) {
-  return h("div", {class: "kpi"}, h("div", {class: "label", text: label}), h("div", {class: "value", text: value}),
+function kpi(label, value, note, cls) {
+  return h("div", {class: `kpi ${cls || ""}`}, h("div", {class: "label", text: label}), h("div", {class: "value", text: value, title: value}),
     note ? h("div", {class: "note", text: note}) : null);
 }
 
@@ -164,15 +188,15 @@ function renderKpis(L, R, S, E, X, finished) {
   const A = L.answer_set;
   $("kpis").replaceChildren(
     kpi("Time left", finished ? "done" : left != null ? dur(left) : "–",
-      E ? `search ${dur(E.elapsed_s)} of ${dur(E.schedule.length_s)}` : (R.mode || "")),
-    kpi("Best local", fix(S.best), E && E.pick ? `pick ${fix(E.pick.score)}` : S.best_config ? `config ${S.best_config.slice(0, 8)}` : ""),
-    kpi("Submitted", lastSub ? fix(lastSub[2]) : "–", lastSub ? `${subs.length} so far · ${ago(lastSub[0])}` : "nothing yet"),
-    kpi("Configs scored", int(S.scored), `${int(S.evaluated)} run · ${int(S.failed)} failed · ${int(S.zero)} scored 0`),
-    kpi("Workers busy", X ? `${int(X.running)} / ${int(X.workers)}` : "–", X ? `${int(X.queued)} queued · ${int(S.in_flight)} in flight` : ""),
-    kpi("Domains", E ? `${live} / ${E.max_domains}` : "–", E ? `${E.domains.length} so far · ${E.merges.length} merging` : ""),
-    kpi("GATK runs", int(S.gatk_runs), perRun ? `${perRun.toFixed(2)} configs per run` : ""),
+      E ? `search ${dur(E.elapsed_s)} of ${dur(E.schedule.length_s)}` : (R.mode || ""), "k-time"),
+    kpi("Best local", fix(S.best), E && E.pick ? `pick ${fix(E.pick.score)}` : S.best_config ? `config ${S.best_config.slice(0, 8)}` : "", "k-best"),
+    kpi("Submitted", lastSub ? fix(lastSub[2]) : "–", lastSub ? `${subs.length} so far · ${ago(lastSub[0])}` : "nothing yet", "k-sub"),
+    kpi("Configs scored", int(S.scored), `${int(S.evaluated)} run · ${int(S.failed)} failed · ${int(S.zero)} scored 0`, "k-configs"),
+    kpi("Workers busy", X ? int(X.running) : "–", X ? `of ${int(X.workers)} · ${int(X.queued)} queued · ${int(S.in_flight)} in flight` : "", "k-workers"),
+    kpi("Domains", E ? `${live} / ${E.max_domains}` : "–", E ? `${E.domains.length} so far · ${E.merges.length} merging` : "", "k-domains"),
+    kpi("GATK runs", int(S.gatk_runs), perRun ? `${perRun.toFixed(2)} configs per run` : "", "k-gatk"),
     kpi("Answer set", A ? `${int(A.germline)} + ${int(A.synthetic)}` : "building",
-      A ? `${A.regime || ""} · donor ${A.donor || "?"} · ${int(A.n_targets)} targets` : ""),
+      A ? `${A.regime || ""} · donor ${A.donor || "?"} · ${int(A.n_targets)} targets` : "", "k-answer"),
   );
 }
 
@@ -355,7 +379,7 @@ function renderChart(S, subs) {
   const data = chartData(S, subs);
   if (!data[0].length) { if (chart) { chart.destroy(); chart = null; } el.replaceChildren(h("div", {class: "empty", text: "No scores yet."})); return; }
   const best = Math.max(...data[2].filter((v) => v != null), ...data[1].filter((v) => v != null));
-  const theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  const theme = effectiveTheme();
   if (!chart || chartKey !== theme) {
     if (chart) chart.destroy();
     el.replaceChildren();
