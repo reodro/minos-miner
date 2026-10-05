@@ -136,10 +136,12 @@ def main():
     ap.add_argument("--redo", action="store_true")
     ap.add_argument("--no-hap", action="store_true", help="without the haplotype genotyper (models trained before g008)")
     ap.add_argument("--no-kg-rd", action="store_true", help="1000G rounds without the read comparison (models before k008)")
+    ap.add_argument("--kg-hg", action="store_true", help="1000G rounds with the haplotype genotyper too")
     args = ap.parse_args()
     from answer_set.k2 import hapgeno
     features.HAP_GENOTYPER = 0 if args.no_hap else hapgeno.VERSION
     features.KG_READDIFF = 0 if args.no_kg_rd else 1
+    features.KG_HAPGENO = hapgeno.VERSION if args.kg_hg else 0
     for tag in sorted(args.tag or os.listdir(SETTINGS.rounds_dir)):
         if not args.redo and (PREPARED / f"{tag}.npz").exists():
             continue

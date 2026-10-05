@@ -103,8 +103,12 @@ def apply_source_thr(meta, X, p_any, p_raw=None):
 RD_FEATS = ["rd_support", "rd_cover", "rd_frac", "only_rd", "rd_orig", "rd_orig_frac", "rd_sib_max", "rd_sib_ratio"]
 
 
-def features_for(track, kg_readdiff=False):
-    other = KG_ONLY if track == "giab" else [f for f in GIAB_ONLY if not (kg_readdiff and f in RD_FEATS)]
+HG_SET = [f for f in GIAB_ONLY if f.startswith("hg_") or f == "only_hg"]   # the genotyper's measurements
+
+
+def features_for(track, kg_readdiff=False, kg_hapgeno=False):
+    other = KG_ONLY if track == "giab" else [f for f in GIAB_ONLY if not (kg_readdiff and f in RD_FEATS)
+                                             and not (kg_hapgeno and f in HG_SET)]
     return [f for f in FEATURES if f not in other and f not in DROP]
 
 

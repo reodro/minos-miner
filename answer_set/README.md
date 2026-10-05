@@ -33,7 +33,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k012_20261004T1750) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k020_20261005T1359) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -138,6 +138,14 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   only the rest (the inserted mutations). If the person's GATK calls cannot be had, the model decides everything, as
   before. All 44 1000G rounds: 99.924 vs k011 98.297, +1.627 per round (better 44/44, worst round 99.700); the new
   round 2026-10-04 10:41 99.865. Left: ~4 missed + ~2 extra inserted 1-bp indels per round (~0.08 points).
+- **Minos changed its 1000G indel insertion on 2026-10-05** (from the 05:53 round on, every 1000G round since): homozygous
+  inserted indels now sit in fewer reads (33% below 80% of reads, was 6%; het median 0.45 -> 0.39), as in GIAB rounds;
+  SNPs unchanged. k012 then called many of them het: 98.4 / 99.3 / 98.8 on the first three such rounds.
+- k020 (1000G, released 2026-10-05) = k012's setup (person's part by the rule) + the haplotype genotyper on 1000G
+  rounds too (`features.KG_HAPGENO`, meta `kg_hapgeno`; against the person's public originals), trained on every
+  1000G round including the new-pattern ones (1000G data only). Leave-one-out on the 3 new-pattern rounds (each scored
+  by a model that never saw it): +0.70 / +0.38 / +0.65 over k012 (1-bp errors 23/19 -> 7/4, 16/11 -> 2/0, 25/14 ->
+  11/4). The 46 old-pattern rounds (fold models): +0.017 per round (t 2.95, better 30 / worse 15, worst -0.061).
 
 ## Open work
 

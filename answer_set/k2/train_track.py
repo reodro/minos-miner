@@ -155,7 +155,8 @@ def train(track, rs, name):
     # kg: the read comparison's measurements when every round was prepared with it (and it worked)
     kg_rd = track == "kg" and all(r["info"].get("kg_readdiff") and "error" not in (r["info"].get("readdiff") or {})
                                   for r in rs)
-    feats = tracks.features_for(track, kg_rd)
+    kg_hg = kg_rd and all(r["info"].get("kg_hapgeno") for r in rs)
+    feats = tracks.features_for(track, kg_rd, kg_hg)
     cols = [FEATURES.index(f) for f in feats]
     if track == "kg" and KG_OWN_RULE:                # the person's part of each round's truth, by the rule
         from answer_set.k2 import kg
@@ -238,6 +239,8 @@ def train(track, rs, name):
                 "thr_only_rd": thr_rd, "thr_class": thr_class, "point_alpha": POINT_ALPHA if cost else None}
         if track == "kg" and KG_OWN_RULE:
             meta["kg_own_rule"] = 1
+        if kg_hg:
+            meta["kg_hapgeno"] = min(int(r["info"]["kg_hapgeno"]) for r in rs)
         if track == "giab":
             from answer_set.k2 import features as _features
             meta["rd_1bp_factor"] = _features.RD_1BP_FACTOR
