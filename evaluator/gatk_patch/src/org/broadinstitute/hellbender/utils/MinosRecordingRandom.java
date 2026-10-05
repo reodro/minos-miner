@@ -28,6 +28,14 @@ public final class MinosRecordingRandom extends Random {
 
     public void setRecording(final boolean on) { recording = on; }
 
+    /** minos server: back to the state of a new JVM's generator (seed position, cached gaussian, nothing recorded). */
+    public synchronized void minosReset(final long seed) {
+        setSeed(seed);                       // also drops Random's cached second gaussian
+        recording = false;
+        draws = new ArrayList<>();
+        gaussians = 0;
+    }
+
     // minos repair: QD jitter is the only Random use in genotyping, and it goes through nextGaussian. Counting those
     // calls lets a repair run skip a region and still leave this generator exactly where the region would have left it
     // (replaying whole nextGaussian calls also reproduces Random's cached second gaussian).

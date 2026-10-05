@@ -392,6 +392,70 @@ class BatchingExecutorTest(unittest.TestCase):
         self.assertEqual(runner.solo, [])
         self.assertEqual(ex.stats()["queued"], 1)
 
+    def test_measured_speed_holds_a_run_the_table_says_fits_and_the_timeline_says_why(self):
+        r = ranges(); d = r.defaults("gatk").params
+        now = [0.0]
+        runner = self.BatchRunner(r)
+        plain = runner.run
+
+        def slow(round, config, fidelity):
+            now[0] += 264.0                                    # this machine: twice the 132 s table
+            return plain(round, config, fidelity)
+
+        runner.run = slow
+        ex = LocalExecutor(runner, workers=1, now=lambda: now[0])
+        ex.submit([EvalJob("a", ROUND, Config("gatk", {**d, "min_pruning": 4}))])
+        self.assertEqual(list(self.drain(ex, 1)), ["a"])
+        self.assertEqual((ex.stats()["solo_s"], ex.stats()["scale"]), (264, 2.0))
+        ex.set_finish_by(now[0] + 200.0)                       # the table (132 s) fits, this machine (264 s) does not
+        ex.submit([EvalJob("b", ROUND, Config("gatk", {**d, "min_pruning": 5}))])
+        self.assertEqual((ex.stats()["running"], ex.stats()["queued"]), (0, 1))
+        now[0] += 60.0
+        ex.poll(0)
+        last = ex.stats()["timeline"][-1]
+        self.assertEqual((last["busy"], last["idle"], last["queued"], last["held"]), (0, 1, 1, 1))
+        self.assertEqual(last["scale"], 2.0)
+
+    def test_speed_ignores_warm_and_instant_runs(self):
+        r = ranges(); d = r.defaults("gatk").params
+        ex = LocalExecutor(self.BatchRunner(r), workers=1)    # fake runs take 0.05 s: not this machine's speed
+        ex.submit([EvalJob("a", ROUND, Config("gatk", {**d, "min_pruning": 4}))])
+        self.drain(ex, 1)
+        self.assertEqual((ex.stats()["solo_s"], ex.stats()["scale"]), (132, 1.0))
+
+    def test_a_haplotype_cap_the_run_never_reached_reuses_that_run(self):
+        r = ranges(); d = r.defaults("gatk").params
+        MNH = "max_num_haplotypes_in_population"
+        runner = self.BatchRunner(r)
+        runner.kbest_needed = lambda round_id, key, fidelity: 40   # every run here needed a cap of 40
+        ex = LocalExecutor(runner, workers=1)
+        blocker = Config("gatk", {**d, "min_pruning": 7})
+        first, higher, lower = (Config("gatk", {**d, MNH: v}) for v in (128, 64, 30))
+        ex.submit([EvalJob("block", ROUND, blocker), EvalJob("first", ROUND, first), EvalJob("higher", ROUND, higher)])
+        got = self.drain(ex, 3)                                 # "higher" was queued when "first" taught the class
+        ex.submit([EvalJob("again", ROUND, Config("gatk", {**d, MNH: 50})), EvalJob("lower", ROUND, lower)])
+        got.update(self.drain(ex, 2))
+        self.assertEqual(sorted(got), ["again", "block", "first", "higher", "lower"])
+        self.assertEqual(runner.solo, [blocker.key, first.key, lower.key])   # 64 and 50 never ran: 30 < 40 did
+        self.assertEqual(got["higher"].config_key, higher.key)               # each under the config it asked for
+        self.assertEqual(got["higher"].sha256, got["first"].sha256)
+        self.assertEqual(got["again"].config_key, Config("gatk", {**d, MNH: 50}).key)
+        self.assertNotEqual(got["lower"].sha256, got["first"].sha256)
+
+    def test_configs_the_bam_cannot_tell_apart_run_once(self):
+        from evaluator.equivalence import RoundFacts
+        r = ranges(); d = r.defaults("gatk").params
+        runner = self.BatchRunner(r)
+        ex = LocalExecutor(runner, workers=1)
+        ex._facts[ROUND.round_id] = RoundFacts(frozenset({2, 14, 30, 40}), frozenset({60}), 12)
+        a, b, c = (Config("gatk", {**d, "min_base_quality_score": v}) for v in (10, 13, 14))   # 3..13 | 14
+        ex.submit([EvalJob("a", ROUND, a), EvalJob("b", ROUND, b), EvalJob("c", ROUND, c)])
+        got = self.drain(ex, 3)
+        self.assertEqual(len(runner.solo), 2)                  # 10 and 13 are one run, 14 another
+        self.assertEqual([got[j].config_key for j in "abc"], [a.key, b.key, c.key])
+        self.assertEqual(got["a"].sha256, got["b"].sha256)
+        self.assertEqual(ex.stats()["canonicalized"], 3)       # each ran as its class's representative
+
     def test_no_batching_without_run_batch(self):
         r = ranges(); runner = FakeRunner(r)
         ex = LocalExecutor(runner, workers=2)

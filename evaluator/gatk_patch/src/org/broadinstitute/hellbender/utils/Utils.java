@@ -72,6 +72,20 @@ public final class Utils {
         randomDataGenerator.reSeed(GATK_RANDOM_SEED);
     }
 
+    /**
+     * minos server: every static the patch keeps, back to a new JVM's state, so the next job in this JVM draws
+     * exactly the numbers a separate run would: both generators at the seed (nothing recorded, no counts, no cached
+     * gaussian), no generator overrides, no activity hook, no haplotype-cap report.
+     */
+    public static void minosResetAll() {
+        randomGenerator.minosReset(GATK_RANDOM_SEED);
+        randomWell.minosReset(GATK_RANDOM_SEED);
+        minosRandomOverride = null;
+        minosRandomDataOverride = null;
+        org.broadinstitute.hellbender.engine.AssemblyRegionIterator.minosHook = null;
+        MinosKBest.reset();
+    }
+
     private static final int TEXT_WARNING_WIDTH = 68;
     private static final String TEXT_WARNING_PREFIX = "* ";
     private static final String TEXT_WARNING_BORDER = StringUtils.repeat('*', TEXT_WARNING_PREFIX.length() + TEXT_WARNING_WIDTH);

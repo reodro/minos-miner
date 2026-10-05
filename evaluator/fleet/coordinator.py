@@ -227,7 +227,7 @@ class FleetExecutor:
     def _connect(self, s: _Session) -> None:
         h = s.host
         bundle = selftest.make_bundle(SETTINGS.cache_dir, SETTINGS.rounds_dir)
-        push(h, [bundle["bam"], bundle["bai"]], f"{h.repo}/cache/selftest/")
+        push(h, selftest.bundle_files(bundle), f"{h.repo}/cache/selftest/")   # slice BAM + truth: the score check
         args = h.extra.get("node_args", "") + (f" --workers {int(h.workers)}" if h.workers else "")
         shared = {"MINOS_NODE_SHARED_DATA": "1"} if h.local else {}          # main's rounds are not the node's to delete
         env = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {"DATA_DIR": h.data_dir, **shared, **h.extra.get("env", {})}.items())
@@ -262,7 +262,7 @@ class FleetExecutor:
             return
         if t == "ready":
             if not msg.get("ok"):
-                s.rejected = f"self-test failed: {msg.get('digest')} != {msg.get('expected')}"
+                s.rejected = selftest.reject_reason(msg)
             elif msg.get("code") != self.code:
                 s.rejected = f"code differs from main ({msg.get('code')} != {self.code}): run control sync"
             if s.rejected:

@@ -12,6 +12,14 @@ Verified (2026-09-28; 3 rounds x 3 configs against the validator-identical basel
            - warm JVM: the process stays up after a traversal. A later genotyping-only variant of that
              family is genotyped from the stored likelihoods. Anything else, or a JVM that ran out of
              memory, is a cold run. Bit-identical to cold runs on chr18:57771001-57871001 (229 calls).
+             Off while GATK servers are on (it holds its JVM; used once in 118 runs of a 60-min replay).
+           - GATK servers (2026-10-05): one persistent JVM per busy worker (gatk_patch MinosServer) runs job
+             after job, so only its first job pays class loading and JIT warm-up (stock GATK, full round, one
+             core: 162 s cold, 127 s / 119 s warm). Every static the patch keeps is reset before and after each
+             job. Server vs cold, same job sequence (batch with genotyping/assembly/activity variants, deep-spot
+             downsampling, contamination, dangling 20, repeats): 15/15 outputs identical on the self-test slice.
+             Every SERVER_VERIFY_EVERY-th solo server run is re-run cold; a difference turns servers off.
+             A failing server is replaced and its job runs cold. MINOS_GATK_SERVER=0 turns them off.
   rejected - GVCF re-genotyping (heterozygosity changes calls; QUAL shifts flip stand_call_conf thresholds in ~13%
              of cases), QUAL projection (1e-4..1e-3 off), native java outside the image (different calls and slower:
              GKL PairHMM missing), interval restriction (~2%), scatter-gather (x0.49 throughput).
@@ -26,11 +34,12 @@ import logging
 import os
 import subprocess
 import sys
+import atexit
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from common.scoring import finalize
 from common.settings import SETTINGS
@@ -90,6 +99,10 @@ def variant_line(config: Config, output: str) -> str:
 DIVERGED = "minos:diverged"      # batch variant whose own run would differ; the executor re-runs it alone
 DEFAULT_PATCH_JAR = os.path.join(os.path.dirname(__file__), "gatk_patch", "build", "minos-patch.jar")
 MAX_WARM = 2                     # JVMs kept after a run so a later genotyping variant can reuse it
+MAX_SERVER_JOBS = 200            # a GATK server (MinosServer) is replaced after this many jobs
+SERVER_IDLE_S = 600              # ... and leaves by itself after this long without a job
+SERVER_VERIFY_EVERY = int(os.environ.get("MINOS_SERVER_VERIFY", "40"))   # every Nth solo server run is re-run cold
+SERVER_MOUNTS = ("/srv/data", "/srv/cache", "/srv/work")                   # data_dir, cache_dir, the runner's work_dir
 
 SAFE_ANNOTATION_EXCLUSIONS = (
     "Coverage", "DepthPerSampleHC", "ChromosomeCounts", "BaseQualityRankSumTest", "ExcessHet", "FisherStrand",
@@ -241,6 +254,68 @@ class _WarmSession:
         self.log_file.close()
 
 
+class _GatkServer:
+    """One persistent patched GATK JVM (gatk_patch MinosServer) running this runner's jobs one after another: every
+    job after its first starts with loaded classes and compiled code. Jobs go in as <dir>/job-NNNNN.tsv."""
+
+    def __init__(self, proc, log_file, directory: Path, name: str, timeout_s: int):
+        self.proc, self.log_file, self.dir, self.name, self.timeout_s = proc, log_file, directory, name, timeout_s
+        self.n = 0
+        self.tag: Optional[str] = None               # round tag of the job it is running
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None and not (self.dir / "exit").exists() and self.n < MAX_SERVER_JOBS
+
+    def submit(self, props: dict, args: list) -> Tuple[str, str]:
+        """("ok", seconds), ("error", message), ("dead", why) or ("timeout", "")."""
+        self.n += 1
+        name = f"job-{self.n:05d}"
+        tmp = self.dir / (name + ".tmp")
+        tmp.write_text("\t".join(f"{k}={v}" for k, v in props.items()) + "\n" + "\n".join(args) + "\n")
+        os.replace(tmp, self.dir / (name + ".tsv"))
+        done = self.dir / (name + ".done")
+        deadline = time.time() + self.timeout_s
+        while time.time() < deadline:
+            if done.exists():
+                state, _, rest = done.read_text().strip().partition(" ")
+                return state, rest
+            if self.proc.poll() is not None:
+                return "dead", "server exited"
+            time.sleep(0.05)
+        return "timeout", ""
+
+    def stop(self, runtime: str) -> None:
+        with _LIVE_LOCK:
+            _LIVE_SERVERS.discard((self, runtime))
+        (self.dir / "stop").write_text("1\n")
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            killer = getattr(self.proc, "minos_kill", None)
+            if killer:
+                killer()
+            elif runtime == "docker":
+                subprocess.run(["docker", "kill", self.name], capture_output=True)
+            self.proc.kill()
+        if runtime != "docker":
+            from evaluator.sandbox import release
+            release(self.proc)
+        self.log_file.close()
+
+
+_LIVE_SERVERS: set = set()          # (server, runtime) of every running server, whatever became of its runner
+_LIVE_LOCK = threading.Lock()
+
+
+@atexit.register
+def _stop_all_servers() -> None:
+    """Stop every server this process started - also those of a runner already gone (main.review's executor)."""
+    with _LIVE_LOCK:
+        live = list(_LIVE_SERVERS)
+    for srv, runtime in live:
+        srv.stop(runtime)
+
+
 class GatkRunner:
     """The validator's HaplotypeCaller command (minos_subnet/templates/gatk.py) plus the verified speed-ups."""
 
@@ -259,6 +334,14 @@ class GatkRunner:
         self._warm_reserved = 0
         self._live: Dict[str, tuple] = {}            # container name -> (round_id, config keys it computes)
         self._live_lock = threading.Lock()
+        self._kbest: Dict[tuple, int] = {}           # (round, config key, fidelity) -> cap that reproduces its run
+        # GATK servers (persistent JVMs, gatk_patch MinosServer): on unless MINOS_GATK_SERVER=0 or without the patch.
+        self.server = self.patch_jar is not None and os.environ.get("MINOS_GATK_SERVER", "1") != "0"
+        self._server_lock = threading.Lock()
+        self._servers_idle: List[_GatkServer] = []
+        self._servers_busy: List[_GatkServer] = []
+        self._server_jobs = 0
+        self.server_stats = {"jobs": 0, "fallbacks": 0, "verified": 0, "started": 0}
 
     def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path, jvm_props: Optional[dict] = None) -> list:
         from templates.tool_params import validate_and_build_flags   # upstream
@@ -294,6 +377,10 @@ class GatkRunner:
             for key in [k for k in self._warm if k[0] == round_id]:
                 self._warm.pop(key).stop()
         tag = Round.tag_of(round_id)
+        with self._server_lock:
+            doomed = [srv for srv in self._servers_busy if srv.tag == tag]
+        for srv in doomed:                           # its job's result is unwanted: the server goes, a new one starts later
+            srv.stop(self.runtime)
         if self.runtime != "docker":
             from evaluator.sandbox import kill_prefix
             return kill_prefix(f"{self.container_prefix}-{tag}-")
@@ -314,7 +401,7 @@ class GatkRunner:
         return len(names)
 
     def _docker(self, cmd: list, warm_dir: Optional[Path] = None, warm_main: Optional[tuple] = None,
-                owner: Optional[tuple] = None, reserved: bool = True) -> subprocess.CompletedProcess:
+                owner: Optional[tuple] = None, reserved: bool = True, cold: bool = False) -> subprocess.CompletedProcess:
         """Run a GATK container; on timeout also kill the container (killing the docker client leaves it running).
         `owner` = (round_id, config keys): while it runs, kill_configs can find it.
 
@@ -324,6 +411,10 @@ class GatkRunner:
         `reserved`: warm_dir holds one of the MAX_WARM slots, given back here.
         """
         name = cmd[cmd.index("--name") + 1]
+        if warm_dir is None and self.server and not cold:
+            done = self._run_on_server(cmd)
+            if done is not None:
+                return done
         if owner is not None:
             with self._live_lock:
                 self._live[name] = owner
@@ -415,7 +506,7 @@ class GatkRunner:
 
     def _reserve_warm(self, parent: Path, config: Config, fidelity: str) -> Optional[Path]:
         """A directory for a warm session, or None when this run should exit as usual."""
-        if self.patch_jar is None or self.branch_key(config, fidelity) is None:
+        if self.patch_jar is None or self.branch_key(config, fidelity) is None or self.server:
             return None
         with self._warm_lock:
             alive = sum(1 for s in self._warm.values() if s.proc.poll() is None)
@@ -437,7 +528,9 @@ class GatkRunner:
             raise ValueError(f"GatkRunner cannot run {config.tool!r}")
         out = self._out(round, config, fidelity)
         warm_dir = self._reserve_warm(out.parent, config, fidelity)
-        props = {"minos.warm.dir": f"/data/output/{warm_dir.name}"} if warm_dir else None
+        props = {"minos.warm.dir": f"/data/output/{warm_dir.name}"} if warm_dir else {}
+        if self.patch_jar is not None:
+            props["minos.kbest.out"] = f"/data/output/{out.name}.minos.kbest"
         t0 = time.time()
         try:
             p = self._docker(self.command(round, config, fidelity, out, jvm_props=props),
@@ -449,8 +542,10 @@ class GatkRunner:
         dt = time.time() - t0
         if p.returncode != 0 or not out.exists():
             keep_stderr(out, p)
+            Path(str(out) + ".minos.kbest").unlink(missing_ok=True)
             return CallSet(round.round_id, config.key, "", "", dt, ok=False,
                            error=f"rc={p.returncode} {gatk_error(p.stderr)}", fidelity=fidelity)
+        self._adopt_kbest(round.round_id, config, fidelity, out)
         return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
 
     # ---- batching: configs differing only in branchable parameters (BRANCH_PARAMS) share one run (needs patch_jar) ----
@@ -498,7 +593,7 @@ class GatkRunner:
         if warm_dir is None and warm:
             warm_dir = main.parent / f"warm_{uuid.uuid4().hex[:10]}"
             warm_dir.mkdir(parents=True)
-        props = {"minos.gt.variants": f"/data/output/{spec.name}"}
+        props = {"minos.gt.variants": f"/data/output/{spec.name}", "minos.kbest.out": f"/data/output/{main.name}.minos.kbest"}
         if warm_dir is not None:
             props["minos.warm.dir"] = f"/data/output/{warm_dir.name}"
         t0 = time.time()
@@ -517,6 +612,7 @@ class GatkRunner:
             keep_stderr(main, p)
             err = f"rc={p.returncode} {gatk_error(p.stderr)}"
             return [CallSet(round.round_id, c.key, "", "", dt, ok=False, error=err, fidelity=fidelity) for c in configs]
+        self._adopt_kbest(round.round_id, configs[0], fidelity, main)
         out = [CallSet(round.round_id, configs[0].key, str(main), records_digest(main), dt, fidelity=fidelity)]
         for c, o in zip(configs[1:], outs):
             out.append(self._adopt_variant(round.round_id, c, o, dt, fidelity))
@@ -533,7 +629,9 @@ class GatkRunner:
         state = status.read_text().strip() if status.exists() else "missing"
         status.unlink(missing_ok=True)
         if state == "exact" and out.exists():
+            self._adopt_kbest(round_id, config, fidelity, out)
             return CallSet(round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
+        Path(str(out) + ".minos.kbest").unlink(missing_ok=True)
         if state == "diverged" and out.exists() and Path(str(out) + ".minos.regions").exists():
             kept = out.with_name(out.name.replace(".vcf.gz", ".batch.vcf.gz"))
             out.rename(kept)
@@ -543,6 +641,220 @@ class GatkRunner:
         out.unlink(missing_ok=True)
         return CallSet(round_id, config.key, "", "", dt, ok=False,
                        error=DIVERGED if state == "diverged" else f"variant status {state}", fidelity=fidelity)
+
+    # ---- GATK servers --------------------------------------------------------------------------------------------
+    def _server_mounts(self) -> List[Tuple[Path, str]]:
+        hosts = (Path(SETTINGS.data_dir), Path(SETTINGS.cache_dir), self.work_dir)
+        return [(h.resolve(), c) for h, c in zip(hosts, SERVER_MOUNTS)]
+
+    def _server_job(self, cmd: list) -> Optional[Tuple[dict, list, Path]]:
+        """The cold command `cmd` as a server job: (properties, GATK arguments, host output VCF), every path moved into
+        the server's mounts. None when a path is outside them (that run stays cold)."""
+        to_host = {}
+        for i, a in enumerate(cmd):
+            if a == "-v" and i + 1 < len(cmd):
+                host, cont = cmd[i + 1].split(":")[:2]
+                to_host[cont.rstrip("/") + "/"] = Path(host)
+        mounts = self._server_mounts()
+
+        def move(token: str) -> Optional[str]:
+            for cont, host in to_host.items():
+                if token.startswith(cont):
+                    real = (host / token[len(cont):]).resolve()
+                    for h, c in mounts:
+                        if real == h or h in real.parents:
+                            return c + "/" + str(real.relative_to(h)) if real != h else c
+                    return None
+            return token
+
+        try:
+            main = cmd.index("org.broadinstitute.hellbender.Main")
+            java = cmd.index("java")
+        except ValueError:
+            return None
+        props = {}
+        for a in cmd[java + 1:main]:
+            if a.startswith("-D") and a not in WRAPPER_JVM:
+                k, _, v = a[2:].partition("=")
+                moved = move(v)
+                if moved is None:
+                    return None
+                if k == "minos.gt.variants":             # its lines name output files: move those too
+                    spec = next(h / v[len(c):] for c, h in to_host.items() if v.startswith(c))
+                    lines = []
+                    for line in spec.read_text().splitlines():
+                        first, sep, rest = line.partition("\t")
+                        target = move(first)
+                        if target is None:
+                            return None
+                        lines.append(target + sep + rest)
+                    served = spec.with_name(spec.name.replace(".tsv", ".srv.tsv"))
+                    served.write_text("".join(x + "\n" for x in lines))
+                    moved = move(v.replace(".tsv", ".srv.tsv"))
+                props[k] = moved
+        args = [move(a) for a in cmd[main + 1:]]
+        if any(a is None for a in args) or "-O" not in cmd:
+            return None
+        out = cmd[cmd.index("-O") + 1]
+        out_host = next((h / out[len(c):] for c, h in to_host.items() if out.startswith(c)), None)
+        return (props, args, out_host) if out_host is not None else None
+
+    def _start_server(self) -> Optional[_GatkServer]:
+        mounts = self._server_mounts()
+        directory = self.work_dir / "servers" / uuid.uuid4().hex[:10]
+        directory.mkdir(parents=True)
+        name = f"{self.container_prefix}-srv-{directory.name}"
+        heap = f"-Xmx{max(512, int(self.memory_gb * 1024 * 0.8))}m"
+        cmd = ["docker", "run", "--rm", "--name", name, f"--cpus={self.threads}", f"--memory={self.memory_gb}g",
+               "--network", "none"]
+        for i, (h, c) in enumerate(mounts):
+            cmd += ["-v", f"{h}:{c}" + (":ro" if i == 0 else "")]
+        cmd += ["-v", f"{self.patch_jar.parent}:/patch:ro", GATK_IMAGE, "java", *WRAPPER_JVM, heap,
+                "-cp", f"/patch/{self.patch_jar.name}:{GATK_JAR_IN_IMAGE}", "org.broadinstitute.hellbender.MinosServer",
+                f"{SERVER_MOUNTS[2]}/servers/{directory.name}", str(MAX_SERVER_JOBS), str(SERVER_IDLE_S)]
+        log_file = open(directory / "jvm.log", "w")
+        try:
+            if self.runtime == "docker":
+                proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            else:
+                from evaluator.sandbox import start as sandbox_start
+                proc = sandbox_start(cmd, stdout=log_file)
+        except Exception as e:  # noqa: BLE001 - no server: cold runs
+            log_file.close()
+            log.warning("GATK server did not start: %s", e)
+            return None
+        deadline = time.time() + 120
+        while time.time() < deadline and proc.poll() is None and not (directory / "ready").exists():
+            time.sleep(0.05)
+        srv = _GatkServer(proc, log_file, directory, name, self.timeout_s)
+        if not (directory / "ready").exists():
+            srv.stop(self.runtime)
+            log.warning("GATK server not ready (%s): cold runs", directory / "jvm.log")
+            return None
+        with self._server_lock:
+            self.server_stats["started"] += 1
+        with _LIVE_LOCK:
+            _LIVE_SERVERS.add((srv, self.runtime))
+        return srv
+
+    def _run_on_server(self, cmd: list) -> Optional[subprocess.CompletedProcess]:
+        """Run `cmd` on an idle GATK server (starting one if none is idle). None: run it cold instead - outside the
+        mounts, no server, or anything going wrong on the server (which is then replaced)."""
+        job = self._server_job(cmd)
+        if job is None:
+            return None
+        props, args, out = job
+        with self._server_lock:
+            if not self.server:
+                return None
+            srv = None
+            while self._servers_idle and srv is None:
+                cand = self._servers_idle.pop()
+                if cand.alive():
+                    srv = cand
+                else:
+                    threading.Thread(target=cand.stop, args=(self.runtime,), daemon=True).start()
+        if srv is None:
+            srv = self._start_server()
+            if srv is None:
+                return None
+        name = cmd[cmd.index("--name") + 1]
+        srv.tag = name[len(self.container_prefix) + 1:].rsplit("-", 1)[0]
+        with self._server_lock:
+            self._servers_busy.append(srv)
+        try:
+            state, detail = srv.submit(props, args)
+        finally:
+            spec = props.get("minos.gt.variants")
+            if spec:
+                (out.parent / Path(spec).name).unlink(missing_ok=True)
+        with self._server_lock:
+            self._servers_busy.remove(srv)
+            srv.tag = None
+            keep = state == "ok" and srv.alive()
+            if keep:
+                self._servers_idle.append(srv)
+            self.server_stats["jobs"] += 1
+        if not keep:
+            srv.stop(self.runtime)
+        if state == "timeout":
+            return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {self.timeout_s}s")
+        if state != "ok":                            # never trust a failing server: the job runs cold
+            with self._server_lock:
+                self.server_stats["fallbacks"] += 1
+            log.warning("GATK server %s: %s %s - running cold", srv.dir.name, state, detail[:200])
+            return None
+        if "minos.gt.variants" not in props and "minos.repair.log" not in props:
+            with self._server_lock:
+                self._server_jobs += 1
+                verify = SERVER_VERIFY_EVERY > 0 and self._server_jobs % SERVER_VERIFY_EVERY == 0
+            if verify:
+                return self._verify_cold(cmd, out)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def _verify_cold(self, cmd: list, out: Path) -> subprocess.CompletedProcess:
+        """Run a solo job cold as well and compare its records with the server's. A difference turns servers off for
+        this runner (logged as an error); the cold output is the one kept either way."""
+        served = out.with_name(out.name.replace(".vcf.gz", ".served.vcf.gz"))
+        try:
+            os.replace(out, served)
+        except OSError:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        Path(str(out) + ".tbi").unlink(missing_ok=True)
+        p = self._docker(cmd, cold=True)
+        if p.returncode == 0 and out.exists():
+            same = records_digest(out) == records_digest(served)
+            with self._server_lock:
+                self.server_stats["verified"] += 1
+            if not same:
+                log.error("GATK server output differs from a cold run (%s): servers off", out.name)
+                self.stop_servers()
+        served.unlink(missing_ok=True)
+        return p
+
+    def stop_servers(self) -> None:
+        with self._server_lock:
+            self.server = False
+            servers, self._servers_idle = self._servers_idle + self._servers_busy, []
+        for srv in servers:
+            srv.stop(self.runtime)
+
+    def _adopt_kbest(self, round_id: str, config: Config, fidelity: str, out: Path) -> None:
+        """Read the patch's max-num-haplotypes report for an exact output ("needed <n>", "stopped", "unknown")."""
+        f = Path(str(out) + ".minos.kbest")
+        try:
+            words = f.read_text().split()
+        except OSError:
+            return
+        finally:
+            f.unlink(missing_ok=True)
+        if len(words) == 2 and words[0] == "needed" and words[1].isdigit():
+            with self._warm_lock:
+                self._kbest[(round_id, config.key, fidelity)] = int(words[1])
+
+    def kbest_needed(self, round_id: str, config_key: str, fidelity: str = FULL) -> Optional[int]:
+        """The smallest max_num_haplotypes_in_population that reproduces this finished run exactly (no k-best
+        search of it was stopped by its cap), or None when unknown (stopped, a repair, no patch, not run here)."""
+        with self._warm_lock:
+            return self._kbest.get((round_id, config_key, fidelity))
+
+    def forget_kbest(self, round_id: str) -> None:
+        with self._warm_lock:
+            for k in [k for k in self._kbest if k[0] == round_id]:
+                del self._kbest[k]
+
+    def warm_report(self) -> list:
+        """Live JVMs that can genotype one more variant of a family they already walked.
+
+        Each entry is the round, the branch key, and the config that JVM walked, so main can send only a
+        genotyping variant into the time a cold walk would not finish.
+        """
+        out = []
+        with self._warm_lock:
+            for (round_id, branch), session in self._warm.items():
+                if session.proc.poll() is None:
+                    out.append({"round_id": round_id, "branch": branch, "config": session.config.to_dict()})
+        return out
 
     def warm_ready(self, round: Round, config: Config, fidelity: str = FULL) -> bool:
         """True when a live JVM has this family's likelihoods and config only changes genotyping."""

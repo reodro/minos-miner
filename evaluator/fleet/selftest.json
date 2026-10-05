@@ -30,5 +30,7 @@
   "dont_use_soft_clipped_bases": false
  },
  "expected_sha256": "96e1906d8702194b6c2feaa56e5b58771d8199fe05b40900e46486523de8ead9",
- "note": "stock config on a 300 kb slice (+5 kb margin of reads) of a stored round; a node must reproduce expected_sha256 (records_digest of its VCF) exactly or it must not evaluate configs"
+ "expected_score": 91.96034579181452,
+ "n_targets": 653,
+ "note": "stock config on a 300 kb slice (+5 kb margin of reads) of a stored round; a node must reproduce expected_sha256 (records_digest of its VCF) and expected_score (HappyScorer, n_targets = records in mutations.vcf.gz) or it must not evaluate configs"
 }
