@@ -7,7 +7,7 @@ evaluation (on a stepped landscape the model cannot resolve the 0.005-0.05 diffe
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -38,6 +38,19 @@ class Ranker:
     @property
     def ready(self) -> bool:
         return self._models is not None
+
+    @property
+    def fitted_on(self) -> int:
+        return self._fitted_on
+
+    def importance(self) -> Optional[Dict[str, float]]:
+        """Each setting's importance to the predicted score (the two forests' mean impurity importance), or None
+        before the first fit."""
+        if self._models is None:
+            return None
+        core, fp = self._models
+        imp = (np.asarray(core.feature_importances_) + np.asarray(fp.feature_importances_)) / 2
+        return dict(zip(self.space.names, (float(x) for x in imp)))
 
     def stale(self, every: int = 100) -> bool:
         return len(self._x) >= self.min_points and len(self._x) - self._fitted_on >= every

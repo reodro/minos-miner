@@ -122,24 +122,69 @@ class ClimberTest(unittest.TestCase):
         self.assertIn(("reapply", {"assembly_region_padding": small.config.params["assembly_region_padding"]}), d.queued)
         self.assertGreater(d.progress(2.0), 0)
 
-    def test_coarse_then_fine_then_perturbation_then_exhausted(self):
+    def test_coarse_then_wide_then_fine_then_perturbation_that_never_gives_up(self):
         space, d, live = self.make()
         rng = random.Random(0)
         moves = d.refill(live, rng, 500)
         self.drain(d, moves, lambda m: 87.0)                                    # nothing wins anywhere
         moves = d.refill(live, rng, 500)
+        self.assertEqual({m.kind for m in moves}, {"wide"})                    # the all-pairs round first
+        self.assertTrue(all(len(m.axes) == 2 for m in moves))
+        self.drain(d, moves, lambda m: 87.0)
+        moves = d.refill(live, rng, 500)
         self.assertEqual(d.mode, "fine")
         self.assertIn("n3", {m.kind for m in moves})
-        seen_perturb = False
-        for _ in range(60):
+        seen = set()
+        for _ in range(80):
             self.drain(d, moves, lambda m: 87.0)
             moves = d.refill(live, rng, 500)
-            seen_perturb = seen_perturb or d.state == "perturb"
-            if d.state == "exhausted":
-                break
-        self.assertTrue(seen_perturb)
-        self.assertEqual(d.state, "exhausted")
+            seen.add(d.state)
+        self.assertIn("perturb", seen)
+        self.assertNotIn("exhausted", seen)                                     # ParamILS never gives up
+        self.assertGreater(d.rounds, 0)
+        self.assertTrue(moves)
         self.assertEqual(d.best, 88.0)
+
+    def test_an_exact_tie_is_not_a_move(self):
+        space, d, live = self.make()
+        rng = random.Random(0)
+        moves = d.refill(live, rng, 500)
+        centre = d.centre.key
+        self.drain(d, moves, lambda m: 88.0)                                    # identical calls everywhere
+        self.assertEqual(d.centre.key, centre)
+        self.assertEqual({m.kind for m in d.refill(live, rng, 500)}, {"wide"})
+
+    def test_a_new_domain_scans_every_setting_over_its_range(self):
+        space, book, names = setup()
+        geno = [a for a in GENOTYPING_PARAMS if a in space.names]
+        live = book.live(0.0) + geno
+        d = Climber(0, space, book, space._assemble({}), 88.0, 0.0, extra_axes=geno, scan=True)
+        moves = d.refill(live, random.Random(0), 2000)
+        self.assertEqual({m.kind for m in moves}, {"scan"})
+        per_axis = {}
+        for m in moves:
+            per_axis[m.axes[0]] = per_axis.get(m.axes[0], 0) + 1
+        self.assertGreater(len(per_axis), 10)
+        self.assertLessEqual(max(per_axis.values()), 9)
+        self.assertTrue(any("full-range scan" in e for e in d.events))
+
+    def test_chains_fill_the_room_and_a_better_chain_result_moves_the_centre(self):
+        space, d, live = self.make()
+        rng = random.Random(0)
+        sweep = d.refill(live, rng, 50)
+        for m in sweep:
+            d.take()                                                            # the sweep is out, nothing back
+        chains = d.refill(live, rng, 200)                                       # the main line waits: chains start
+        self.assertTrue(chains and all(m.kind == "chain" for m in chains))
+        self.assertEqual(len(d.chains), len(chains))
+        m = d.take()
+        d.consider(m, True, m.config, 87.9, False, 1.0)                         # the shaken point is back
+        local = [x for x in d.pool if x.kind == "chainl" and x.chain == m.chain]
+        self.assertTrue(local)
+        x = local[0]
+        d.pool.remove(x); d.inflight += 1
+        self.assertTrue(d.consider(x, True, x.config, 88.0 + 2 * ACCEPT_MIN, False, 2.0))   # beats the domain
+        self.assertEqual(d.centre.key, x.config.key)
 
     def test_perturbation_accepts_better_or_equal(self):
         space, d, live = self.make()
@@ -209,7 +254,7 @@ class EngineRoundTest(unittest.TestCase):
         with self.assertLogs("search.engine", level="INFO") as logs:
             out, ex = virtual_round(950, minutes=30, duration=heavy)
         founding = [l for l in logs.output if "founding at" in l][0]
-        self.assertLessEqual(float(founding.split("t+")[1].split("m")[0]), 8.4)  # 14 min scaled to 30 + one run (virtual time)
+        self.assertLessEqual(float(founding.split("t+")[1].split("m")[0]), 8.8)  # 15 min scaled to 30 + one run (virtual time)
         self.assertGreater(ex.utilization(), 0.85)
 
     def test_crashes_are_counted_and_not_fatal(self):

@@ -41,37 +41,38 @@ search. `emit_ref_confidence` is `NONE` because GVCF / BP_RESOLUTION output is r
 too. `adaptive_pruning_initial_error_rate` and `pruning_lod_threshold` stay at the GATK defaults because
 HaplotypeCaller does not read them unless `--adaptive-pruning` is on, and that switch is not a search parameter.
 
-## The engine (v4)
+## The engine (v4.1)
 
 | module | what it does |
 |---|---|
-| `hills.py` | the one rule for which hill a config is on (4+ settings more than 10% of range apart = another hill); ownership, adoption, the scout's exclusion zone, merging and founding all ask it |
+| `hills.py` | the one rule for which hill a config is on (4+ settings more than 10% of range apart = another hill; once the ranker is fitted, only the settings it finds important count); ownership, adoption, the scout's exclusion zone, merging and founding all ask it |
 | `genetic.py` | recombination: niched genetic generations, and the merge operator - every combination of the settings where two centres differ (when 8 or fewer, else 256 random ones) plus mutated children |
-| `climber.py` | a domain's climb, iterated local search (ParamILS): coarse then fine sweeps, best of each sweep with the other winners re-applied, sideways moves on plateaus, the perturb-and-climb loop (shake 2/3/5/8 settings, a local round, keep better OR equal); it reports facts and never decides its own lifecycle |
-| `engine.py` | the opening and the controller: everything about domains is decided in one pass from facts |
+| `climber.py` | a domain's climb, iterated local search (ParamILS): a full-range scan of every setting first, coarse sweeps, a wide all-pairs round when a coarse sweep finds nothing, fine sweeps, best of each sweep with the other winners re-applied, the perturb-and-climb loop (shake 2/3/5/8 settings, a local round, keep better OR equal) round after round, and parallel ParamILS chains on the workers the main line leaves idle; it reports facts and notes and never decides its own lifecycle |
+| `engine.py` | the opening and the controller: everything about domains and finds is decided in one pass from facts |
 | `axes.py` | per-setting steps, learned cliffs, parked settings, the distance between configs, the Latin hypercube |
 | `families.py` | genotyping riders for global points |
 | `portfolio.py` | the opening's seeds: the legacy pipeline's portfolio (`portfolio/legacy.json`, 749 configs from 79 rounds) and what our reviewed runs add (`$DATA_DIR/portfolio/ours.jsonl`), the round's read-length profile first, spaced apart, up to `opening.portfolio_share` of wave 0 |
-| `ranker.py` | the (core, FP) forest the scout ranks candidates with |
+| `ranker.py` | the (core, FP) forests the scout ranks candidates with; their importances drive the hill rule |
 | `space.py` | the round's search space: published ranges, pinned settings, floors, BAM caps |
 | `client.py`, `base.py` | the EvalClient the search talks to; a random baseline strategy for tests |
 
-The round (times for a 72-minute search; they scale with the round's length):
+The round (times for a 72-minute search, from its start; they scale with the round's length):
 
 | minutes | stage |
 |---|---|
-| 0-12 | wave 0 (the defaults, the official seed, up to 40% portfolio seeds, the rest a Latin hypercube over every setting; 4 threshold riders) while the answer set is built, then 3 genetic generations, each launched once 60% of the previous is back or workers idle; stops early when a generation gains < 0.05; hard limit 14 |
-| 12 | founding: one domain per hill (registry), up to 6 |
-| 12-62 | ParamILS in every domain; winning settings shared between domains every 5 min; the scout keeps 15% of the workers (hypercube points, crossovers between hills, model upper confidence bound); a scout find founds a domain only after a midpoint run shows a valley (until minute 34) |
-| any time | merge on evidence: two domains on one hill, or a frozen domain on a live one's hill |
+| 0-15 | wave 0 (the defaults, the official seed, up to 40% portfolio seeds, the rest a Latin hypercube over every setting; 4 threshold riders) while the answer set is built, then 3 genetic generations, each launched once 60% of the previous is back or workers idle; stops early when a generation gains < 0.05; hard limit 15 |
+| ~15 | founding: one domain per hill (registry), up to 6; each scans every setting over its range first |
+| 15-62 | ParamILS in every domain with parallel chains on idle workers; winning settings shared between domains every 5 min; the scout keeps 15% of the workers until minute 34 and 5% after |
+| any time | finds: an off-hill config at least as good as the weakest domain - a valley test may found a domain (a free slot, or fewer than 4 domains before minute 34 / 2 before minute 50), may replace the weakest domain when it is 0.05 better and every slot is full; anything else close to the nearest domain is merged into it |
+| any time | merge on evidence: two domains on one hill |
 | 34-40 | scheduled merges, closest pairs first: at most 3 domains from minute 40 |
-| 56-62 | a three-way merge: one domain |
-| 62-72 | the final on one point (halving single steps, all pairs, a last pairing with the runner-up), then the plateau-centre pick: among configs within 0.05 of the best, the one whose neighbours score highest |
+| 50-62 | a three-way merge: one domain |
+| 62-72 | the final on one point (halving single steps, all pairs, a last pairing with the runner-up, chains with small shakes, the scout's share scoring the neighbours of the pick candidates), then the plateau-centre pick: among configs within 0.05 of the best, the one whose neighbours score highest |
 
 Every merge evaluates its children in parallel (small batches: one config per worker, only cheap siblings riding) and
 takes the best of parents and children as the new centre, which inherits both parents' tested configs and steps.
-Riders: 4 on wave 0, 2 on generations and scout points; a climbing move carries 2 siblings (one genotyping, one
-PairHMM step); merges and the final carry none.
+Riders: 4 on wave 0, 2 on generations and scout points; a climbing move or chain move carries 2 siblings (one
+genotyping, one PairHMM step); merges carry none.
 
 ## Engine versions
 

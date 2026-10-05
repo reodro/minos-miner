@@ -228,8 +228,35 @@ function segments(E) {
   ].filter((g) => g[3] - g[2] > 1);
 }
 
+function roundAxis(E) {
+  // the round's time axis, shared by the schedule bar and the domain tree: from the round's start to its deadline.
+  // The engine's times are seconds from its own start (`off` into the round); the search stops `margin` before
+  // the deadline, which leaves main the time to submit.
+  const R = (last && last.round) || {};
+  const vals = (last && last.settings && last.settings.values) || {};
+  const margin = vals["main.stop_before_deadline_s"] != null ? vals["main.stop_before_deadline_s"] : 60;
+  const off = E && R.started_ts && E.started_ts ? Math.max(0, E.started_ts - R.started_ts) : 0;
+  const total = R.started_ts && R.deadline_ts ? R.deadline_ts - R.started_ts : (E ? off + E.schedule.length_s + margin : 72 * 60);
+  const searchEnd = E ? Math.min(total, off + E.schedule.length_s) : total - margin;
+  return {total, off, searchEnd, start: R.started_ts};
+}
+
+function renderAnswerLane(ax, finished) {
+  const lane = $("answer-lane");
+  const A = last && last.answer_set;
+  if (!ax.start) { lane.replaceChildren(); return; }
+  if (A && !A.ready_ts) { lane.replaceChildren(); return; }               // a status file from before main recorded it
+  const ready = A && A.ready_ts ? A.ready_ts - ax.start : null;
+  const end = ready != null ? ready : Math.max(5, now() - ax.start);
+  const pct = (t) => `${(100 * Math.max(0, Math.min(ax.total, t))) / ax.total}%`;
+  const label = ready != null ? `answer set ${Math.round(ready)} s` : "answer set…";
+  lane.replaceChildren(h("div", {class: "seg", style: {left: "0", width: pct(end)}, title: label, text: label}));
+}
+
 function renderSchedule(E, finished) {
   const box = $("schedule"), ticks = $("schedule-ticks");
+  const ax = roundAxis(E);
+  renderAnswerLane(ax, finished);
   if (!E) {
     const R = (last && last.round) || {};
     const what = R.mode === "building answer set" ? "building the answer set, then the opening" : "waiting for the fleet to settle, then the opening";
@@ -238,18 +265,24 @@ function renderSchedule(E, finished) {
     $("schedule-sub").textContent = "";
     return;
   }
-  const L = E.schedule.length_s;
+  const L = ax.total, o = ax.off;
   const x = (t) => `${(100 * Math.max(0, Math.min(L, t))) / L}%`;
-  const segs = segments(E);
-  const els = segs.map(([cls, label, a, b]) => h("div", {class: `seg ${cls}`, style: {left: x(a), width: `${(100 * (b - a)) / L}%`}, title: `${label}: ${mins(a)} to ${mins(b)}`}, label));
-  const t = finished ? L : E.elapsed_s;
+  const segs = segments(E).map(([cls, label, a, b]) => [cls, label, a + o, b + o]);
+  segs.push(["submit", "submit", ax.searchEnd, L]);
+  const els = segs.filter((g) => g[3] > g[2]).map(([cls, label, a, b]) => h("div", {class: `seg ${cls}`,
+    style: {left: x(a), width: `${(100 * (b - a)) / L}%`}, title: `${label}: ${mins(a)} to ${mins(b)}`}, label));
+  const t = finished ? L : E.elapsed_s + o;
   els.push(h("div", {class: "done", style: {width: x(t)}}));
-  els.push(h("div", {class: "pick", style: {left: x(E.schedule.pick_s)}, title: "plateau-centre pick"}));
+  els.push(h("div", {class: "pick", style: {left: x(E.schedule.pick_s + o)}, title: "plateau-centre pick"}));
   if (!finished) els.push(h("div", {class: "now", style: {left: x(t)}, title: `now: ${mins(t)}`}));
   box.replaceChildren(...els);
-  const marks = [0, ...new Set(segs.map((g) => Math.round(g[3] / 60)))];
+  const all = [...new Set([0, ...segs.map((g) => Math.round(g[3] / 60))])].sort((a, b) => a - b);
+  const marks = [];
+  for (const m of all) {                                    // labels closer than 2 minutes: keep the later one
+    if (marks.length && m - marks[marks.length - 1] < 2) marks[marks.length - 1] = m; else marks.push(m);
+  }
   ticks.replaceChildren(...marks.map((m) => h("span", {style: {left: x(m * 60)}, text: `${m}`})));
-  $("schedule-sub").textContent = `minutes; times scaled ×${E.schedule.scale.toFixed(2)} to this round`;
+  $("schedule-sub").textContent = `minutes from the round's start; the search's stages scaled ×${E.schedule.scale.toFixed(2)} to this round`;
 }
 
 function rowClass(d) {
@@ -269,8 +302,8 @@ function renderLineage(E) {
   const W = Math.max(520, box.clientWidth || 640), top = 22, rh = 22;
   const left = parseFloat(css("--axis-l")) || 46, right = parseFloat(css("--axis-r")) || 66;   // same axis as the schedule
   const H = top + doms.length * rh + 8;
-  const L = E.schedule.length_s;
-  const x = (t) => left + ((W - left - right) * Math.max(0, Math.min(L, t))) / L;
+  const ax = roundAxis(E), L = ax.total, o = ax.off;                   // the same axis as the schedule bar
+  const x = (t) => left + ((W - left - right) * Math.max(0, Math.min(L, t + o))) / L;
   const y = (i) => top + i * rh + rh / 2;
   const svg = s("svg", {width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Domain tree over the round"});
   for (const [cls, label, a, b] of segments(E)) {
@@ -349,6 +382,7 @@ function renderDomains(E, finished) {
         ["climbing", `${d.progress_per_min >= 0 ? "+" : ""}${fix(d.progress_per_min)} / min`],
         finished ? null : ["in flight", d.status === "merging" ? `${d.inflight}, merging` : `${d.inflight} of ${fix(d.allotted, 0)} allotted`],
         ["configs tried", int(d.tried)],
+        finished || !d.chains ? null : ["chains", `${d.chains}${d.perturb_rounds ? ` · perturbation round ${d.perturb_rounds}` : ""}`],
         ["born at", mins(d.born_s)],
         d.parents.length ? ["merged from", d.parents.map((p) => `D${p}`).join(", ")] : null,
         ["centre", h("span", {class: "mono", text: d.centre.slice(0, 12)})],

@@ -1,20 +1,32 @@
 """A domain's climb: iterated local search (ParamILS) on one hill. Owner: search.
 
-The domain only proposes moves and takes in results; it never decides its own lifecycle (founding, merging, freezing,
-dropping are the controller's, engine.py). It reports facts: what is in flight, whether it has moves left, its
-progress rate, and `state`.
+The domain only proposes moves and takes in results; it never decides its own lifecycle (founding, merging,
+dropping are the controller's, engine.py). It reports facts: what is in flight, its progress rate, `state`, and
+notes for the dashboard's event feed (`events`).
 
+  scan         a domain founded fresh (not by a merge) first scans every setting over its whole range:
+               climb.scan_points points per setting from the centre (the legacy pipeline's "injection", +0.2 on its
+               rounds, 7x more top-30 configs per evaluation than the opening wave)
   sweep        the neighbourhood of the centre. COARSE: one setting at a time at its learned step and at half and
-               double it, plus pairs of the strongest settings. FINE (entered when a coarse sweep is exhausted without
-               a gain): steps halved and never doubled again, settings whose step changed nothing are left out until
-               the centre moves, triples join the pairs, and each exhausted fine sweep halves the scale once more
+               double it, plus pairs of the strongest settings. When a coarse sweep comes back without a gain, a WIDE
+               round first: all pairs of the WIDE_AXES strongest settings at two step sizes (WIDE_STEPS of the
+               range; at most climb.wide_max configs - the legacy pipeline's all-pairs rung). Then FINE: steps halved
+               and never doubled again, settings whose step changed nothing are left out until the centre moves,
+               triples join the pairs, and each exhausted fine sweep halves the scale once more
   acceptance   the centre moves to the best result of the sweep once most of it is back (a decisive gain at once); the
-               sweep's other winners are re-applied on the new centre first. An equal-score neighbour is a sideways
-               move once a sweep is back without a gain (a walk across the plateau, at most climb.sideways_max in a row)
-  perturbation when a fine sweep is exhausted at every setting's smallest step: shake K settings of the centre (K = 2,
-               3, 5, 8 in turn), then one local round around the best shaken point; the result replaces the centre if
-               it is better OR EQUAL (ParamILS's acceptance). A full cycle of K values without that: state "exhausted"
-  final        the last minutes on this one point: single steps at halving scales and all pairs of the top settings
+               sweep's other winners are re-applied on the new centre first. An exact tie is never a move: identical
+               scores mean identical calls (the setting changed nothing here)
+  perturbation when a fine sweep is exhausted at every setting's smallest step: shake K settings of the centre (K =
+               climb.shake_k in turn), then one local round around the best shaken point; the result replaces the
+               centre if it is better OR EQUAL (ParamILS's acceptance). Round after round - it never gives up
+  chains       parallel ParamILS walkers on the workers the main line leaves idle, up to climb.max_chains: each
+               shakes 2-3 settings of its own incumbent, climbs one local round around the shaken point
+               (climb.chain_local moves), keeps the result when it is better or equal, and repeats; sometimes
+               (climb.chain_restart) or when it falls behind, it restarts from the domain's centre. A chain result
+               better than the domain's best by the resolution moves the domain's centre. In the final the shakes
+               are 1-2 settings and smaller
+  final        the last minutes on this one point: single steps at halving scales and all pairs of the top settings,
+               chains until the end
   siblings     a structural move carries one genotyping and one PairHMM variation of itself (the question "does this
                move work better with another threshold / PCR model"), packed into the move's GATK run
 """
@@ -32,30 +44,52 @@ from search.space import GENOTYPING_PARAMS, PAIRHMM_PARAMS, Space
 
 # Tunable (common/tuning.py): climb.accept_min (the answer set's resolution between neighbours: a smaller gain is
 # not a gain), climb.decisive (a gain that moves the centre at once), climb.back_frac (a set of moves counts as back
-# at this share), climb.sideways_max, climb.equal_accepts, climb.shake_k, climb.shake_points, riders.siblings.
+# at this share), climb.equal_accepts, climb.shake_k, climb.shake_points, climb.scan_points, climb.wide_max,
+# climb.max_chains, climb.chain_local, climb.chain_restart, riders.siblings.
 EQUAL = 1e-9
 COARSE_SCALES = (1.0, 0.5, 2.0)
 PAIR_AXES, TRIPLE_AXES, TRIPLES_MAX = 8, 5, 40
+WIDE_AXES, WIDE_STEPS = 12, (0.04, 0.12)
 SHAKE_SCALE = 0.3
+CHAIN_KS, CHAIN_SCALE = (2, 3), 0.15
+FINAL_CHAIN_KS, FINAL_CHAIN_SCALE = (1, 2), 0.06
 STEP_MAX = 0.5
 PROGRESS_WINDOW_S = 600.0
 CHEAP = tuple(GENOTYPING_PARAMS) + tuple(PAIRHMM_PARAMS)
-SWEEP_KINDS = ("n1", "n2", "n3", "reapply", "share", "final", "pairing")
+SWEEP_KINDS = ("scan", "n1", "n2", "n3", "wide", "reapply", "share", "final", "pairing")
+CHAIN_KINDS = ("chain", "chainl")
 
 
 @dataclass
 class Move:
-    kind: str                # n1 | n2 | n3 | reapply | share | shake | local | final | pairing
+    kind: str                # scan | n1 | n2 | n3 | wide | reapply | share | shake | local | final | pairing | chain | chainl
     config: Config
     axes: Tuple[str, ...]
     centre_key: str
     centre_score: float
     cycle: int = -1          # the perturbation step it belongs to
+    chain: int = -1          # the chain it belongs to
+
+
+@dataclass
+class Chain:
+    """One ParamILS walker of a domain."""
+    id: int
+    base: Config             # the chain's incumbent
+    base_score: float
+    stage: str = "shake"     # shake: its shaken point is out | local: the local round around that point is out
+    sent: int = 0
+    back: int = 0
+    point: Optional[Tuple[Config, float]] = None
+    best: Optional[Tuple[Config, float]] = None
+    axes: Tuple[str, ...] = ()
+    iters: int = 0
 
 
 class Climber:
     def __init__(self, id: int, space: Space, book: AxisBook, centre: Config, score: float, now: float,
-                 owner: Optional[Callable[[Config], Optional[int]]] = None, extra_axes: Sequence[str] = ()):
+                 owner: Optional[Callable[[Config], Optional[int]]] = None, extra_axes: Sequence[str] = (),
+                 scan: bool = False):
         self.id, self.space, self.book = id, space, book
         self.centre, self.best = centre, score
         self.born = now
@@ -68,14 +102,14 @@ class Climber:
         self.tried: Set[str] = {centre.key}
         self.pool: List[Move] = []
         self.inflight = 0
-        self.state = "climb"                               # climb | perturb | exhausted | final
+        self.state = "climb"                               # climb | perturb | final  ("exhausted" is never reached)
         self.mode = "coarse"                               # coarse | fine
         self.scale = 1.0                                   # fine-mode scale, halved per exhausted fine sweep
         self.fresh = True                                  # the centre's sweep is not sent yet
+        self.scan_next = scan                              # the first sweep is a full-range scan
+        self.wide_next = self.wide_done = False            # the wide round of this centre: queued / done
         self.sweep_sent = self.sweep_back = 0
         self.winners: List[Tuple[Move, Config, float]] = []
-        self.equals: List[Config] = []
-        self.sideways = 0
         self.flat: Set[str] = set()
         self.recent: List[str] = []                        # settings of accepted moves, most recent last
         self.axis_gain: Dict[str, float] = {}
@@ -84,7 +118,13 @@ class Climber:
         self.cycle_stage = "points"                        # points | local
         self.cycle_sent = self.cycle_back = 0
         self.cycle_best: Optional[Tuple[Config, float]] = None
+        self.rounds = 0                                    # full perturbation rounds without an acceptance
         self.equal_accepts = 0
+        self.chains: Dict[int, Chain] = {}
+        self._chain_seq = 0
+        self._live: Sequence[str] = ()                     # the live settings and rng of the last refill: results
+        self._rng = random.Random(id)                      # start chain moves without waiting for a refill
+        self.events: List[str] = []                        # notes for the event feed (the engine drains them)
         self.gains: List[Tuple[float, float]] = []         # (time, gain) of the domain's OWN accepted moves
         self.history: List[Tuple[float, float, str]] = [(now, score, "born")]
 
@@ -96,6 +136,10 @@ class Climber:
 
     def age(self, now: float) -> float:
         return now - self.born
+
+    def note(self, msg: str) -> None:
+        self.events.append(msg)
+        del self.events[:-50]
 
     # ---- values ----------------------------------------------------------------------------------------------------
     def _floor(self, a: str) -> float:
@@ -128,12 +172,12 @@ class Climber:
         return c
 
     def _add(self, kind: str, base: Config, base_score: float, changes: Dict[str, object], out: List[Move],
-             cycle: int = -1) -> bool:
+             cycle: int = -1, chain: int = -1) -> bool:
         c = self._variant(base, changes)
         if c is None:
             return False
         self.tried.add(c.key)
-        out.append(Move(kind, c, tuple(sorted(changes)), base.key, base_score, cycle))
+        out.append(Move(kind, c, tuple(sorted(changes)), base.key, base_score, cycle, chain))
         return True
 
     def strongest(self, live: Sequence[str], n: int) -> List[str]:
@@ -178,24 +222,76 @@ class Climber:
                 break
         return out
 
+    def scan_moves(self, live: Sequence[str]) -> List[Move]:
+        """Every setting over its whole range: climb.scan_points evenly spaced values (every value of a choice)."""
+        n = max(2, tune("climb.scan_points"))
+        out: List[Move] = []
+        for a in live:
+            s = self.space.specs.get(a)
+            if s is None:
+                continue
+            cur = self.centre.params.get(a, s.default)
+            if s.allowed or s.type == "bool":
+                vals = [v for v in (s.allowed or (True, False)) if v != cur]
+            else:
+                vals = []
+                for i in range(n):
+                    v = self.space._from_unit(s, i / (n - 1))
+                    if v != cur and v not in vals and self._allowed(a, v):
+                        vals.append(v)
+            for v in vals:
+                self._add("scan", self.centre, self.best, {a: v}, out)
+        return out
+
+    def wide_pairs(self, live: Sequence[str], rng: random.Random) -> List[Move]:
+        """All pairs of the WIDE_AXES strongest settings, each at WIDE_STEPS of its range either way (at most two
+        other values of a choice); a random climb.wide_max of them when there are more."""
+        def values(a: str) -> List[object]:
+            s = self.space.specs[a]
+            cur = self.centre.params.get(a, s.default)
+            if s.allowed or s.type == "bool":
+                return [v for v in (s.allowed or (True, False)) if v != cur][:2]
+            u, out = self.space._to_unit(s, cur), []
+            for h in WIDE_STEPS:
+                for sgn in (1, -1):
+                    v = self.space._from_unit(s, min(1.0, max(0.0, u + sgn * h)))
+                    if v != cur and v not in out and self._allowed(a, v):
+                        out.append(v)
+            return out
+        axes = [a for a in self.strongest(live, WIDE_AXES) if a in self.space.specs]
+        vals = {a: values(a) for a in axes}
+        combos = [(a, b, x, y) for a, b in itertools.combinations(axes, 2) for x in vals[a] for y in vals[b]]
+        rng.shuffle(combos)
+        out: List[Move] = []
+        for a, b, x, y in combos:
+            if len(out) >= tune("climb.wide_max"):
+                break
+            self._add("wide", self.centre, self.best, {a: x, b: y}, out)
+        return out
+
+    def _shake(self, base: Config, live: Sequence[str], rng: random.Random, k: int, scale: float) -> Dict[str, object]:
+        """Random changes to k settings of `base` (gaussian steps of `scale` of the range; another value of a choice)."""
+        axes = [a for a in live if a in self.steps]
+        ch: Dict[str, object] = {}
+        for a in rng.sample(axes, min(k, len(axes))) if axes else []:
+            s = self.space.specs[a]
+            cur = base.params.get(a, s.default)
+            if s.allowed or s.type == "bool":
+                others = [v for v in (s.allowed or (True, False)) if v != cur]
+                if others:
+                    ch[a] = rng.choice(others)
+            else:
+                v = self.space._from_unit(s, min(1.0, max(0.0, self.space._to_unit(s, cur) + rng.gauss(0, scale))))
+                if v != cur and self._allowed(a, v):
+                    ch[a] = v
+        return ch
+
     def shake_points(self, live: Sequence[str], rng: random.Random, k: int, n: int) -> List[Move]:
         out: List[Move] = []
-        axes = [a for a in live if a in self.steps]
         tries = 0
-        while len(out) < n and tries < 10 * n and axes:
+        while len(out) < n and tries < 10 * n:
             tries += 1
-            ch: Dict[str, object] = {}
-            for a in rng.sample(axes, min(k, len(axes))):
-                s = self.space.specs[a]
-                cur = self.centre.params.get(a, s.default)
-                if s.allowed or s.type == "bool":
-                    others = [v for v in (s.allowed or (True, False)) if v != cur]
-                    if others:
-                        ch[a] = rng.choice(others)
-                else:
-                    v = self.space._from_unit(s, min(1.0, max(0.0, self.space._to_unit(s, cur) + rng.gauss(0, SHAKE_SCALE))))
-                    if v != cur and self._allowed(a, v):
-                        ch[a] = v
+            ch = self._shake(self.centre, live, rng, k, SHAKE_SCALE)
             if len(ch) >= max(1, k // 2):
                 self._add("shake", self.centre, self.best, ch, out, self.cycle)
         return out
@@ -224,7 +320,7 @@ class Climber:
                     break
         return out
 
-    # ---- the state machine -------------------------------------------------------------------------------------------
+    # ---- the main line ---------------------------------------------------------------------------------------------
     def _sweep(self, live: Sequence[str], rng: random.Random) -> List[Move]:
         out: List[Move] = []
         for kind, ch in self.queued:                       # re-applied winners and settings shared by other domains
@@ -233,6 +329,14 @@ class Climber:
         if self.state == "final":
             out += self.singles(self.centre, self.best, live, "final", self.scale)
             out += self.pairs(live, rng, self.scale, kind="final")
+        elif self.scan_next:
+            self.scan_next = False
+            out += self.scan_moves(live)
+            self.note(f"full-range scan: {len(out)} configs")
+        elif self.wide_next:
+            self.wide_next = False
+            out += self.wide_pairs(live, rng)
+            self.note(f"coarse sweep without a gain: wide round of {len(out)} pairs")
         elif self.mode == "coarse":
             for sc in COARSE_SCALES:
                 out += self.singles(self.centre, self.best, live, "n1", sc)
@@ -245,9 +349,15 @@ class Climber:
         return out
 
     def refill(self, live: Sequence[str], rng: random.Random, room: int) -> List[Move]:
-        """More moves, when the pool is empty. `room`: the workers this domain may still fill."""
-        if self.state == "exhausted":
-            return []
+        """More moves, when the pool is empty. `room`: the workers this domain may still fill. The main line
+        (sweeps, then perturbation) first; when it is waiting for results or has nothing, chains take the room."""
+        self._live, self._rng = live, rng
+        out = self._main(live, rng, room)
+        if not out and room > 0:
+            out = self._start_chains(live, rng, room)
+        return out
+
+    def _main(self, live: Sequence[str], rng: random.Random, room: int) -> List[Move]:
         out: List[Move] = []
         if self.fresh:
             self.fresh = False
@@ -256,44 +366,50 @@ class Climber:
             self.pool.extend(out)
             if out or self.state == "final":
                 return out
-        if self.state in ("climb", "final") and self.sweep_back < tune("climb.back_frac") * max(1, self.sweep_sent):
+        if self.state in ("climb", "final") and self.sweep_sent and \
+                self.sweep_back < tune("climb.back_frac") * self.sweep_sent:
             return []                                      # the sweep is still coming back
-        if self.state in ("climb", "final") and self.equals and not self.winners and self.sideways < tune("climb.sideways_max"):
-            self.sideways += 1
-            self._recentre(self.equals[-1], self.best, self.history[-1][0], (), own=False)
-            return self.refill(live, rng, room)
-        if self.state == "final":                          # a halved final sweep, down to the floor
+        if self.state == "final":                          # a halved final sweep, down to the floor; then chains
             if any(self.scale * st > self._floor(a) for a, st in self.steps.items()):
                 self.scale *= 0.5
                 self.fresh = True
-                return self.refill(live, rng, room)
+                return self._main(live, rng, room)
             return []
         if self.state == "climb":
             if self.mode == "coarse":
+                if not self.wide_done:                     # the legacy pipeline's all-pairs rung, once per centre
+                    self.wide_done = self.wide_next = self.fresh = True
+                    return self._main(live, rng, room)
                 self.mode = "fine"
                 for a in self.steps:
                     self.steps[a] = max(self._floor(a), self.steps[a] * 0.5)
                 self.scale, self.fresh = 1.0, True
-                return self.refill(live, rng, room)
+                self.note("coarse sweeps exhausted: fine mode")
+                return self._main(live, rng, room)
             if any(self.scale * st > self._floor(a) for a, st in self.steps.items()):
                 self.scale *= 0.5
                 self.fresh = True
-                return self.refill(live, rng, room)
+                return self._main(live, rng, room)
             self.state, self.cycle, self.cycle_stage = "perturb", 0, "points"
             self.cycle_sent = 0
+            self.note("fine sweeps exhausted at the smallest steps: perturbation")
         return self._perturb(live, rng, room)
 
     def _perturb(self, live: Sequence[str], rng: random.Random, room: int) -> List[Move]:
         out: List[Move] = []
         if self.cycle_sent == 0:                           # start this K: its shaken points
-            if self.cycle >= len(tune("climb.shake_k")):
-                self.state = "exhausted"
-                return []
-            out = self.shake_points(live, rng, tune("climb.shake_k")[self.cycle], max(tune("climb.shake_points"), min(room, 60)))
-            self.cycle_stage, self.cycle_sent, self.cycle_back, self.cycle_best = "points", len(out), 0, None
-            if not out:
+            ks = tune("climb.shake_k")
+            for _ in range(len(ks) + 1):
+                if self.cycle >= len(ks):                  # a full round of K without acceptance: start over
+                    self.cycle, self.rounds = 0, self.rounds + 1
+                    self.note(f"perturbation round {self.rounds} without acceptance: starting over")
+                out = self.shake_points(live, rng, ks[self.cycle], max(tune("climb.shake_points"), min(room, 60)))
+                if out:
+                    break
                 self.cycle += 1
-                return self._perturb(live, rng, room)
+            if not out:
+                return []                                  # nothing can be shaken (every point tried)
+            self.cycle_stage, self.cycle_sent, self.cycle_back, self.cycle_best = "points", len(out), 0, None
         elif self.cycle_back < tune("climb.back_frac") * self.cycle_sent:
             return []
         elif self.cycle_stage == "points":                 # the points are back: one local round around the best
@@ -320,17 +436,107 @@ class Climber:
                 self.equal_accepts += 1
             self._recentre(cfg, sc, self.history[-1][0], (), own=own)
             self.state, self.scale, self.fresh = "climb", 1.0, True
-            return self.refill(live, rng, room)
+            self.note(f"perturbation accepted at {sc:.4f}")
+            return self._main(live, rng, room)
         self.cycle, self.cycle_sent = self.cycle + 1, 0
         return self._perturb(live, rng, room)
 
+    # ---- chains --------------------------------------------------------------------------------------------------------
+    def _start_chains(self, live: Sequence[str], rng: random.Random, room: int) -> List[Move]:
+        out: List[Move] = []
+        per = 1 + max(1, tune("climb.chain_local"))
+        while room > 0 and len(self.chains) < tune("climb.max_chains"):
+            self._chain_seq += 1
+            ch = Chain(self._chain_seq, self.centre, self.best)
+            mv = self._chain_shake(ch, live, rng)
+            if mv is None:
+                break
+            self.chains[ch.id] = ch
+            out.append(mv)
+            room -= per
+        if out:
+            self.pool.extend(out)
+        return out
+
+    def _chain_shake(self, ch: Chain, live: Sequence[str], rng: random.Random) -> Optional[Move]:
+        final = self.state == "final"
+        ks, scale = (FINAL_CHAIN_KS, FINAL_CHAIN_SCALE) if final else (CHAIN_KS, CHAIN_SCALE)
+        for _ in range(10):
+            changes = self._shake(ch.base, live, rng, rng.choice(ks), scale)
+            out: List[Move] = []
+            if changes and self._add("chain", ch.base, ch.base_score, changes, out, cycle=ch.iters, chain=ch.id):
+                ch.stage, ch.sent, ch.back, ch.point, ch.best = "shake", 1, 0, None, None
+                ch.axes = out[0].axes
+                return out[0]
+        return None
+
+    def _chain_local(self, ch: Chain) -> List[Move]:
+        cfg, sc = ch.point
+        n = max(1, tune("climb.chain_local"))
+        axes = list(ch.axes) + [a for a in self.strongest(self._live, n) if a not in ch.axes]
+        scale = 0.5 if self.state == "final" else 1.0
+        out: List[Move] = []
+        for a in axes:
+            if a not in self.steps:
+                continue
+            for v in self.step_values(a, cfg, scale):
+                self._add("chainl", cfg, sc, {a: v}, out, cycle=ch.iters, chain=ch.id)
+            if len(out) >= n:
+                break
+        return out[:n]
+
+    def _chain_result(self, move: Move, config: Config, score: Optional[float]) -> None:
+        ch = self.chains.get(move.chain)
+        if ch is None or move.cycle != ch.iters:
+            return                                         # a chain that ended, or a late result of a past round
+        if move.kind == "chain":                           # the shaken point is back: a local round around it
+            if ch.stage != "shake":
+                return
+            if score is None:
+                self._chain_next(ch)
+                return
+            ch.point = ch.best = (config, score)
+            moves = self._chain_local(ch)
+            if not moves:
+                self._chain_judge(ch)
+                return
+            ch.stage, ch.sent, ch.back = "local", len(moves), 0
+            self.pool.extend(moves)
+            return
+        if ch.stage != "local":
+            return
+        ch.back += 1
+        if score is not None and (ch.best is None or score > ch.best[1]):
+            ch.best = (config, score)
+        if ch.back >= tune("climb.back_frac") * ch.sent:
+            self._chain_judge(ch)
+
+    def _chain_judge(self, ch: Chain) -> None:
+        """Better or equal: the chain moves there (ParamILS); then its next shake."""
+        if ch.best is not None and ch.best[1] >= ch.base_score - EQUAL:
+            ch.base, ch.base_score = ch.best
+        self._chain_next(ch)
+
+    def _chain_next(self, ch: Chain) -> None:
+        ch.iters += 1                                      # results of the round that ended are ignored from now on
+        if ch.base_score < self.best - tune("climb.decisive") or self._rng.random() < tune("climb.chain_restart"):
+            ch.base, ch.base_score = self.centre, self.best        # fell behind (or by chance): from the centre again
+        mv = self._chain_shake(ch, self._live, self._rng)
+        if mv is None:
+            self.chains.pop(ch.id, None)
+        else:
+            self.pool.append(mv)
+
+    # ---- bookkeeping ---------------------------------------------------------------------------------------------------
     def dropped(self, move: Move) -> None:
-        """A move that could not be sent counts as back, so a sweep never waits for it."""
+        """A move that could not be sent counts as back, so a sweep or chain never waits for it."""
         self.inflight = max(0, self.inflight - 1)
         if move.kind in SWEEP_KINDS and move.centre_key == self.centre.key:
             self.sweep_back += 1
         if move.kind in ("shake", "local") and move.cycle == self.cycle and self.state == "perturb":
             self.cycle_back += 1
+        if move.kind in CHAIN_KINDS:
+            self._chain_result(move, move.config, None)
 
     def take(self) -> Optional[Move]:
         if not self.pool:
@@ -353,7 +559,10 @@ class Climber:
 
     def start_final(self) -> None:
         self.state, self.pool, self.fresh, self.scale = "final", [], True, 0.5
-        self.winners, self.equals = [], []
+        self.winners = []
+        self.scan_next = self.wide_next = False
+        for ch in self.chains.values():                    # the final is about this one point
+            ch.base, ch.base_score = self.centre, self.best
 
     def inherit(self, tried: Set[str], steps: Dict[str, float], axis_gain: Dict[str, float]) -> None:
         """At a merge: the parents' tested configs, finer steps and per-setting gains carry over."""
@@ -378,6 +587,8 @@ class Climber:
                 self.cycle_back += 1
             if move.kind in ("n1", "local", "final") and len(move.axes) == 1:
                 self._learn(move.axes[0], config, move, score, bad, now)
+            if move.kind in CHAIN_KINDS:
+                self._chain_result(move, config, None if bad else score)
         if bad:
             return self._maybe_recentre(now)
         if move.kind in ("shake", "local") and self.state == "perturb" and move.cycle == self.cycle:
@@ -387,12 +598,14 @@ class Climber:
             self._credit(move, score)
             self._recentre(config, score, now, move.axes if current else (), own=True)
             return True
+        if score > self.best + tune("climb.accept_min") and move.kind in CHAIN_KINDS:
+            self._credit(move, score)                                   # a chain beat the domain: its centre moves
+            self.note(f"a chain found {score:.4f}")
+            self._recentre(config, score, now, (), own=True)
+            return True
         if score > self.best + tune("climb.accept_min") and move.kind in SWEEP_KINDS and self.state in ("climb", "final"):
             self._credit(move, score)
             self.winners.append((move, config, score))
-            return self._maybe_recentre(now)
-        if abs(score - self.best) <= EQUAL and is_head and current and move.kind in ("n1", "n2"):
-            self.equals.append(config)
         return self._maybe_recentre(now)
 
     def _credit(self, move: Move, score: float) -> None:
@@ -433,14 +646,16 @@ class Climber:
         gain = score - self.best
         if own and gain > 0:
             self.gains.append((now, gain))
-            self.sideways = 0
             self.equal_accepts = 0
+            self.rounds = 0
         self.cycle, self.cycle_sent, self.cycle_best = 0, 0, None   # a new centre: the next perturbation starts at K=2
         self.centre, self.best = config, score
         self.tried.add(config.key)
-        self.pool, self.winners, self.equals = [], [], []
+        self.pool = [m for m in self.pool if m.kind in CHAIN_KINDS]  # the chains walk on; the centre's sweep restarts
+        self.winners = []
         self.flat.clear()
         self.fresh = True
+        self.wide_done = False
         self.sweep_sent = self.sweep_back = 0
         if self.state == "perturb":
             self.state = "climb"

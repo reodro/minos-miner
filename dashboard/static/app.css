@@ -186,7 +186,12 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .bar.scout > span { background: var(--scout); } .bar.final > span { background: var(--final); }
 
 /* schedule */
-.schedule, .ticks { margin-left: var(--axis-l); margin-right: var(--axis-r); }
+.schedule, .ticks, .lane { margin-left: var(--axis-l); margin-right: var(--axis-r); }
+.lane { position: relative; height: 18px; }
+.lane .seg { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; padding: 0 6px; font-size: 11px;
+  font-weight: 600; white-space: nowrap; overflow: hidden; border-radius: 4px; background: var(--scout-soft); color: var(--ink);
+  border: 1px solid var(--scout); }
+.seg.submit { background: var(--track); color: var(--muted); }
 .schedule { position: relative; height: 44px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: var(--panel-2); }
 .schedule .seg { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; padding: 0 8px; font-size: 12px;
   font-weight: 600; white-space: nowrap; overflow: hidden; border-right: 1px solid var(--panel); }

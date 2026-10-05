@@ -101,6 +101,7 @@ class StatusBoard:
             "regime": a.regime.value, "donor": a.donor, "germline": len(a.germline), "synthetic": len(a.synthetic),
             "n_targets": a.n_targets, "n_targets_source": n.get("n_targets_source"), "seconds": n.get("seconds"),
             "degraded": n.get("degraded"), "version": a.version,
+            "ready_ts": (self.state.get("answer_set") or {}).get("ready_ts") or time.time(),   # the first version's
             "composition": {"germline": _composition(a.germline),
                             "synthetic": _composition([c.variant for c in a.synthetic], [c.p for c in a.synthetic])}}
         self.state["round"]["mode"] = "searching" if a.germline else "static fallback"
