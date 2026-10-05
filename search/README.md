@@ -51,6 +51,7 @@ HaplotypeCaller does not read them unless `--adaptive-pruning` is on, and that s
 | `engine.py` | the opening and the controller: everything about domains is decided in one pass from facts |
 | `axes.py` | per-setting steps, learned cliffs, parked settings, the distance between configs, the Latin hypercube |
 | `families.py` | genotyping riders for global points |
+| `portfolio.py` | the opening's seeds: the legacy pipeline's portfolio (`portfolio/legacy.json`, 749 configs from 79 rounds) and what our reviewed runs add (`$DATA_DIR/portfolio/ours.jsonl`), the round's read-length profile first, spaced apart, up to `opening.portfolio_share` of wave 0 |
 | `ranker.py` | the (core, FP) forest the scout ranks candidates with |
 | `space.py` | the round's search space: published ranges, pinned settings, floors, BAM caps |
 | `client.py`, `base.py` | the EvalClient the search talks to; a random baseline strategy for tests |
@@ -59,7 +60,7 @@ The round (times for a 72-minute search; they scale with the round's length):
 
 | minutes | stage |
 |---|---|
-| 0-12 | wave 0 (seeds + a Latin hypercube over every setting, 4 threshold riders) while the answer set is built, then 3 genetic generations, each launched once 60% of the previous is back or workers idle; stops early when a generation gains < 0.05; hard limit 14 |
+| 0-12 | wave 0 (the defaults, the official seed, up to 40% portfolio seeds, the rest a Latin hypercube over every setting; 4 threshold riders) while the answer set is built, then 3 genetic generations, each launched once 60% of the previous is back or workers idle; stops early when a generation gains < 0.05; hard limit 14 |
 | 12 | founding: one domain per hill (registry), up to 6 |
 | 12-62 | ParamILS in every domain; winning settings shared between domains every 5 min; the scout keeps 15% of the workers (hypercube points, crossovers between hills, model upper confidence bound); a scout find founds a domain only after a midpoint run shows a valley (until minute 34) |
 | any time | merge on evidence: two domains on one hill, or a frozen domain on a live one's hill |

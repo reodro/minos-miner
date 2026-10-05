@@ -205,6 +205,7 @@ class Reviewer:
         row["search"] = summarize(local, true, m.get("final_config"), m.get("baseline_config"))
         row["rerun"] = rerun
         self._append(row)
+        self._grow_portfolio(rnd, m)
         log.info("review %s: final true %s, pick gap %s, spearman %s", run_id, row["search"].get("final_true"),
                  row["search"].get("pick_gap"), row["search"].get("spearman"))
         return row
@@ -250,6 +251,23 @@ class Reviewer:
             if row.get("type") == "review" and row.get("run_id") == run_id:
                 found = row
         return found
+
+    def _grow_portfolio(self, rnd: Round, m: dict) -> None:
+        """The run's diverse near-best configs join our part of the opening's portfolio (search.portfolio)."""
+        try:
+            from common.params import ParamRanges
+            from search import portfolio
+            from search.space import Space
+            try:
+                r = ParamRanges.from_platform()
+            except Exception:  # noqa: BLE001 - offline: the checked-in snapshot
+                r = ParamRanges.from_file(str(Path(__file__).resolve().parents[1] / "tests" / "fixtures" /
+                                              "parameter_ranges.json"))
+            profile = portfolio.bam_profile(rnd.bam, rnd.chrom, rnd.start, rnd.end) if rnd.bam else None
+            n = portfolio.add_run(Space(r, "gatk"), m.get("configs") or {}, m["tag"], profile)
+            log.info("review %s: %d configs added to the portfolio (profile %s)", m["tag"], n, profile)
+        except Exception as e:  # noqa: BLE001 - the portfolio must never lose a review
+            log.warning("review: portfolio update failed: %s", e)
 
     def _append(self, row: dict) -> None:
         if self.board is not None:

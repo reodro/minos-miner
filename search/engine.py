@@ -42,7 +42,7 @@ from search.client import EvalClient, Outcome
 from search.families import genotyping_riders
 from search.ranker import Ranker
 from search.space import GENOTYPING_PARAMS, Space, bam_caps
-from search import genetic
+from search import genetic, portfolio
 from search.climber import Climber, Move
 from search.hills import MIN_FAR, Hills
 
@@ -61,14 +61,6 @@ OFFICIAL_SEED = {
     "max_assembly_region_size": 270, "assembly_region_padding": 100, "pair_hmm_gap_continuation_penalty": 7,
     "phred_scaled_global_read_mismapping_rate": 45, "heterozygosity": 0.002154, "indel_heterozygosity": 0.000125,
     "contamination_fraction_to_filter": 0.04, "max_reads_per_alignment_start": 116,
-}
-FAMILY_SEED = {
-    "min_base_quality_score": 35, "min_mapping_quality_score": 8, "base_quality_score_threshold": 37,
-    "standard_min_confidence_threshold_for_calling": 74.0, "pcr_indel_model": "AGGRESSIVE", "min_pruning": 2,
-    "min_dangling_branch_length": 20, "recover_all_dangling_branches": False, "max_num_haplotypes_in_population": 17,
-    "active_probability_threshold": 0.005, "min_assembly_region_size": 18, "max_assembly_region_size": 100,
-    "assembly_region_padding": 13, "pair_hmm_gap_continuation_penalty": 13,
-    "phred_scaled_global_read_mismapping_rate": 48, "heterozygosity": 0.008, "max_reads_per_alignment_start": 64,
 }
 
 
@@ -119,6 +111,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
     async def run(client: EvalClient) -> None:
         r = client.round
         caps = bam_caps(r.bam, r.chrom, r.start, r.end) if r.bam else {}
+        profile = portfolio.bam_profile(r.bam, r.chrom, r.start, r.end) if r.bam else None
         space = Space(ranges, tool, caps=caps)
         book = AxisBook(space)
         ranker = Ranker(space, seed=seed)
@@ -224,15 +217,19 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
 
         # ---- opening --------------------------------------------------------------------------------------------
         def seeds() -> List[Config]:
+            """The defaults, the official seed and up to opening.portfolio_share of wave 0 from the portfolio
+            (search/portfolio.py: the round's read-length profile first)."""
             out: List[Config] = []
-            for p in ({}, OFFICIAL_SEED, FAMILY_SEED):
+            for p in ({}, OFFICIAL_SEED):
                 c = space._assemble(dict(p))
                 if c is not None and all(c.key != x.key for x in out):
                     out.append(c)
-            for raw in client.store.portfolio(limit=max(4, cap // 20), tool=tool):
-                c = space._assemble(dict(raw.params))
-                if c is not None and all(c.key != x.key for x in out):
+            want, n = int(cap * tune("opening.portfolio_share")), 0
+            for c in portfolio.pick(space, profile, want):
+                if all(c.key != x.key for x in out):
                     out.append(c)
+                    n += 1
+            say("seeds: %d from the portfolio (profile %s)", n, profile or "unknown")
             return out
 
         def launch_wave(configs: Sequence[Config], riders: int, label: str) -> None:
