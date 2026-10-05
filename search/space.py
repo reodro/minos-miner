@@ -12,6 +12,7 @@ PairHMM (~0.12) and genotyping (~0.01) are the cheap axes a family can sweep ins
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 import random
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -26,9 +27,37 @@ from common.types import Config
 # (useAdaptivePruning defaults false) and this space has no switch to turn it on, so the assembler builds
 # LowWeightChainPruner(min_pruning) and never reads them. Holding them at the GATK defaults drops two dimensions
 # that cannot change a call.
+# recover_all_dangling_branches stays an axis: on 20261002T115300Z none of the 333 configs with it reached the top
+# 200 of 7,067 true-scored, but on 20261002T104100Z a climb gained 0.04 by flipping it - the axis book decides per
+# round, and a bool costs one move per refill.
 PINNED = {"gatk": {"emit_ref_confidence": "NONE",
                    "adaptive_pruning_initial_error_rate": 0.001,
                    "pruning_lod_threshold": 2.302585}}
+# assembly_region_padding below 5 is never proposed: the batch path's GATK dies in assembly for heads with padding
+# 0-1 (6 of 6 plain runs on 20261002T104100Z; 5 and 13 pass), and on 20261002T115300Z none of the 1,322 configs with
+# padding 0-4 reached the top 200 of 7,067 true-scored (best 85.67 against 85.84 at padding 13).
+FLOORS = {"gatk": {"assembly_region_padding": 5}}
+
+
+def bam_caps(bam: str, chrom: str, start: int, end: int, reads: int = 20000) -> Dict[str, object]:
+    """Bounds the round's data sets: min_base_quality_score above the BAM's highest base quality keeps no base and
+    calls nothing (409 zero-scored configs in one fleet run), so the cap is that maximum (sampled from `reads`
+    reads of the region; 20k reads take ~0.1 s). {} when the BAM cannot be read (tests, a missing file)."""
+    try:
+        import pysam
+        with pysam.AlignmentFile(bam) as f:
+            top, n = 0, 0
+            for r in f.fetch(chrom, max(0, start - 1), end):
+                q = r.query_qualities
+                if q is None:
+                    continue
+                top = max(top, max(q))
+                n += 1
+                if n >= reads:
+                    break
+    except Exception:  # noqa: BLE001 - no BAM, no index, no pysam: no caps
+        return {}
+    return {"min_base_quality_score": int(top)} if n else {}
 
 # Copied from evaluator.gatk.BRANCH groups. Search must not import evaluator (CONTRIBUTING.md).
 GENOTYPING_PARAMS = ("standard_min_confidence_threshold_for_calling", "indel_heterozygosity",
@@ -82,9 +111,21 @@ _FAR_STARTS = (
 
 
 class Space:
-    def __init__(self, ranges: ParamRanges, tool: str = "gatk", pinned: Optional[Dict[str, object]] = None):
+    def __init__(self, ranges: ParamRanges, tool: str = "gatk", pinned: Optional[Dict[str, object]] = None,
+                 caps: Optional[Dict[str, object]] = None):
+        """`caps`: upper bounds the round's data sets (bam_caps), on top of FLOORS; values beyond them are never
+        proposed and are clamped when a config comes from outside (a seed, a portfolio member)."""
         self.ranges, self.tool = ranges, tool
-        self.specs: Dict[str, ParamSpec] = ranges.tools[tool]
+        specs = ranges.tools[tool]
+        self.floors = {n: f for n, f in FLOORS.get(tool, {}).items() if n in specs}
+        self.caps = {n: c for n, c in (caps or {}).items() if n in specs and specs[n].max is not None and c < specs[n].max}
+        self.specs: Dict[str, ParamSpec] = {}
+        for n, sp in specs.items():
+            if n in self.floors:
+                sp = dataclasses.replace(sp, min=max(sp.min, self.floors[n]))
+            if n in self.caps:
+                sp = dataclasses.replace(sp, max=max(sp.min, self.caps[n]))
+            self.specs[n] = sp
         self.pinned = dict(PINNED.get(tool, {}) if pinned is None else pinned)
         self.names: List[str] = [n for n, s in sorted(self.specs.items()) if not self._fixed(s) and n not in self.pinned]
         cheap = set(GENOTYPING_PARAMS) | set(PAIRHMM_PARAMS)
@@ -134,6 +175,12 @@ class Space:
         """A full valid config from `params`, with pinned values and the two GATK cross-constraints repaired."""
         full = {n: params.get(n, self.pinned.get(n, s.default)) for n, s in self.specs.items()}
         full.update(self.pinned)
+        for n, f in self.floors.items():
+            if isinstance(full.get(n), (int, float)) and full[n] < f:
+                full[n] = f
+        for n, c in self.caps.items():
+            if isinstance(full.get(n), (int, float)) and full[n] > c:
+                full[n] = c
         lo, hi = full.get("min_assembly_region_size"), full.get("max_assembly_region_size")
         if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and lo > hi:
             hi_max = self.specs["max_assembly_region_size"].max
