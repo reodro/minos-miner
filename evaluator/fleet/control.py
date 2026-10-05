@@ -30,6 +30,8 @@ from evaluator.fleet.inventory import REPO, Host, code_digest, ensure_agent, loa
 
 EXCLUDES = ["--exclude", ".git/", "--exclude", ".venv/", "--exclude", "test/", "--exclude", "__pycache__/",
             "--exclude", "/fleet.json",                     # the inventory (key passphrases) stays on main
+            "--exclude", "/tuning.json",                    # main's settings overrides (only main reads them)
+            "--exclude", "/dashboard/.certs/",              # the dashboard's TLS key and certificate stay on main
             "--exclude", "/cache/", "--exclude", "/status/",  # each machine's own (--delete would wipe them)
             "--exclude", "evaluator/gatk_patch/build/", "--exclude", "*.pyc"]
 
