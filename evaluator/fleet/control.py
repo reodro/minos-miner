@@ -95,7 +95,7 @@ def provision(h: Host) -> dict:
 def sync(h: Host) -> dict:
     copy_repo(h)
     b = selftest.make_bundle(SETTINGS.cache_dir, SETTINGS.rounds_dir)
-    push(h, [b["bam"], b["bai"]], f"{h.repo}/cache/selftest/")
+    push(h, selftest.bundle_files(b), f"{h.repo}/cache/selftest/")
     p = sh(h, f"cd {shlex.quote(h.repo)} && bash evaluator/gatk_patch/build.sh", timeout=1200)
     return {"host": h.name, "ok": p.returncode == 0, "tail": (p.stdout + p.stderr).strip()[-200:]}
 

@@ -1,16 +1,23 @@
-"""Node self-test: a fixed config on a small BAM slice must reproduce selftest.json's digest exactly.
+"""Node self-test: a fixed config on a small BAM slice must match selftest.json.
 
-It checks the whole stack a node evaluates with - GATK image, patch jar, reference, runner flags - in ~11 s.
-Main cuts the slice from its copy of the round once and pushes it to every node.
+A node is accepted only when both hold: the VCF digest equals expected_sha256, and HappyScorer
+(the validator scoring path) returns expected_score. A node that can call variants but cannot
+score does not become ready. Main cuts the slice and copies truth/mutations once, then pushes
+that bundle to every node.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Dict
 
 SPEC_FILE = Path(__file__).with_name("selftest.json")
+_TRUTH = (("truth", "truth.vcf.gz"), ("truth_tbi", "truth.vcf.gz.tbi"),
+          ("mutations", "mutations.vcf.gz"), ("mutations_tbi", "mutations.vcf.gz.tbi"))
+_SCORE_TOL = 1e-4
 
 
 def spec() -> dict:
@@ -22,8 +29,27 @@ def bundle_name() -> str:
     return f"{s['tag']}_{s['slice'].replace(':', '_').replace('-', '_')}.bam"
 
 
+def bundle_files(bundle: Dict[str, str]) -> list:
+    """Local paths main pushes: slice BAM, its index, and the truth the scorer needs."""
+    order = ("bam", "bai", "truth", "truth_tbi", "mutations", "mutations_tbi")
+    return [bundle[k] for k in order if bundle.get(k)]
+
+
+def reject_reason(result: dict) -> str:
+    """Why a ready message is not accepted. A score miss is not reported as a digest miss."""
+    if result.get("digest") != result.get("expected"):
+        return f"self-test failed: {result.get('digest')} != {result.get('expected')}"
+    if result.get("error"):
+        return f"self-test failed: {result['error']}"
+    return f"self-test failed: score {result.get('score')} != {result.get('expected_score')}"
+
+
 def make_bundle(cache_dir: str, rounds_dir: str) -> Dict[str, str]:
-    """On main: the slice BAM (+ index) under cache_dir/selftest - rebuildable, cut from the stored round when missing."""
+    """On main: slice BAM (+ index) and truth/mutations under cache_dir/selftest.
+
+    The BAM is cut from the stored round when missing. Truth files are copied from that round
+    when main has them; scoring fails closed on the node if they are absent.
+    """
     s = spec()
     d = Path(cache_dir) / "selftest"
     d.mkdir(parents=True, exist_ok=True)
@@ -40,21 +66,76 @@ def make_bundle(cache_dir: str, rounds_dir: str) -> Dict[str, str]:
         pysam.index(str(tmp))
         os.replace(tmp, bam)
         os.replace(str(tmp) + ".bai", str(bam) + ".bai")
-    return {"bam": str(bam), "bai": str(bam) + ".bai"}
+    out = {"bam": str(bam), "bai": str(bam) + ".bai"}
+    src_dir = Path(rounds_dir) / s["tag"]
+    for key, name in _TRUTH:
+        src, dest = src_dir / name, d / name
+        if src.exists() and (not dest.exists() or dest.stat().st_size != src.stat().st_size):
+            shutil.copy2(src, dest)
+        if dest.exists():
+            out[key] = str(dest)
+    return out
+
+
+def _count_records(path: Path) -> int:
+    n = 0
+    with gzip.open(path, "rt") as f:
+        for line in f:
+            if line and line[0] != "#":
+                n += 1
+    return n
+
+
+def _score(runner_cs, s: dict, cache_dir: str, reference: str) -> dict:
+    """HappyScorer on the self-test VCF. Any failure is a failed node, not a skipped check."""
+    from common.types import AnswerSet, Regime
+    from evaluator.gatk import HappyScorer
+    d = Path(cache_dir) / "selftest"
+    truth, mutations = d / "truth.vcf.gz", d / "mutations.vcf.gz"
+    if not truth.exists() or not mutations.exists():
+        raise FileNotFoundError("self-test bundle has no truth/mutations (run: python -m evaluator.fleet.control sync)")
+    n_targets = _count_records(mutations)
+    expected_n = s.get("n_targets")
+    if expected_n is not None and int(expected_n) != n_targets:
+        raise ValueError(f"mutations count {n_targets} != n_targets {expected_n}")
+    if n_targets < 1:
+        raise ValueError("self-test mutations VCF has no records")
+    answer = AnswerSet(f"selftest-{s['tag']}", 1, Regime.UNKNOWN, None, [], [], n_targets,
+                       notes={"truth_vcf": str(truth), "mutations_vcf": str(mutations),
+                              "region": s["slice"], "reference": reference})
+    scored = HappyScorer().score(runner_cs, answer)
+    if scored.score is None:
+        raise RuntimeError("HappyScorer returned no score")
+    return {"score": float(scored.score), "n_targets": n_targets}
 
 
 def run(runner, data_dir: str, cache_dir: str) -> dict:
-    """On a node: run the bundle (from cache_dir/selftest, pushed by main) on the reference in data_dir, compare
-    digests. {"ok", "digest", "expected"}."""
+    """On a node: reproduce the VCF digest, then the validator score. {"ok", "digest", "expected", ...}."""
     from common.types import FULL, Config, Round
     from evaluator.gatk import records_digest
     s = spec()
+    base = {"expected": s["expected_sha256"], "expected_score": s.get("expected_score")}
     bam = Path(cache_dir) / "selftest" / bundle_name()
     if not bam.exists():
-        return {"ok": False, "digest": "no bundle (run: python -m evaluator.fleet.control sync)", "expected": s["expected_sha256"]}
+        return {**base, "ok": False, "digest": "no bundle (run: python -m evaluator.fleet.control sync)"}
     chrom, span = s["slice"].split(":")
     a, b = (int(x) for x in span.split("-"))
-    rnd = Round(f"selftest-{s['tag']}", chrom, a, b, str(bam), os.path.join(data_dir, "reference", chrom, f"{chrom}.fa"))
+    reference = os.path.join(data_dir, "reference", chrom, f"{chrom}.fa")
+    rnd = Round(f"selftest-{s['tag']}", chrom, a, b, str(bam), reference)
     cs = runner.run(rnd, Config("gatk", s["config"]), FULL)
     got = records_digest(Path(cs.vcf)) if cs.ok else f"failed: {cs.error}"
-    return {"ok": got == s["expected_sha256"], "digest": got, "expected": s["expected_sha256"]}
+    if got != s["expected_sha256"]:
+        return {**base, "ok": False, "digest": got}
+    try:
+        measured = _score(cs, s, cache_dir, reference)
+    except Exception as e:  # noqa: BLE001 - a node that cannot score must not become ready
+        return {**base, "ok": False, "digest": got, "error": f"scoring failed: {e}"}
+    expected = s.get("expected_score")
+    if expected is None:
+        return {**base, "ok": False, "digest": got, **measured,
+                "error": "self-test has no expected_score"}
+    ok = abs(float(measured["score"]) - float(expected)) <= _SCORE_TOL
+    out = {**base, "ok": ok, "digest": got, "score": measured["score"]}
+    if not ok:
+        out["error"] = f"score {measured['score']} != {expected}"
+    return out

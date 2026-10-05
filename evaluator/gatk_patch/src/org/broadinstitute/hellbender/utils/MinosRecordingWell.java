@@ -28,6 +28,14 @@ public final class MinosRecordingWell extends Well19937c {
 
     public void setRecording(final boolean on) { recording = on; }
 
+    /** minos server: back to the state of a new JVM's generator (seed position, cached gaussian, nothing recorded). */
+    public void minosReset(final long seed) {
+        setSeed(seed);                       // AbstractWell.setSeed clears BitsStreamGenerator's cached gaussian
+        recording = false;
+        draws = new ArrayList<>();
+        steps = 0;
+    }
+
     public List<int[]> takeDraws() {
         final List<int[]> out = draws;
         draws = new ArrayList<>();

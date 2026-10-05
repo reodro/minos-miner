@@ -37,6 +37,14 @@ main) - and `GatkRunner`, `HappyScorer`, `LocalExecutor`, `SimExecutor`, `FakeRu
 | Identical records scored once (node agent) | a callset whose records digest was already scored this round reuses that score (or failure): no hap.py |
 | Truth sliced once per (truth, region) (`truth_slices`) | upstream slices the truth on every scoring (2 bcftools containers); the cached slice is the same bcftools output |
 | GATK containers with `--network none` | no network namespace and interface per container (container start 3.9 s -> 0.33 s measured in the legacy project) |
+| Provably identical configs run once (`equivalence.py`) | a config is run as its canonical config when the round's BAM cannot tell them apart: `max_reads_per_alignment_start` >= the most reads at one start, `min_base_quality_score` / `base_quality_score_threshold` with no compared quality between them (BAM qualities + 0 and 20 from overlapping mates; MAPQ cap). Result delivered under the asked-for key. Stock GATK digests identical for every class tested (2 datasets) |
+| GATK servers: persistent JVMs (`gatk_patch` MinosServer, `GatkRunner` server pool) | a worker's JVM runs job after job, so only its first job pays class loading and JIT warm-up: stock GATK full round on one core 162 s cold vs 119-127 s warm; on the self-test slice a sequence of 8 jobs took 163 s vs 334 s cold. Before/after each job every static the patch keeps is reset (`Utils.minosResetAll`: generators, overrides, activity hook, cap report). Server vs cold: identical outputs (see gatk.py). Every 40th solo server run is also run cold and compared (`MINOS_SERVER_VERIFY`); a failing server is replaced and the job runs cold; a server leaves by itself after 10 min without a job (a finished review's executor would otherwise leave 8 idle JVMs per round); `MINOS_GATK_SERVER=0` = off |
+| Learned haplotype cap | the patch reports per output the smallest `max_num_haplotypes_in_population` that reproduces it (`.minos.kbest`); a run no k-best search of which hit its cap is reused for every cap >= that. Exact, but only fires when no region reaches the cap (the slice: 72; round 20261004T092900Z: the default 128 is reached somewhere, so nothing is learned) |
+
+Scheduling on this machine's real speed: every cold run records real seconds / table seconds; the deadline uses the
+90th percentile of the last 30 (`stats()["scale"]`, ~2.07 on a 6-core i7 with 10 workers), for a whole family, while
+packing stays in table seconds. `stats()["timeline"]` (and the log) records each minute's busy/idle workers, queue,
+held jobs, callsets being scored and what search submitted - the first thing to read when workers sit idle.
 
 Rejected after measuring (not exact, or no gain): GVCF re-genotyping, QUAL projection, native Java outside the
 image, interval restriction, scatter-gather, JVM heap/GC tuning, uncompressed BAM, no phasing.

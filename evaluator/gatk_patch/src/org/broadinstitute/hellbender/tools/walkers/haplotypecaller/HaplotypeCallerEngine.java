@@ -822,7 +822,13 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         }
 
         // run the local assembler, getting back a collection of information on how we should proceed
-        final AssemblyResultSet untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader, samplesList, logger, referenceReader, assemblyEngine, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities, hcArgs.fbargs, false);
+        final AssemblyResultSet untrimmedAssemblyResult;
+        org.broadinstitute.hellbender.utils.MinosKBest.setKey("-1|" + minosAssemblyKey(hcArgs));   // minos: cap report
+        try {
+            untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader, samplesList, logger, referenceReader, assemblyEngine, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities, hcArgs.fbargs, false);
+        } finally {
+            org.broadinstitute.hellbender.utils.MinosKBest.setKey(null);
+        }
         minosCallAssemblyVariants(region, features, referenceContext, givenAlleles);
         ReadThreadingAssembler.addAssembledVariantsToEventMapOutput(untrimmedAssemblyResult, assembledEventMapVariants, hcArgs.maxMnpDistance, assembledEventMapVcfOutputWriter);
 
@@ -1216,8 +1222,17 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
                     Files.write(Paths.get(v.output + ".minos.regions"), v.regionLog);
                 }
                 Files.write(Paths.get(v.output + ".minos"), (v.diverged ? "diverged\n" : "exact\n").getBytes());
+                Files.write(Paths.get(v.output + ".minos.kbest"), minosKBestReport(minosKBestKey(v)).getBytes());
             } catch (final IOException e) {
                 throw new UserException("cannot write status for " + v.output, e);
+            }
+        }
+        final String kbestOut = System.getProperty("minos.kbest.out");
+        if (kbestOut != null) {
+            try {
+                Files.write(Paths.get(kbestOut), minosKBestReport("-1|" + minosAssemblyKey(hcArgs)).getBytes());
+            } catch (final IOException e) {
+                throw new UserException("cannot write " + kbestOut, e);
             }
         }
         minosWarmServe();
@@ -1627,6 +1642,19 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         }
     }
 
+    /** minos: MinosKBest's report, or "unknown" when the run did not search every region with the stock finder. */
+    private String minosKBestReport(final String key) {
+        if (minosRepairLog != null || hcArgs.assemblerArgs.useLinkedDeBruijnGraph) {
+            return "unknown\n";
+        }
+        return org.broadinstitute.hellbender.utils.MinosKBest.report(key);
+    }
+
+    /** minos: the MinosKBest key of the assembly a variant's calls come from (its regions, its assembly settings). */
+    private static String minosKBestKey(final MinosGenotypingVariant v) {
+        return v.stream + "|" + minosAssemblyKey(v.args);
+    }
+
     private static String minosAssemblyKey(final HaplotypeCallerArgumentCollection a) {
         return a.assemblerArgs.minPruneFactor + "|" + a.assemblerArgs.minDanglingBranchLength + "|"
                 + a.assemblerArgs.recoverAllDanglingBranches + "|" + a.assemblerArgs.maxNumHaplotypesInPopulation + "|"
@@ -1681,9 +1709,15 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
                                         final ReferenceContext referenceContext, final List<Event> givenAlleles,
                                         final ReadThreadingAssembler groupAssembler,
                                         final List<MinosGenotypingVariant> members) {
-        final AssemblyResultSet untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader,
-                samplesList, logger, referenceReader, groupAssembler, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities,
-                hcArgs.fbargs, false);
+        final AssemblyResultSet untrimmedAssemblyResult;
+        org.broadinstitute.hellbender.utils.MinosKBest.setKey(minosKBestKey(members.get(0)));   // minos: cap report
+        try {
+            untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader,
+                    samplesList, logger, referenceReader, groupAssembler, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities,
+                    hcArgs.fbargs, false);
+        } finally {
+            org.broadinstitute.hellbender.utils.MinosKBest.setKey(null);
+        }
         final Pair<Set<Event>, Set<Event>> goodAndBadPileupEvents =
                 PileupBasedAlleles.goodAndBadPileupEvents(region.getAlignmentData(), hcArgs.pileupDetectionArgs, readsHeader, hcArgs.minBaseQualityScore);
         final Set<Event> goodPileupEvents = goodAndBadPileupEvents.getLeft();
