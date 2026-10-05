@@ -73,23 +73,30 @@ runs the extra configs ("variants") inside one run and writes one VCF per varian
   open (`run_batch(..., warm=True)` runs warm-style without keeping the JVM, kept for experiments); the search also
   never proposes padding below 5 (never in the top 200 of 7,067 true-scored configs).
 
-### Lanes: throughput vs latency
+### Batch size: small vs big
 
-Every job carries a lane (`EvalJob.lane`, set by the search through `client.propose_many(..., lane=...)`):
+Every job says how big its batch may get (`EvalJob.batch`, set by the search through
+`client.propose_many(..., batch=...)`):
 
-- **throughput** (default): packed up to 32 configs and the batch time cap, run on the node with the largest free
-  share. Scouts, families, anything whose result is not waited on.
-- **latency**: a result the search waits for (a climbing step). It is always the head of its own batch, takes
-  only riders cheaper than 2% of a run (genotyping variants), never rides in another batch, and goes to the fastest
-  free node that has its round. A fleet's nodes differ up to 4-5x per worker; the critical path should not land on
-  the slow ones.
+- **big** (default): packed with other queued configs that share its GATK traversal, up to 32 configs and
+  `BIG_BATCH` = 2.3 solo runs of work in total, run on the node with the largest free share. Wave 0, the scout,
+  riders: nothing waits on one of them.
+- **small**: a result the search waits for (a climbing move, a merge child, a generation child, a midpoint test). It
+  is always the head of its own batch, holds at most `SMALL_BATCH` = 1.3 solo runs of work in total (itself plus
+  cheap riders such as its genotyping and PairHMM siblings), never rides in another batch, and goes to the fastest
+  free node that has its round, or to the fastest free slow node when no fast one has a free worker. Packing
+  structural variants of one centre in one batch runs them one after another on one worker - 30 assembly variants
+  take ~16 run-times - which is why a waited-for result must stay small.
+
+Both limits are total work, the head included, in the node's own solo time (`evaluator/local.py`; the coordinator
+and the simulator use the same constants). `MAX_BATCH_S` is the big limit in planning seconds (2.3 x 132 s).
 
 Each node's solo-run time is measured from its finished batches (an EMA of wall time / predicted cost units;
 `FleetExecutor.nodes()` shows `solo_s`) and scales that node's batch cap and rider costs; the planning constant
 `SOLO_S` (132 s) is only the starting value.
 
-A late latency run is not waited for. Width is cheap and latency is not, so while the fleet has a worker to spare
-(nothing queued could use it) a latency group that has run longer than 1.5x its expected time on its node, or that a
+A late small batch is not waited for. Width is cheap and latency is not, so while the fleet has a worker to spare
+(nothing queued could use it) a small batch that has run longer than 1.5x its expected time on its node, or that a
 free faster node could redo before its node is expected to finish, is duplicated there - same head, same riders.
 The first result wins; the other node kills its run (`abort_jobs`: the executor's `cancel_running`, the runner's
 `kill_configs`) and reports nothing for it. `FleetExecutor.stats()` counts `speculated` and `speculation_won`.

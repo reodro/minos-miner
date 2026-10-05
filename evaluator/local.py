@@ -24,8 +24,9 @@ DIVERGED = "minos:diverged"   # same marker as evaluator.gatk.DIVERGED (kept her
 SOLO_S = 132.0                # one full GATK run at production load
 REPAIR_S = 34.0               # a diverged variant's repair run
 WARM_S = SOLO_S * 0.011       # genotyping one variant in a JVM that already walked the family
-MAX_BATCH_S = 4.5 * 60        # split a family that would run longer than this and leave the rest queued
-LATENCY_RIDER_MAX = 0.02      # a latency-lane batch admits only riders this cheap (a genotyping variant: 0.011)
+SMALL_BATCH = 1.3             # a small batch holds at most this much work, in solo runs: its head and cheap siblings
+BIG_BATCH = 2.3               # a big batch at most this much: packed, yet never a long serial tail on one worker
+MAX_BATCH_S = BIG_BATCH * SOLO_S   # no batch runs longer: a family beyond it is split and the rest stays queued
 MNH = "max_num_haplotypes_in_population"
 CLOCK_WINDOW = 30             # recent runs the deadline estimate is taken from
 CLOCK_QUANTILE = 0.9          # ... and how pessimistic it is (a run this slow or slower is 1 in 10)
@@ -400,7 +401,7 @@ class LocalExecutor:
                 continue
             batch, seconds = [job], main_s
             bk = self._branch(job)
-            cap_s = LATENCY_RIDER_MAX * SOLO_S if job.lane == "latency" else float("inf")   # cheap riders only
+            limit_s = (SMALL_BATCH if job.batch == "small" else BIG_BATCH) * SOLO_S
             if bk is not None:
                 keep = []
                 while self._queue:
@@ -408,11 +409,11 @@ class LocalExecutor:
                     other = item[2]
                     extra = None
                     if (len(batch) < self.max_batch and other.job_id not in self._cancelled
-                            and other.lane != "latency"                     # a latency job is always its own head
+                            and other.batch != "small"                      # a small batch is always its own head
                             and other.round.round_id == job.round.round_id and self._branch(other) == bk
                             and (not served or self._served_warm(other))):
                         extra = extra_seconds(self.runner, job, other, self._learned_extra)
-                        if extra is not None and extra > cap_s:
+                        if extra is not None and seconds + extra > limit_s:
                             extra = None
                     if extra is not None and seconds + extra <= room:
                         batch.append(other)

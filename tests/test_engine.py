@@ -1,14 +1,14 @@
 import random
 import unittest
 
-from common.types import AnswerSet, Config, Regime, Round, Variant
+from common.types import AnswerSet, Regime, Round, Variant
 from evaluator import FakeRunner, FakeScorer, SimExecutor
 from main import DryRunSubmitter, LoopSettings, run_round
-from search.axes import DOMINANT_LEVELS, AxisBook, design_wave, structural_names
-from search.basins import Basin
-from search.families import genotyping_riders, pairhmm_riders
-from search.ranker import Ranker
+from search.axes import AxisBook, latin_hypercube
 from search.space import GENOTYPING_PARAMS, Space
+from search import genetic
+from search.climber import ACCEPT_MIN, DECISIVE, Climber
+from search.hills import Hills
 import search.engine as engine
 from tests.helpers import ranges
 
@@ -23,214 +23,198 @@ class Stub:
         return a
 
 
-def virtual_round(cap, minutes=72, seed=0, duration=150.0, crashes=None, hills=1):
+def virtual_round(cap, minutes=72, hills=1, duration=150.0, crashes=None):
     r = ranges()
-    runner = FakeRunner(r, seed=seed, batching=True, hills=hills)
-    ex = SimExecutor(runner, cap, duration=lambda job: duration, crashes=crashes or (lambda job: False))
+    runner = FakeRunner(r, seed=0, batching=True, hills=hills)
+    dur = duration if callable(duration) else (lambda job: duration)
+    ex = SimExecutor(runner, cap, duration=dur, crashes=crashes or (lambda job: False))
     out = run_round(ROUND, Stub(), ex, FakeScorer(runner), engine.searcher(r, cap), DryRunSubmitter(), r,
                     LoopSettings(stop_before_deadline_s=60), baselines=[r.defaults("gatk")], deadline_ts=minutes * 60)
     return out, ex
 
 
-class AxesTest(unittest.TestCase):
-    def test_design_wave_balances_levels_and_stays_valid(self):
-        space = Space(ranges())
-        cells = design_wave(space, random.Random(0), 60, [space._assemble({})])
-        self.assertGreaterEqual(len(cells), 55)
-        counts = {}
-        for c in cells:
-            counts[c.params["min_pruning"]] = counts.get(c.params["min_pruning"], 0) + 1
-        self.assertEqual(set(counts), set(DOMINANT_LEVELS["min_pruning"]))
-        self.assertLessEqual(max(counts.values()) - min(counts.values()), 5)
-        self.assertEqual(len({c.key for c in cells}), len(cells))
-
-    def test_axis_book_learns_cliffs_and_parks_dead_axes(self):
-        space = Space(ranges())
-        book = AxisBook(space)
-        # moves above the base-quality cliff fail: nothing is proposed past the lowest failing value
-        book.note_move("min_base_quality_score", 45, 30, None, failed=True, now=0.0)
-        book.note_move("min_base_quality_score", 42, 30, None, failed=True, now=0.0)
-        self.assertFalse(book.allowed("min_base_quality_score", 43))
-        self.assertTrue(book.allowed("min_base_quality_score", 40))
-        # an axis whose moves change nothing is parked, then retested later
-        for _ in range(8):
-            book.note_move("max_reads_per_alignment_start", 60, 50, 0.0, failed=False, now=100.0)
-        self.assertNotIn("max_reads_per_alignment_start", book.live(now=100.0))
-        self.assertIn("max_reads_per_alignment_start", book.live(now=100.0 + 601))
-        # a winning move widens the step, repeated failures narrow it
-        step0 = book.axes["assembly_region_padding"].step
-        book.note_move("assembly_region_padding", 60, 50, 0.05, failed=False, now=0.0)
-        self.assertGreater(book.axes["assembly_region_padding"].step, step0)
+def setup():
+    space = Space(ranges())
+    book = AxisBook(space)
+    names = list(space.names)
+    return space, book, names
 
 
-class FarAxesTest(unittest.TestCase):
-    def test_counts_axes_more_than_a_tenth_of_their_range_apart(self):
-        from search.axes import far_axes
-        space = Space(ranges())
+class HillsTest(unittest.TestCase):
+    def test_one_rule_for_distance_ownership_and_clusters(self):
+        space, book, names = setup()
+        hills = Hills(space, lambda: names)
         a = space._assemble({})
-        b = space._assemble({"min_pruning": 6, "assembly_region_padding": 13, "min_mapping_quality_score": 21,
-                             "pcr_indel_model": "NONE"})
-        names = ["min_pruning", "assembly_region_padding", "min_mapping_quality_score", "pcr_indel_model",
-                 "min_dangling_branch_length"]
-        self.assertEqual(far_axes(space, names, a, b), 3)       # pruning 2->6 (4 of 8), padding 100->13, the enum; mapq 20->21 is near
-        self.assertEqual(far_axes(space, names, a, a), 0)
+        near = space._assemble({"min_pruning": 4, "assembly_region_padding": 20})
+        far = space._assemble({"min_pruning": 6, "assembly_region_padding": 300, "min_mapping_quality_score": 50,
+                               "pcr_indel_model": "NONE", "max_assembly_region_size": 650})
+        self.assertTrue(hills.same(a, near))
+        self.assertFalse(hills.same(a, far))
+        self.assertEqual(hills.owner(near, {7: a}), 7)
+        self.assertIsNone(hills.owner(far, {7: a}))
+        picked = hills.cluster([(a, 90.0), (near, 89.9), (far, 89.8)], 6, band=0.5)
+        self.assertEqual([c.key for c, _ in picked], [a.key, far.key])        # near is on a's hill
 
 
-class WidthTest(unittest.TestCase):
-    def test_structural_riders_and_screens_change_the_right_axes(self):
-        from search.families import STRUCTURAL, screen_moves, structural_riders
-        space = Space(ranges())
-        base = space._assemble({})
+class GeneticTest(unittest.TestCase):
+    def test_merge_children_are_every_combination_when_few_settings_differ(self):
+        space, book, names = setup()
+        a = space._assemble({})
+        b = space._assemble({"min_pruning": 4, "assembly_region_padding": 300, "min_mapping_quality_score": 50})
+        kids = genetic.merge_children(space, a, b, random.Random(0), names, n_mutated=0)
+        self.assertEqual(len(kids), 2 ** 3 - 2)                                 # every proper subset, parents excluded
+        for c in kids:
+            diff = genetic.differing(space, names, a, c)
+            self.assertTrue(set(diff) <= {"min_pruning", "assembly_region_padding", "min_mapping_quality_score"})
+        mutated = genetic.merge_children(space, a, b, random.Random(0), names, n_mutated=20)
+        self.assertGreater(len(mutated), len(kids))
+
+    def test_merge_children_sample_when_many_settings_differ(self):
+        space, book, names = setup()
+        rng = random.Random(1)
+        cells = latin_hypercube(space, rng, 2)
+        kids = genetic.merge_children(space, cells[0], cells[1], rng, names, n_random=40, n_mutated=0)
+        self.assertGreater(len(genetic.differing(space, names, cells[0], cells[1])), genetic.EXHAUSTIVE_MAX)
+        self.assertTrue(10 < len(kids) <= 40)
+
+    def test_a_generation_keeps_several_hills(self):
+        space, book, names = setup()
+        rng = random.Random(2)
+        hills = Hills(space, lambda: names)
+        pool = [(c, 90.0 - 0.01 * i) for i, c in enumerate(latin_hypercube(space, rng, 120))]
+        kids = genetic.generation(space, pool, rng, 200, hills, names)
+        self.assertGreaterEqual(len(kids), 150)
+        self.assertEqual(len({c.key for c in kids}), len(kids))
+
+
+class ClimberTest(unittest.TestCase):
+    def make(self):
+        space, book, names = setup()
+        geno = [a for a in GENOTYPING_PARAMS if a in space.names]
+        live = book.live(0.0) + geno
+        d = Climber(0, space, book, space._assemble({}), 88.0, 0.0, extra_axes=geno)
+        return space, d, live
+
+    def drain(self, d, moves, score):
+        for m in moves:
+            d.take()
+            d.consider(m, True, m.config, score(m), False, 1.0)
+
+    def test_best_of_sweep_with_the_other_winners_reapplied(self):
+        space, d, live = self.make()
         rng = random.Random(0)
-        kids = structural_riders(space, base, 4, rng)
-        self.assertEqual(len(kids), 4)
-        for k in kids:
-            changed = [n for n in space.names if k.params.get(n) != base.params.get(n)]
-            self.assertTrue(1 <= len(changed) <= 2 and all(n in STRUCTURAL for n in changed), changed)
-        names = [n for n in space.names if n not in GENOTYPING_PARAMS]
-        screens = screen_moves(space, base, rng, 6, names)
-        self.assertGreaterEqual(len(screens), 4)
-        for c in screens:
-            changed = [n for n in names if c.params.get(n) != base.params.get(n)]
-            self.assertTrue(3 <= len(changed) <= 8, changed)      # several axes at once
+        moves = d.refill(live, rng, 500)
+        self.assertEqual({m.kind for m in moves}, {"n1", "n2"})
+        small = next(m for m in moves if m.axes == ("assembly_region_padding",))
+        big = next(m for m in moves if m.axes == ("min_mapping_quality_score",))
+        for m in moves:
+            d.take()
+        d.consider(small, True, small.config, 88.0 + 2 * ACCEPT_MIN, False, 1.0)
+        d.consider(big, True, big.config, 88.0 + 4 * ACCEPT_MIN, False, 1.0)
+        self.assertEqual(d.best, 88.0)                                          # waits for the sweep
+        for m in moves:
+            if m is not small and m is not big:
+                d.consider(m, True, m.config, 87.0, False, 1.0)
+        self.assertEqual(d.centre.key, big.config.key)
+        self.assertIn(("reapply", {"assembly_region_padding": small.config.params["assembly_region_padding"]}), d.queued)
+        self.assertGreater(d.progress(2.0), 0)
 
-
-class FamiliesTest(unittest.TestCase):
-    def test_riders_differ_from_the_base_in_one_cheap_axis(self):
-        space = Space(ranges())
-        base = space._assemble({})
-        kids = genotyping_riders(space, base, 24)
-        self.assertGreaterEqual(len(kids), 12)
-        for k in kids:
-            changed = [n for n in space.names if k.params.get(n) != base.params.get(n)]
-            self.assertEqual(len(changed), 1)
-            self.assertIn(changed[0], GENOTYPING_PARAMS)
-        self.assertEqual(len({k.key for k in kids}), len(kids))
-        pair = pairhmm_riders(space, base, 6)
-        self.assertGreaterEqual(len(pair), 4)
-        self.assertTrue(all("pcr_indel_model" in c.params for c in pair))
-
-
-class BasinTest(unittest.TestCase):
-    def test_climb_accepts_better_moves_and_merges_winners(self):
-        space = Space(ranges())
-        book = AxisBook(space)
-        centre = space._assemble({})
-        b = Basin(0, space, book, centre, 80.0, 0.0, 0.0)
-        n = b.refill(random.Random(0), [], now=0.0, want_pairs=0)   # no pairs: a pair tried first would own the merge's config
-        self.assertGreater(n, 50)
-        kinds = {m.kind for m in b.pool}
-        self.assertTrue({"step", "probe"} <= kinds)
-        m1 = next(m for m in b.pool if m.kind == "step" and m.axes == ("assembly_region_padding",))
-        m2 = next(m for m in b.pool if m.kind == "step" and m.axes == ("min_mapping_quality_score",))
-        b.pool.remove(m1); b.pool.remove(m2)
-        b.inflight, b.gen_sent = 2, 2                                             # the sweep: these two moves
-        self.assertFalse(b.consider(m2, m2.config, 80.03, False, now=1.0))     # a winner, but half the sweep is out
-        self.assertTrue(b.consider(m1, m1.config, 80.045, False, now=1.5))     # sweep back: the best of it is the centre
-        self.assertEqual(b.centre.key, m1.config.key)
-        self.assertEqual(b.pool, [])
-        b.refill(random.Random(1), [], now=2.0, want_pairs=0)
-        merges = [m for m in b.pool if m.kind == "merge"]                        # the other winner rides on the new centre
-        self.assertTrue(merges)
-        self.assertIn("min_mapping_quality_score", merges[0].axes)
-        self.assertTrue(all(m.priority == 0 for m in merges))
-        # a gain below the answer set's resolution is not an improvement; a decisive one does not wait
-        m3 = b.take()
-        self.assertFalse(b.consider(m3, m3.config, b.best + 0.004, False, now=3.0))
-        m4 = b.take()
-        self.assertTrue(b.consider(m4, m4.config, b.best + 0.06, False, now=3.5))
-
-    def test_transplants_copy_axes_from_another_basin(self):
-        space = Space(ranges())
-        book = AxisBook(space)
-        a = Basin(0, space, book, space._assemble({}), 80.0, 0.0, 0.0)
-        other = space._assemble({"min_mapping_quality_score": 59, "assembly_region_padding": 13})
-        a.refill(random.Random(0), [other], now=0.0)
-        tr = [m for m in a.pool if m.kind == "transplant"]
-        self.assertTrue(any(m.axes == ("min_mapping_quality_score",) for m in tr))
-        self.assertTrue(any(set(m.axes) == {"assembly_region_padding", "min_mapping_quality_score"} for m in tr))
-
-
-class RankerTest(unittest.TestCase):
-    def test_ranks_known_good_region_first_once_fitted(self):
-        r = ranges()
-        space = Space(r)
-        runner = FakeRunner(r, batching=True)
-        rk = Ranker(space, n_trees=20, min_points=20)
+    def test_coarse_then_fine_then_perturbation_then_exhausted(self):
+        space, d, live = self.make()
         rng = random.Random(0)
-        for _ in range(120):
-            c = space.random(rng)
-            q = runner.quality(c)
-            rk.add(c, 0.5 + 0.4 * q, 5.0 * (1 - q))
-        rk.fit()
-        self.assertTrue(rk.ready)
-        cands = [space.random(rng) for _ in range(40)]
-        order = rk.rank(cands, best=0.0)
-        top, bottom = [runner.quality(cands[i]) for i in order[:10]], [runner.quality(cands[i]) for i in order[-10:]]
-        self.assertGreater(sum(top) / 10, sum(bottom) / 10)
+        moves = d.refill(live, rng, 500)
+        self.drain(d, moves, lambda m: 87.0)                                    # nothing wins anywhere
+        moves = d.refill(live, rng, 500)
+        self.assertEqual(d.mode, "fine")
+        self.assertIn("n3", {m.kind for m in moves})
+        seen_perturb = False
+        for _ in range(60):
+            self.drain(d, moves, lambda m: 87.0)
+            moves = d.refill(live, rng, 500)
+            seen_perturb = seen_perturb or d.state == "perturb"
+            if d.state == "exhausted":
+                break
+        self.assertTrue(seen_perturb)
+        self.assertEqual(d.state, "exhausted")
+        self.assertEqual(d.best, 88.0)
 
+    def test_perturbation_accepts_better_or_equal(self):
+        space, d, live = self.make()
+        rng = random.Random(0)
+        d.mode, d.state, d.cycle, d.cycle_sent, d.fresh = "fine", "perturb", 0, 0, False
+        pts = d.refill(live, rng, 30)
+        self.assertTrue(pts and all(m.kind == "shake" for m in pts))
+        self.drain(d, pts, lambda m: 88.0 if m is pts[0] else 87.0)            # one shaken point ties the centre
+        local = d.refill(live, rng, 30)
+        self.assertTrue(local and all(m.kind == "local" for m in local))
+        self.drain(d, local, lambda m: 87.0)
+        nxt = d.refill(live, rng, 30)                                          # equal: the centre moves (ParamILS)
+        self.assertEqual(d.centre.key, pts[0].config.key)
+        self.assertEqual(d.state, "climb")
+        self.assertTrue(nxt)
 
-class CapacityTest(unittest.TestCase):
-    def test_a_fleets_capacity_is_read_once_its_nodes_have_joined(self):
-        import asyncio
-        from unittest import mock
+    def test_offer_and_decisive_gains(self):
+        space, d, live = self.make()
+        rng = random.Random(0)
+        other = space._assemble({"min_pruning": 3})
+        self.assertFalse(d.offer(other, 88.0 + ACCEPT_MIN / 2, 1.0))
+        self.assertTrue(d.offer(other, 88.1, 1.0))
+        self.assertEqual(d.progress(2.0), 0.0)                                  # a taken point is not own progress
+        d.refill(live, rng, 500)
+        m = d.take()
+        self.assertTrue(d.consider(m, True, m.config, 88.1 + 2 * DECISIVE, False, 2.0))
 
-        class Fleet:                                  # nodes join over the first polls; the last one is slow
-            def __init__(self):
-                self.calls = 0
-
-            def nodes(self):                          # a node still joining holds the wait even when the count is still
-                joining = self.calls < 9
-                return [{"ready": True, "rejected": ""}, {"ready": not joining, "rejected": ""}, {"ready": False, "rejected": "old code"}]
-
-            def capacity(self):
-                self.calls += 1
-                return [0, 0, 300, 300, 300, 300, 300, 300, 300, 700, 700, 700][min(self.calls, 11)]
-
-        fleet = Fleet()
-        client = mock.Mock(executor=fleet, capacity=fleet.capacity)
-        with mock.patch.multiple(engine, CAPACITY_WAIT_S=5.0, CAPACITY_SETTLE_S=0.25, CAPACITY_POLL_S=0.05):
-            cap = asyncio.run(engine.settled_capacity(client, 14))
-        self.assertEqual(cap, 700)
-        local = mock.Mock(executor=object(), capacity=lambda: 14)       # no nodes(): a local executor answers at once
-        self.assertEqual(asyncio.run(engine.settled_capacity(local, 8)), 14)
+    def test_siblings_are_one_genotyping_and_one_pairhmm_step(self):
+        space, d, live = self.make()
+        moves = d.refill(live, random.Random(0), 500)
+        pad = next(m for m in moves if m.axes == ("assembly_region_padding",))
+        sibs = d.siblings(pad, random.Random(0))
+        self.assertEqual(len(sibs), 2)
 
 
 class EngineRoundTest(unittest.TestCase):
-    def test_small_fleet_climbs_all_round_and_fills_the_workers(self):
-        out, ex = virtual_round(16)
-        self.assertEqual(out.failed, 0)
+    def test_big_fleet_two_hills_runs_the_whole_pipeline(self):
+        with self.assertLogs("search.engine", level="INFO") as logs:
+            out, ex = virtual_round(950, minutes=72, hills=2)
+        text = "\n".join(logs.output)
+        for i in range(4):
+            self.assertIn(f"wave {i} ", text)                                   # wave 0 + three generations
+        self.assertIn("founding at", text)
+        self.assertIn("merge 0", text)
+        self.assertIn("final at", text)
+        self.assertIn("plateau-centre pick", text)
         self.assertGreater(ex.utilization(), 0.9)
-        opening = max(r.score for (k, fid), r in out.callsets.items() if False) if False else None
-        self.assertGreater(out.best.score, 91.0)                # the fake landscape's seeds score ~90
-        self.assertGreater(out.evaluated, 1500)                 # riders: many configs per traversal
+        self.assertGreater(out.best.score, 94.5)
+        pick = [l for l in logs.output if "plateau-centre pick" in l][0].split("pick ")[1].split(" ")[0]
+        self.assertEqual(out.submissions[-1][1], pick)                         # main submitted the search's pick
+        for l in logs.output:                                                   # at most 3 domains from minute 40
+            if " domains " in l and "t+" in l:
+                t = float(l.split("t+")[1].split("m")[0])
+                if 41 <= t < 61:
+                    doms = l.split("domains ")[1].split(" | ")[0].split()
+                    self.assertLessEqual(len([x for x in doms if not x.endswith("/m")]), 3, l)
 
-    def test_big_fleet_races_several_basins(self):
+    def test_small_fleet(self):
         with self.assertLogs("search.engine", level="INFO") as logs:
-            out, ex = virtual_round(950, minutes=30)
-        text = "\n".join(logs.output)
-        self.assertIn("4 basins max", text)
-        self.assertGreaterEqual(text.count(" born at "), 3)
+            out, ex = virtual_round(16, minutes=72)
+        self.assertGreater(ex.utilization(), 0.9)
+        self.assertGreater(out.best.score, 92.0)
+        self.assertIn("final at", "\n".join(logs.output))
+
+    def test_a_slow_tail_does_not_hold_the_opening(self):
+        heavy = lambda job: 540.0 if int(job.config.key[:2], 16) % 10 < 3 else 150.0
+        with self.assertLogs("search.engine", level="INFO") as logs:
+            out, ex = virtual_round(950, minutes=30, duration=heavy)
+        founding = [l for l in logs.output if "founding at" in l][0]
+        self.assertLessEqual(float(founding.split("t+")[1].split("m")[0]), 8.4)  # 14 min scaled to 30 + one run (virtual time)
         self.assertGreater(ex.utilization(), 0.85)
-        self.assertGreater(out.evaluated, 20000)
-
-    def test_two_hills_give_two_basins_after_a_valley_test(self):
-        with self.assertLogs("search.engine", level="INFO") as logs:
-            out, ex = virtual_round(950, minutes=40, hills=2)
-        text = "\n".join(logs.output)
-        self.assertIn("a valley between", text)
-        self.assertGreaterEqual(text.count(" born at "), 2)
-        self.assertGreater(out.best.score, 91.0)
-        last = [l for l in logs.output if " basins " in l][-1]                 # the leader holds the best found
-        leader = max(float(x.split(":")[1].split("/")[0]) for x in last.split("basins ")[1].split(" | ")[0].split())
-        self.assertGreaterEqual(leader, out.best.score - 0.3)
 
     def test_crashes_are_counted_and_not_fatal(self):
-        bad = lambda job: int(job.config.key[:2], 16) % 8 == 0           # ~12% of configs crash, at random
+        bad = lambda job: int(job.config.key[:2], 16) % 8 == 0
         out, ex = virtual_round(16, minutes=40, crashes=bad)
         self.assertGreater(out.failed, 0)
         self.assertEqual(sum(out.failures.values()), out.failed)
-        self.assertGreater(out.best.score, 90.5)                       # the climb goes on around the crashes
+        self.assertGreater(out.best.score, 90.5)
 
 
 if __name__ == "__main__":

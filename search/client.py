@@ -60,6 +60,7 @@ class EvalClient:
         self.on_rescore: List[Callable[[], None]] = []
         self._best: Dict[str, ScoreResult] = {}                     # fidelity -> best scored result so far
         self.notes: Dict[str, object] = {}                          # what the search wants shown (dashboard)
+        self.pick_key: Optional[str] = None                         # the config the search wants submitted (None: the best)
 
     # ---- strategy-facing API -------------------------------------------------------------------------------
     def time_left(self) -> Optional[float]:
@@ -71,23 +72,23 @@ class EvalClient:
         return self.budget is not None and self.spent >= self.budget
 
     def propose(self, config: Config, *, fidelity: str = FULL, priority: int = 0, tag: str = "",
-                lane: str = "throughput") -> asyncio.Future:
-        return self.propose_many([config], fidelity=fidelity, priority=priority, tag=tag, lane=lane)[0]
+                batch: str = "big") -> asyncio.Future:
+        return self.propose_many([config], fidelity=fidelity, priority=priority, tag=tag, batch=batch)[0]
 
     def propose_many(self, configs: Iterable[Config], *, fidelity: str = FULL, priority: int = 0,
-                    tag: str = "", lane: str = "throughput",
-                    lanes: Optional[Sequence[str]] = None) -> List[asyncio.Future]:
+                    tag: str = "", batch: str = "big",
+                    batches: Optional[Sequence[str]] = None) -> List[asyncio.Future]:
         """Several configs in ONE executor call, so related ones (a family: same config except cheap
         parameters) are queued together and can share one GATK run. Budget: each is charged the executor's
         cost for it as part of this group (a batch rider costs a fraction of a full run).
-        `lane`: "latency" for a result the search is waiting on (run on the fastest free node, cheap riders only),
-        "throughput" (default) for everything else (packed fully, run anywhere). `lanes`: one lane per config
-        instead (a latency head with throughput riders in the same call, so they queue together and pack)."""
+        `batch`: "small" for a result the search is waiting on (its batch holds at most its cheap riders), "big"
+        (default) to pack freely. `batches`: one value per config (a small head whose siblings are "big" riders).
+        """
         loop = asyncio.get_running_loop()
         futs, jobs = [], []
         configs = list(configs)
-        per_config = list(lanes) if lanes is not None else [lane] * len(configs)
-        for config, lane in zip(configs, per_config):
+        per_config = list(batches) if batches is not None else [batch] * len(configs)
+        for config, batch in zip(configs, per_config):
             fut = loop.create_future()
             futs.append(fut)
             errs = self.ranges.errors(config)
@@ -99,7 +100,7 @@ class EvalClient:
                 fut.set_result(Outcome(config, cached, None, tag))
                 continue
             jobs.append((fut, EvalJob(f"{self.round.tag}-j{next(self._ids)}", self.round, config, fidelity, priority, tag,
-                                      lane)))
+                                      batch)))
         if not jobs:
             return futs
         hints = getattr(self.executor, "cost_hints", None)
@@ -139,6 +140,10 @@ class EvalClient:
 
     def best(self, fidelity: str = FULL) -> Optional[ScoreResult]:
         return self._best.get(fidelity)
+
+    def picked(self) -> Optional[ScoreResult]:
+        """The scored result of the config the search picked for submission (pick_key), or None."""
+        return self.latest.get((self.pick_key, FULL)) if self.pick_key else None
 
     def _note_best(self, r: ScoreResult) -> None:
         if r.score is None or r.gate_passed is False:

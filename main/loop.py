@@ -87,8 +87,15 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         if best is None:
             return
         out.best = best
+        pick = client.picked()                    # the search's own pick (a plateau centre) goes out as it is
         key = submitted[0]
-        if best.config_key == key:
+        if pick is not None and pick.config_key != key:
+            if submitter.submit(round, client.configs[pick.config_key]):
+                submitted[0] = pick.config_key
+                last_submit[0] = clock()
+                out.submissions.append((clock(), pick.config_key, pick.score))
+            return
+        if pick is not None or best.config_key == key:
             return
         if key is not None and not force and clock() - last_submit[0] < settings.resubmit_interval_s:
             return                            # the first submission is never delayed; later ones wait

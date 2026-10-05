@@ -1,22 +1,25 @@
-"""The search engine: asynchronous basin climbing. Owner: search.
+"""The search engine (v4): a global genetic opening, ParamILS climbs on up to six hills, merges by recombination. Owner: search.
 
-One streaming loop with no barriers. A round allows only ~15-20 dependent steps (a GATK traversal is minutes under
-load) and as much width as the fleet has, so every step is as wide as the free workers allow and an improvement is
-used the moment it arrives:
+  opening     wave 0 = seeds + a Latin hypercube over every setting (4 threshold riders each), sent while the answer
+              set is still being built; then GENERATIONS genetic generations with niching (genetic.py), each launched
+              once GEN_BACK of the previous one is back or workers sit idle (no barrier). Stops early when a
+              generation gains less than GEN_MIN_GAIN
+  founding    the hill registry (hills.py) groups the good configs into hills; one domain per hill, up to N_DOMAINS
+  climb       every domain runs iterated local search (climber.py); winning settings are shared between domains
+              every SHARE_EVERY_S; the scout keeps SCOUT_SHARE of the workers on the whole space for the whole round
+  merges      one operation everywhere: pairing (every combination of the settings where two centres differ, when
+              few) plus a genetic generation of the two (genetic.merge_children); the best of parents and children is
+              the merged domain's centre, which inherits both parents' tested configs and steps. Merges happen
+                - on evidence, at any time: two domains on one hill, or a frozen domain on a live one's hill
+                - on schedule: closest pairs first from REDUCE_TO_3[0] so at most 3 domains remain at REDUCE_TO_3[1];
+                  all remaining domains at REDUCE_TO_1[0] (a three-way merge) so one remains for the final
+  final       the last FINAL_S on one point: halving single steps and all pairs, one last pairing with the runner-up,
+              and the plateau-centre pick: among configs within PICK_BAND of the best, the one whose neighbours score
+              highest (client.pick_key; main submits it)
 
-  opening     seeds (GATK default, the official seed, earlier rounds' bests) + a designed wave over the dominant
-              axes (axes.design_wave), every skeleton with a genotyping family as riders
-  basins      k regions (MIN_FAR live axes apart, a valley between them confirmed by one midpoint run; k from the
-              fast nodes' capacity), each climbed asynchronously; born freely in the opening, later only by a leader
-              (basins.py): a move is dispatched whenever this basin has a free worker, in the latency lane; an
-              accept re-centres at once
-  scouts      a share of the width keeps exploring (crossover and mutations of the basins' bests, unrun design
-              cells, a few random configs), ranked by the (core, FP) forest; a scout that beats the weakest basin
-              by a margin births a basin, if it is a region of its own
-  finish      the last minutes: dense genotyping + PairHMM families on the best skeletons, half steps only
-
-Every count scales with the executor's capacity, so a 16-worker replay and a 2,000-worker fleet run the same code.
-Main submits the local best; the engine never submits.
+One controller pass after every batch of results (and at least every TICK_S) decides everything from facts: what is
+in flight, each domain's progress rate (own gain per minute over the last 10 minutes), the registry. Schedule times
+are fractions of the search's time, set for a 72-minute round.
 """
 from __future__ import annotations
 
@@ -29,40 +32,40 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from common.params import ParamRanges
 from common.types import FULL, Config
-from search.axes import AxisBook, design_wave, far_axes, rms_distance
+from search.axes import AxisBook, far_axes, latin_hypercube
 from search.base import Strategy
-from search.basins import Basin, Move
 from search.client import EvalClient, Outcome
-from search.families import genotyping_riders, pairhmm_riders, screen_moves, structural_riders
+from search.families import genotyping_riders
 from search.ranker import Ranker
-from search.space import Space, bam_caps
+from search.space import GENOTYPING_PARAMS, Space, bam_caps
+from search import genetic
+from search.climber import ACCEPT_MIN, Climber, Move
+from search.hills import MIN_FAR, Hills
 
 log = logging.getLogger(__name__)
-TRACE = False                 # print every fill decision (debugging on the virtual clock)
 
-RADIUS = 0.15                 # basins this far apart (RMS unit distance over structural axes) are distinct regions
-MIN_FAR = 4                   # ... and now: on at least this many live axes far apart (> 10% of the range)
-OPENING_S = 12 * 60           # basins are born freely only this long; later a newcomer must lead the best
-LEAD_MARGIN = 0.05            # ... by this much (and sit on a confirmed hill of its own)
-WORTH_A_HILL = 0.5            # a candidate this far below the best is not worth a valley test (the legacy margin)
-FAST_FACTOR = 1.5             # nodes within this factor of the fastest are the climbing lane's capacity
-BIRTH_UNTIL_S = 15 * 60       # no new basin in the last 15 min (it could not be climbed in time)
-FINISH_S = 8 * 60             # the finish phase
-RETIRE_BEHIND = 0.10          # a basin this far behind the leader after its patience is retired
-RETIRE_PATIENCE_S = 12 * 60
-BIRTH_MARGIN = 0.02           # a candidate must beat the weakest basin by this to replace it
-REPLACE_AGE_S = 5 * 60        # ... and that basin must have had its chance: this old, or stalled for STALL_S
-STALL_S = 4 * 60
-MOVES_PER_BASIN = 200         # moves in flight per basin on a big fleet: sets how many basins the fleet races
-MAX_BASINS = 12
-SCOUT_SHARE, SCOUT_SHARE_LATE = 0.25, 0.15
-RIDERS, RIDERS_SCOUT, RIDERS_SMALL = 8, 4, 6      # genotyping riders: the threshold sweep, the indel prior, contamination
-STRUCTURAL_RIDERS = 4                             # a scout's family: structurally different configs in its traversal
-SCREEN_S = FINISH_S + 10 * 60                     # the last stretch: multi-axis screens around the peak take the width
+ROUND_S = 72 * 60                    # the schedule below is written for this much search time; it scales with it
+GENERATIONS = 3
+GEN_BACK = 0.6                       # a generation launches once this share of the previous wave is back
+GEN_IDLE = 0.25                      # ... or this share of the workers is idle with half of it back
+GEN_MIN_GAIN = 0.05                  # a generation gaining less than this ends the opening early
+WAVE_BACK = 0.8
+OPENING_MAX_S = 14 * 60
+N_DOMAINS = 6
+WORTH_A_HILL = 0.5                   # no domain is founded this far below the best
+REDUCE_TO_3 = (34 * 60, 40 * 60)     # scheduled merges start / at most 3 domains
+REDUCE_TO_1 = (56 * 60, 62 * 60)     # the three-way merge starts / one domain
+FINAL_S = 10 * 60
+MERGE_BACK = 0.8
+MERGE_CLOSE, MIDPOINT_RETEST_S = 0.02, 10 * 60
+SHARE_EVERY_S, SHARE_AXES = 5 * 60, 3
+SCOUT_SHARE, SCOUT_KAPPA = 0.15, 1.0
+RIDERS_WAVE0, RIDERS_GLOBAL = 4, 2
+PICK_BAND, PICK_NEAR, PICK_MIN, PICK_S = 0.05, 2, 3, 90.0
+TICK_S = 2.0
 SMALL_FLEET = 64
-CAPACITY_WAIT_S, CAPACITY_SETTLE_S, CAPACITY_POLL_S = 120.0, 20.0, 5.0   # a fleet's nodes join in the first minute
 
-# A known strong config (official 88.163 on 2026-09-28 09:29): a seed, never a claim about the next round.
+# Known strong configs (a seed is a start, never a claim about the round).
 OFFICIAL_SEED = {
     "min_base_quality_score": 16, "min_mapping_quality_score": 46, "base_quality_score_threshold": 22,
     "standard_min_confidence_threshold_for_calling": 80.0, "pcr_indel_model": "NONE", "min_pruning": 2,
@@ -72,7 +75,6 @@ OFFICIAL_SEED = {
     "phred_scaled_global_read_mismapping_rate": 45, "heterozygosity": 0.002154, "indel_heterozygosity": 0.000125,
     "contamination_fraction_to_filter": 0.04, "max_reads_per_alignment_start": 116,
 }
-# The family shape that won our 2026-10-02 test round locally (its basin, not its exact values).
 FAMILY_SEED = {
     "min_base_quality_score": 35, "min_mapping_quality_score": 8, "base_quality_score_threshold": 37,
     "standard_min_confidence_threshold_for_calling": 74.0, "pcr_indel_model": "AGGRESSIVE", "min_pruning": 2,
@@ -85,36 +87,42 @@ FAMILY_SEED = {
 
 @dataclass
 class Unit:
-    """One proposal: a head skeleton and its riders."""
-    role: str                                   # seed | design | scout | move | finish
+    role: str                        # wave | scout | move | merge | midpoint
     head: Config
-    basin: Optional[int] = None
+    domain: Optional[int] = None
     move: Optional[Move] = None
-    best: Optional[float] = None
-    best_config: Optional[Config] = None
+    merge: Optional[int] = None
+    wave: int = 0
 
 
-async def settled_capacity(client: EvalClient, workers: int) -> int:
-    """The workers the round has. A fleet's nodes join during the first minute (self-test, bundle push), so the
-    first number seen would size a 1,000-worker fleet as a one-basin search: wait until the count has stood still
-    for CAPACITY_SETTLE_S (at most CAPACITY_WAIT_S). Local and virtual executors answer at once."""
+@dataclass
+class MergeJob:
+    id: int
+    parents: List[int]
+    why: str
+    sent: int = 0
+    back: int = 0
+    best: Optional[Tuple[Config, float]] = None
+    started: float = 0.0
+
+
+async def settled_capacity(client: EvalClient, workers: int, wait_s: float = 120.0, settle_s: float = 20.0) -> int:
+    """The workers the round has, once a fleet's nodes have joined (local and virtual executors answer at once)."""
     cap = client.capacity()
     nodes = getattr(client.executor, "nodes", None)
-    if nodes is None:                                          # not a fleet: its workers, now
+    if nodes is None:
         return cap or workers or 8
-    t0 = time.time()
-    stable_since = t0
-    while time.time() - t0 < CAPACITY_WAIT_S:
-        await asyncio.sleep(CAPACITY_POLL_S)
+    t0 = stable = time.time()
+    while time.time() - t0 < wait_s:
+        await asyncio.sleep(5.0)
         c = client.capacity() or 0
         if c != cap:
-            cap, stable_since = c, time.time()
+            cap, stable = c, time.time()
             continue
-        joining = [n for n in nodes() if not n["ready"] and not n["rejected"]]   # still in its self-test or push
-        if cap and not joining and time.time() - stable_since >= CAPACITY_SETTLE_S:
+        joining = [n for n in nodes() if not n["ready"] and not n["rejected"]]
+        if cap and not joining and time.time() - stable >= settle_s:
             break
-    log.info("engine: fleet capacity settled at %d workers after %.0f s (%d nodes ready)", cap or 0,
-             time.time() - t0, sum(1 for n in nodes() if n["ready"]))
+    log.info("engine: fleet capacity settled at %d workers after %.0f s", cap or 0, time.time() - t0)
     return cap or workers or 8
 
 
@@ -124,46 +132,38 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
     async def run(client: EvalClient) -> None:
         r = client.round
         caps = bam_caps(r.bam, r.chrom, r.start, r.end) if r.bam else {}
-        space = Space(ranges, tool, caps=caps)                 # the round's space: its data bounds the axes
-        if caps:
-            log.info("engine: caps from the round's BAM: %s", caps)
+        space = Space(ranges, tool, caps=caps)
         book = AxisBook(space)
         ranker = Ranker(space, seed=seed)
         clock = client.clock
         t0 = clock()
         cap = await settled_capacity(client, workers)
-        small = cap < SMALL_FLEET
-        riders = RIDERS_SMALL if small else RIDERS
-        riders_scout = max(2, RIDERS_SMALL // 2) if small else RIDERS_SCOUT
-
-        def fast_capacity() -> int:
-            """Workers on the nodes within FAST_FACTOR of the fastest: a sweep is as slow as its slowest move, so
-            the climbing lane is sized to them (a lone machine, or a virtual executor: everything)."""
-            nodes = getattr(client.executor, "nodes", None)
-            rows = [n for n in (nodes() if nodes else []) if n.get("ready") and n.get("workers")]
-            if not rows:
-                return cap
-            fastest = min(n["solo_s"] for n in rows)
-            return sum(n["workers"] for n in rows if n["solo_s"] <= FAST_FACTOR * fastest) or cap
-
-        fast_cap = fast_capacity()
-        k_max = 1 if small else max(1, min(MAX_BASINS, round(fast_cap * (1 - SCOUT_SHARE) / MOVES_PER_BASIN)))
+        tl = client.time_left()
+        scale_t = (tl if tl is not None and tl > 0 else ROUND_S) / ROUND_S     # the schedule follows the round's length
+        T = lambda s: s * scale_t
+        n_domains = max(1, min(N_DOMAINS, cap // 8))
         virtual = hasattr(client.executor, "now")
-        pending: Dict[asyncio.Future, Tuple[Unit, bool]] = {}      # future -> (unit, is_head)
+        genotyping = [a for a in GENOTYPING_PARAMS if a in space.names]
+
+        pending: Dict[asyncio.Future, Tuple[Unit, bool]] = {}
         proposed: Set[str] = set()
-        basins: Dict[int, Basin] = {}
-        next_basin = [0]
-        candidates: Dict[str, Tuple[Config, float]] = {}            # basin candidates: key -> (config, family best)
-        retired_centres: List[Tuple[Config, float]] = []           # where retired basins ended, and their bests
-        was_centre: Set[str] = set()                                # candidate keys that already seeded a basin
-        valley: Dict[str, Tuple[Config, float, int]] = {}          # midpoint key -> (candidate, its score, basin id)
-        valley_done: Set[str] = set()                               # candidate keys already tested
-        inflight_scouts = [0]
-        scout_queue: List[Config] = []                              # ranked scouts waiting for a slot
-        design_left: List[Config] = []
+        domains: Dict[int, Climber] = {}
+        status: Dict[int, str] = {}                  # live | merging | retired
+        merges: Dict[int, MergeJob] = {}
+        ids = [0, 0]                                 # next domain id, next merge id
+        candidates: Dict[str, Tuple[Config, float]] = {}
+        was_centre: Set[str] = set()
+        wave_heads: List[int] = []                   # heads sent per wave (0 = hypercube, 1.. = generations)
+        wave_back: List[int] = []
+        wave_best: List[float] = []                  # best score seen when each wave launched
+        st = {"founded": False, "gens_done": False, "r3": False, "r3_done": False, "r1": False, "final": False,
+              "last_share": 0.0, "last_log": t0, "scouts": 0, "runner_up": None, "picked": False}
+        midpoint: Dict[str, Tuple[int, int]] = {}
+        find_test: Dict[str, Tuple[Config, float, int]] = {}     # midpoint key -> (scout find, its score, nearest domain)
+        find_done: Set[str] = set()                              # finds already tested
+        tested_pair: Dict[Tuple[int, int], float] = {}
+        scout_queue: List[Config] = []
         fitting: List[Optional[asyncio.Task]] = [None]
-        finish_sent = [False]
-        last_log = [t0]
         wake = asyncio.Event()
         client.on_result.append(lambda _o: wake.set())
 
@@ -176,407 +176,522 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         def fresh(c: Optional[Config]) -> bool:
             return c is not None and c.key not in proposed and (c.key, FULL) not in client.latest
 
-        def live() -> List[Basin]:
-            return [b for b in basins.values() if not b.retired]
+        def names() -> List[str]:
+            return book.live(clock()) + genotyping
 
-        def leader() -> Optional[Basin]:
-            lb = live()
-            return max(lb, key=lambda b: b.best) if lb else None
+        hills = Hills(space, names)
 
-        def best_known() -> float:
+        def live() -> List[Climber]:
+            return [d for i, d in domains.items() if status[i] == "live" and d.state != "exhausted"]
+
+        def standing() -> List[Climber]:
+            return [d for i, d in domains.items() if status[i] != "retired"]
+
+        def centres(which: Sequence[Climber]) -> Dict[int, Config]:
+            return {d.id: d.centre for d in which}
+
+        def owner_of(c: Config) -> Optional[int]:
+            return hills.owner(c, centres([d for i, d in domains.items() if status[i] == "live"]))
+
+        def top() -> float:
             return max((s for _, s in candidates.values()), default=0.0)
 
-        def scout_target() -> int:
-            t = left()
-            share = SCOUT_SHARE_LATE if (t is not None and t < FINISH_S + 10 * 60) else SCOUT_SHARE
-            return max(1, int(cap * share)) if live() else cap
-
-        # ---- proposing ---------------------------------------------------------------------------------------
-        def propose(unit: Unit, rider_configs: Sequence[Config], priority: int, lane: str) -> int:
-            batch = [unit.head] + [c for c in rider_configs if fresh(c)]
-            batch = [c for c in batch if fresh(c) or c is unit.head]
+        # ---- proposing ----------------------------------------------------------------------------------------------
+        def propose(unit: Unit, kids: Sequence[Config], priority: int) -> int:
+            batch = [unit.head] + [c for c in kids if fresh(c)]
+            if not fresh(unit.head) and unit.role != "move":
+                batch = batch[1:]
             if not batch:
                 return 0
-            lanes = [lane] + ["throughput"] * (len(batch) - 1)            # riders pack into the head's batch
-            futs = client.propose_many(batch, priority=priority, tag=f"{tag}:{unit.role}", lanes=lanes)
+            kind = unit.move.kind if unit.move is not None else unit.role
+            # a result the search waits on (a move, a merge child, a generation child, a midpoint or valley test) is a
+            # small batch: one config per worker, in parallel, carrying only its cheap siblings. Wave 0 and the scout
+            # pack freely (big): nothing waits on any single one of them.
+            small = unit.role in ("move", "merge", "midpoint", "findtest") or (unit.role == "wave" and unit.wave > 0)
+            batches = [("small" if small else "big")] + ["big"] * (len(batch) - 1)
+            if batch[0] is not unit.head:
+                batches = ["big"] * len(batch)
+            futs = client.propose_many(batch, priority=priority, tag=f"{tag}:{kind}", batches=batches)
             for c, f in zip(batch, futs):
                 proposed.add(c.key)
-                if f.done():                                   # cached by the client: handle it on the next pass
-                    pending[f] = (unit, c is unit.head)
-                else:
-                    pending[f] = (unit, c is unit.head)
+                pending[f] = (unit, c is unit.head)
             return len(futs)
 
-        def propose_skeleton(role: str, head: Config, n_riders: int, priority: int, lane: str,
-                             basin: Optional[Basin] = None, move: Optional[Move] = None) -> bool:
-            unit = Unit(role, head, basin.id if basin else None, move)
-            kids = genotyping_riders(space, head, n_riders, fresh)
-            if role in ("seed", "design", "scout"):              # width: a family of structural variants per traversal
-                kids += structural_riders(space, head, STRUCTURAL_RIDERS, rng, fresh)
-            sent = propose(unit, kids, priority, lane)
-            if TRACE:
-                print(f"   propose {role}: {sent} futures, {len(kids)} riders, head fresh={fresh(head)} idle_after={client.idle_slots()}")
-            if sent == 0:
-                return False
-            if basin is not None:
-                pass                                         # basin.inflight was counted by take()
-            elif role != "finish":
-                inflight_scouts[0] += 1
-            return True
+        def send_global(c: Config, role: str, riders: int, priority: int, wave: int = 0) -> bool:
+            return propose(Unit(role, c, wave=wave), genotyping_riders(space, c, riders, fresh), priority) > 0
 
-        def opening() -> None:
-            seeds: List[Config] = []
-            for params in ({}, OFFICIAL_SEED, FAMILY_SEED):
-                c = space._assemble(dict(params))
-                if c is not None and all(c.key != s.key for s in seeds):
-                    seeds.append(c)
+        # ---- opening --------------------------------------------------------------------------------------------
+        def seeds() -> List[Config]:
+            out: List[Config] = []
+            for p in ({}, OFFICIAL_SEED, FAMILY_SEED):
+                c = space._assemble(dict(p))
+                if c is not None and all(c.key != x.key for x in out):
+                    out.append(c)
             for raw in client.store.portfolio(limit=max(4, cap // 20), tool=tool):
                 c = space._assemble(dict(raw.params))
-                if c is not None and all(c.key != s.key for s in seeds):
-                    seeds.append(c)
-            n_design = max(0, cap - len(seeds))
-            cells = design_wave(space, rng, n_design, seeds[:3])
-            for c in seeds:
-                propose_skeleton("seed", c, riders, 5, "throughput")
-            design_left.extend(cells)
-            log.info("engine: capacity %d (%d on the fast nodes) -> %d basins max, %d riders; %d seeds, %d design cells",
-                     cap, fast_cap, k_max, riders, len(seeds), len(cells))
-
-        def scout_candidates(n: int) -> List[Config]:
-            out: List[Config] = []
-            while design_left and len(out) < n:
-                c = design_left.pop(0)
-                if fresh(c):
+                if c is not None and all(c.key != x.key for x in out):
                     out.append(c)
-            if len(out) >= n:
-                return out
-            bests = [b.centre for b in live()]
-            if not bests:
-                bests = [c for c, _ in sorted(candidates.values(), key=lambda t: -t[1])[:4]]
-            pool: List[Config] = []
-            names = book.names
-            t_left = left()
-            if bests and t_left is not None and t_left < SCREEN_S:   # the last stretch: screens around the peaks
-                ld = leader()
-                tops = [ld.centre] if ld is not None else []
-                tops += [c for c, _ in sorted(candidates.values(), key=lambda t: -t[1])[:3] if all(c.key != x.key for x in tops)]
-                for top in tops:
-                    pool += screen_moves(space, top, rng, max(1, n // max(1, len(tops))), book.live(clock()), fresh)
-            tries = 0
-            while len(pool) < 4 * n and tries < 20 * n:
-                tries += 1
-                r = rng.random()
-                if r < 0.10 or not bests:
-                    c = space.random(rng)
-                elif r < 0.45 and len(bests) >= 2:
-                    a, b = rng.sample(bests, 2)
-                    params = dict(a.params)
-                    for name in names:
-                        if rng.random() < 0.5:
-                            params[name] = b.params.get(name, space.specs[name].default)
-                    c = space._assemble(params)
-                    if c is not None and rng.random() < 0.3:
-                        c = space.neighbour(c, rng, n_params=2, scale=0.2, pool=names) or c
-                elif r < 0.85:
-                    c = space.neighbour(rng.choice(bests), rng, n_params=rng.randint(1, 3), scale=0.2, pool=names)
-                else:
-                    base = rng.choice(bests)
-                    name = rng.choice(names)
-                    spec = space.specs[name]
-                    if spec.allowed or spec.type == "bool":
-                        continue
-                    params = dict(base.params)
-                    params[name] = space._from_unit(spec, 0.0 if rng.random() < 0.5 else 1.0)
-                    c = space._assemble(params)
-                if c is None or not fresh(c) or any(c.key == p.key for p in pool):
-                    continue
-                if not all(book.allowed(a, c.params.get(a)) for a in names):
-                    continue
-                pool.append(c)
-            if ranker.ready and pool:
-                lb = leader()
-                order = ranker.rank(pool, best=lb.best if lb else 0.0)
-                pool = [pool[i] for i in order]
-            out.extend(pool[:n - len(out)])
             return out
 
-        def finish_round() -> None:
-            """Dense families on the best skeletons of every surviving basin, and the top candidates."""
-            finish_sent[0] = True
-            tops: List[Config] = [b.centre for b in sorted(live(), key=lambda b: -b.best)]
-            for c, _ in sorted(candidates.values(), key=lambda t: -t[1])[:max(1, cap // 40)]:
-                if all(rms_distance(space, book.names, c, t) > 1e-9 for t in tops):
-                    tops.append(c)
-            n = 0
-            for c in tops[:max(1, cap // 40)]:
-                kids = genotyping_riders(space, c, riders, fresh) + pairhmm_riders(space, c, 6, fresh)
-                unit = Unit("finish", c)
-                n += propose(unit, kids, 2, "throughput")
-            for a in book.axes.values():                    # the last steps are half steps
-                a.step = max(0.02, a.step * 0.5)
-            log.info("engine: finish at t+%.1fm: %d rider configs on %d skeletons", elapsed() / 60, n, len(tops))
+        def launch_wave(configs: Sequence[Config], riders: int, label: str) -> None:
+            w = len(wave_heads)
+            wave_heads.append(0); wave_back.append(0); wave_best.append(top())
+            for c in configs:
+                if send_global(c, "wave", riders, 5 if w == 0 else 4, wave=w):
+                    wave_heads[w] += 1
+            log.info("engine: wave %d (%s) at t+%.1fm: %d points", w, label, elapsed() / 60, wave_heads[w])
 
+        def opening_step() -> None:
+            if st["founded"]:
+                return
+            w = len(wave_heads) - 1
+            back = wave_back[w] / max(1, wave_heads[w])
+            idle = client.idle_slots()
+            if elapsed() >= T(OPENING_MAX_S):                  # the opening's limit is hard: found now
+                st["gens_done"] = True
+                found()
+                return
+            if not st["gens_done"]:
+                can = back >= GEN_BACK or (back >= 0.5 and idle is not None and idle >= GEN_IDLE * cap)
+                if can and len(candidates) >= 4:
+                    if w >= 2 and top() - wave_best[w] < GEN_MIN_GAIN:        # the last generation gained too little
+                        st["gens_done"] = True
+                        log.info("engine: generations stop after %d (last gained %.3f) t+%.1fm", w, top() - wave_best[w],
+                                 elapsed() / 60)
+                    else:
+                        children = [c for c in genetic.generation(space, list(candidates.values()), rng, cap, hills, names())
+                                    if fresh(c)]
+                        launch_wave(children, RIDERS_GLOBAL, f"generation {w + 1}")
+                        st["gens_done"] = len(wave_heads) - 1 >= GENERATIONS
+                return
+            if back >= WAVE_BACK or not pending:
+                found()
+
+        def found() -> None:
+            st["founded"] = True
+            ranked = sorted(candidates.values(), key=lambda t: -t[1])
+            for c, s in hills.cluster(ranked, n_domains, WORTH_A_HILL):
+                birth(c, s, "the opening")
+            log.info("engine: founding at t+%.1fm: %d domains from %d scored configs (waves %s)", elapsed() / 60,
+                     len(live()), len(candidates), " ".join(f"{b}/{h}" for b, h in zip(wave_back, wave_heads)))
+
+        def birth(c: Config, s: float, why: str, parents: Sequence[Climber] = ()) -> Climber:
+            d = Climber(ids[0], space, book, c, s, clock(), owner_of, extra_axes=genotyping)
+            ids[0] += 1
+            for p in parents:
+                d.inherit(p.tried, p.steps, p.axis_gain)
+                if p.mode == "fine":
+                    d.mode = "fine"
+            domains[d.id], status[d.id] = d, "live"
+            was_centre.add(c.key)
+            log.info("engine: domain %d born at %.4f (%s) t+%.1fm", d.id, s, why, elapsed() / 60)
+            return d
+
+        # ---- merges -----------------------------------------------------------------------------------------------
+        def start_merge(parents: List[Climber], why: str) -> None:
+            parents = sorted(parents, key=lambda d: -d.best)
+            for p in parents:
+                status[p.id] = "merging"
+                p.pool = []
+            mj = MergeJob(ids[1], [p.id for p in parents], why, started=clock(),
+                          best=(parents[0].centre, parents[0].best))
+            ids[1] += 1
+            merges[mj.id] = mj
+            if len(parents) == 2:
+                kids = genetic.merge_children(space, parents[0].centre, parents[1].centre, rng, names())
+            else:
+                kids = genetic.merge3_children(space, [p.centre for p in parents], rng, names())
+            tried = set().union(*(p.tried for p in parents))
+            kids = [c for c in kids if c.key not in tried and fresh(c)]
+            limit = max(24, cap // 4)                       # one wave's worth on a big fleet, a few on a small one
+            if len(kids) > limit:
+                kids = rng.sample(kids, limit)
+            for c in kids:
+                if c.key in tried or not fresh(c):
+                    continue
+                if propose(Unit("merge", c, merge=mj.id), [], 6):
+                    mj.sent += 1
+            log.info("engine: merge %d (%s): domains %s at %s, %d children, t+%.1fm", mj.id, why,
+                     ",".join(str(p.id) for p in parents), " ".join(f"{p.best:.4f}" for p in parents), mj.sent,
+                     elapsed() / 60)
+            if mj.sent == 0:
+                resolve(mj)
+
+        def resolve(mj: MergeJob) -> Climber:
+            merges.pop(mj.id, None)
+            parents = [domains[i] for i in mj.parents]
+            pool = [(p.centre, p.best, f"domain {p.id}") for p in parents]
+            if mj.best is not None:
+                pool.append((mj.best[0], mj.best[1], "a child"))
+            c, s, src = max(pool, key=lambda t: t[1])
+            for p in parents:
+                status[p.id] = "retired"
+            rest = sorted((p for p in parents if p.centre.key != c.key), key=lambda p: -p.best)
+            if rest:
+                st["runner_up"] = rest[0].centre
+            d = birth(c, s, f"merge {mj.id}, {mj.why}: best from {src}, {mj.back}/{mj.sent} children back", parents)
+            return d
+
+        def same_hill_pairs(which: Sequence[Climber]) -> List[Tuple[int, Climber, Climber]]:
+            out = []
+            for i, a in enumerate(which):
+                for b in which[i + 1:]:
+                    out.append((hills.distance(a.centre, b.centre), a, b))
+            return sorted(out, key=lambda t: t[0])
+
+        def test_midpoint(a: Climber, b: Climber) -> None:
+            p = dict(a.centre.params)
+            for n in names():
+                s = space.specs[n]
+                if s.allowed or s.type == "bool":
+                    continue
+                u = (space._to_unit(s, a.centre.params.get(n, s.default)) + space._to_unit(s, b.centre.params.get(n, s.default))) / 2
+                p[n] = space._from_unit(s, u)
+            mid = space._assemble(p)
+            tested_pair[(a.id, b.id)] = clock()
+            if mid is not None and fresh(mid) and propose(Unit("midpoint", mid), [], 6):
+                midpoint[mid.key] = (a.id, b.id)
+
+        def test_find(c: Config, s: float) -> None:
+            """One run halfway between a scout find and the nearest domain: a dip means a hill of its own."""
+            find_done.add(c.key)
+            sd = [d for d in standing()]
+            if not sd:
+                birth(c, s, "a scout find")
+                return
+            d = min(sd, key=lambda x: hills.distance(x.centre, c))
+            p = dict(c.params)
+            for n in names():
+                spec = space.specs[n]
+                if spec.allowed or spec.type == "bool":
+                    continue
+                u = (space._to_unit(spec, c.params.get(n, spec.default)) + space._to_unit(spec, d.centre.params.get(n, spec.default))) / 2
+                p[n] = space._from_unit(spec, u)
+            mid = space._assemble(p)
+            if mid is not None and fresh(mid) and propose(Unit("findtest", mid), [], 5):
+                find_test[mid.key] = (c, s, d.id)
+
+        def judge_find(key: str, mid_score: Optional[float]) -> None:
+            item = find_test.pop(key, None)
+            if item is None:
+                return
+            c, s, did = item
+            d = domains.get(did)
+            ref = d.best if d is not None else s
+            if mid_score is None or mid_score < min(s, ref) - ACCEPT_MIN:          # a valley: a hill of its own
+                if elapsed() < T(REDUCE_TO_3[0]) and len(live()) + len(merges) < n_domains:
+                    birth(c, s, f"a scout find, valley at {mid_score if mid_score is not None else 'a failed run'}")
+            elif d is not None and status[d.id] == "live" and d.offer(c, s, clock()):
+                log.info("engine: domain %d -> %.4f, a scout find on its hill (midpoint %.4f) t+%.1fm", d.id, s,
+                         mid_score, elapsed() / 60)
+
+        def judge_midpoint(key: str, score: Optional[float]) -> None:
+            pair = midpoint.pop(key, None)
+            if pair is None:
+                return
+            a, b = domains.get(pair[0]), domains.get(pair[1])
+            if a is None or b is None or status[a.id] != "live" or status[b.id] != "live":
+                return
+            if score is not None and score >= min(a.best, b.best) - ACCEPT_MIN:
+                start_merge([a, b], f"one hill by midpoint {score:.4f}")
+
+        # ---- the controller ------------------------------------------------------------------------------------------
+        def control() -> None:
+            now = clock()
+            # merges that are back
+            for mj in list(merges.values()):
+                if mj.back >= MERGE_BACK * mj.sent:
+                    resolve(mj)
+            # frozen domains: merge into a live domain on the same hill, else retire (their best stays a candidate)
+            for d in [x for i, x in domains.items() if status[i] == "live" and x.state == "exhausted"]:
+                others = [x for x in live() if x is not d]
+                near = min(others, key=lambda x: hills.distance(x.centre, d.centre), default=None)
+                if near is not None and hills.same(near.centre, d.centre):
+                    start_merge([near, d], "a frozen domain on a live one's hill")
+                else:
+                    status[d.id] = "retired"
+                    log.info("engine: domain %d retired at %.4f (its climb is exhausted) t+%.1fm", d.id, d.best, elapsed() / 60)
+            # evidence: two domains on one hill
+            lv = [d for d in live() if d.state != "final"]
+            busy: Set[int] = set()
+            for dist, a, b in same_hill_pairs(lv):
+                if a.id in busy or b.id in busy:
+                    continue
+                if dist < MIN_FAR:
+                    start_merge([a, b], f"one hill, {dist} settings apart")
+                    busy |= {a.id, b.id}
+                elif abs(a.best - b.best) <= MERGE_CLOSE and dist < MIN_FAR + 2 and \
+                        now - tested_pair.get((a.id, b.id), -1e9) > MIDPOINT_RETEST_S:
+                    test_midpoint(a, b)
+            # schedule: at most 3 from REDUCE_TO_3[1]
+            if elapsed() >= T(REDUCE_TO_3[0]) and not st["r3"]:
+                st["r3"] = True
+                lv = live()
+                count = len(lv) + len(merges)
+                taken: Set[int] = set()
+                for dist, a, b in same_hill_pairs(lv):
+                    if count <= 3:
+                        break
+                    if a.id in taken or b.id in taken:
+                        continue
+                    start_merge([a, b], f"scheduled 6 to 3, {dist} settings apart")
+                    taken |= {a.id, b.id}
+                    count -= 1
+            if elapsed() >= T(REDUCE_TO_3[1]) and not st["r3_done"]:
+                st["r3_done"] = True
+                for mj in list(merges.values()):
+                    resolve(mj)
+                lv = live()
+                if len(lv) > 3:
+                    holder = max(lv, key=lambda d: d.best)
+                    rest = sorted((d for d in lv if d is not holder), key=lambda d: (-d.progress(now), -d.best))
+                    for d in rest[2:]:
+                        status[d.id] = "retired"
+                        log.info("engine: domain %d (%.4f, progress %.4f/min) dropped to keep 3 t+%.1fm", d.id, d.best,
+                                 d.progress(now), elapsed() / 60)
+            # schedule: one domain for the final
+            if elapsed() >= T(REDUCE_TO_1[0]) and not st["r1"]:
+                st["r1"] = True
+                for mj in list(merges.values()):
+                    resolve(mj)
+                lv = live()
+                if len(lv) > 1:
+                    start_merge(lv, "scheduled 3 to 1")
+            # free slots, until the scheduled merges begin: the scout's finds on hills nobody climbs
+            if st["founded"] and elapsed() < T(REDUCE_TO_3[0]) and len(live()) + len(merges) < n_domains:
+                ranked = sorted(candidates.values(), key=lambda t: -t[1])
+                cs = centres(standing())
+                weakest = min((d.best for d in live()), default=float("-inf"))
+                for c, s in ranked:
+                    if s < max(top() - WORTH_A_HILL, weakest) or len(find_test) >= 4:
+                        break                                  # a find below every domain is not worth a domain
+                    if c.key in was_centre or c.key in find_done or hills.owner(c, cs) is not None:
+                        continue
+                    test_find(c, s)                            # a new hill only if a valley separates it
+            # sharing between domains: their strongest settings, offered as moves
+            if now - st["last_share"] >= SHARE_EVERY_S and len(live()) > 1:
+                st["last_share"] = now
+                for d in live():
+                    for a in sorted(d.axis_gain, key=lambda x: -d.axis_gain[x])[:SHARE_AXES]:
+                        v = d.centre.params.get(a)
+                        for e in live():
+                            if e is not d and not space._same(space.specs[a], e.centre.params.get(a), v):
+                                e.queue("share", {a: v})
+            # the final
+            t = left()
+            if not st["final"] and st["founded"] and (t is not None and t < T(FINAL_S) or elapsed() >= T(REDUCE_TO_1[1])):
+                final_round()
+            if st["final"] and not st["picked"] and t is not None and t < PICK_S:
+                pick()
+
+        def final_round() -> None:
+            st["final"] = True
+            for mj in list(merges.values()):
+                resolve(mj)
+            sd = standing()
+            if not sd:
+                return
+            win = max(sd, key=lambda d: d.best)
+            others = sorted((d for d in sd if d is not win), key=lambda d: -d.best)
+            for d in others:
+                status[d.id] = "retired"
+            if st["runner_up"] is None and others:
+                st["runner_up"] = others[0].centre
+            status[win.id] = "live"
+            win.state = "climb"
+            win.start_final()
+            if st["runner_up"] is not None:
+                ru = st["runner_up"]
+                diff = genetic.differing(space, names(), win.centre, ru)
+                if 0 < len(diff) <= genetic.EXHAUSTIVE_MAX:
+                    for c in genetic.merge_children(space, win.centre, ru, rng, names(), n_mutated=0):
+                        win.queue("pairing", {n: c.params.get(n) for n in diff})
+            log.info("engine: final at t+%.1fm on domain %d (%.4f)%s", elapsed() / 60, win.id, win.best,
+                     ", with a pairing against the runner-up" if st["runner_up"] is not None else "")
+
+        def pick() -> None:
+            """The plateau-centre pick: among configs within PICK_BAND of the best, the one whose neighbours (at most
+            PICK_NEAR settings apart) score highest - the middle of the plateau, least exposed to the answer set's blur."""
+            st["picked"] = True
+            ranked = sorted(candidates.values(), key=lambda t: -t[1])
+            if not ranked:
+                return
+            best = ranked[0][1]
+            near_top = [(c, s) for c, s in ranked if s >= best - PICK_BAND][:60]
+            pool = ranked[:600]
+            chosen, chosen_v = ranked[0][0], None
+            for c, s in near_top:
+                nb = [s2 for c2, s2 in pool if c2.key != c.key and far_axes(space, space.names, c, c2) <= PICK_NEAR]
+                if len(nb) < PICK_MIN:
+                    continue
+                v = sum(nb) / len(nb)
+                if chosen_v is None or v > chosen_v:
+                    chosen, chosen_v = c, v
+            client.pick_key = chosen.key
+            log.info("engine: plateau-centre pick %s (%.4f; best %.4f; neighbour mean %s) t+%.1fm", chosen.key,
+                     candidates.get(chosen.key, (None, 0.0))[1], best,
+                     f"{chosen_v:.4f}" if chosen_v is not None else "n/a", elapsed() / 60)
+
+        # ---- the scout ------------------------------------------------------------------------------------------------
+        def scout_pick(n: int) -> List[Config]:
+            cs = centres(standing())
+            pool = [c for c in latin_hypercube(space, rng, 2 * n) if fresh(c) and hills.owner(c, cs) is None]
+            cents = list(cs.values())
+            for _ in range(n):                                 # crossovers between the bests of different hills
+                if len(cents) < 2:
+                    break
+                a, b = rng.sample(cents, 2)
+                c = genetic.uniform_child(space, a, b, rng, names())
+                if c is not None and rng.random() < genetic.MUTATE_FRAC:
+                    c = genetic.mutate(space, c, rng, names()) or c
+                if fresh(c):
+                    pool.append(c)
+            if ranker.ready and pool:
+                mean, spread = ranker.predict(pool)
+                order = sorted(range(len(pool)), key=lambda i: -(mean[i] + SCOUT_KAPPA * spread[i]))
+                pool = [pool[i] for i in order]
+            return pool[:n]
+
+        def send_scout(idle: Optional[int]) -> bool:
+            if not scout_queue:
+                scout_queue.extend(scout_pick(max(1, min(64, idle or 64))))
+            while scout_queue:
+                c = scout_queue.pop(0)
+                if fresh(c) and send_global(c, "scout", RIDERS_GLOBAL, 1):
+                    st["scouts"] += 1
+                    return True
+            return False
+
+        # ---- allocation ------------------------------------------------------------------------------------------------
         def fill() -> int:
             n = 0
+            now = clock()
             while not client.exhausted:
                 idle = client.idle_slots()
                 if idle is not None and idle <= 0:
                     break
                 if idle is None and len(pending) >= cap:
                     break
-                t = left()
-                if t is not None and t < FINISH_S:
-                    if not finish_sent[0]:
-                        finish_round()
-                        n += 1
-                        continue
-                lb = live()
-                want_scouts = scout_target()
-                picked = None
-                if TRACE:
-                    print(f"fill t+{elapsed()/60:.1f}m idle={idle} scouts={inflight_scouts[0]}/{want_scouts} basins="
-                          + " ".join(f"{b.id}:pool{len(b.pool)}/inflight{b.inflight}/gen{b.generation}/refilled{b.refilled_generation}" for b in lb))
-                if lb and inflight_scouts[0] >= want_scouts:
-                    ready = [b for b in lb if b.pool or (b.wants_refill()
-                                                         and b.refill(rng, [o.centre for o in lb if o is not b], clock(), ranker))]
+                if not st["founded"]:
+                    break                                      # the opening's waves are queued by opening_step
+                if st["scouts"] < max(1, int(cap * SCOUT_SHARE)) and send_scout(idle):
+                    n += 1
+                    continue
+                lv = live()
+                if lv:
+                    rates = [max(d.progress(now), 1e-4) for d in lv]
+                    floor = 0.25 * sum(rates) / len(rates)
+                    w = [max(x, floor) for x in rates]
+                    share = cap * (1 - SCOUT_SHARE)
+                    targets = {d.id: share * x / sum(w) for d, x in zip(lv, w)}
+                    for d in lv:
+                        if not d.pool and d.inflight < targets[d.id]:
+                            d.refill(names(), rng, int(targets[d.id] - d.inflight) + 1)
+                    ready = [d for d in lv if d.pool]
                     if ready:
-                        target = max(1.0, fast_cap * (1 - SCOUT_SHARE) / max(1, len(lb)))   # a sweep per basin, on fast nodes
-                        under = [b for b in ready if b.inflight < target]
-                        picked = min(under, key=lambda b: b.inflight / target) if under else None
-                if picked is not None:
-                    move = picked.take()
-                    if move is not None and propose_skeleton("move", move.config, riders, 3, "latency", picked, move):
-                        n += 1
-                        continue
-                    picked.inflight = max(0, picked.inflight - 1)
-                if t is None or t >= FINISH_S:
-                    if not scout_queue:
-                        scout_queue.extend(scout_candidates(max(1, min(64, want_scouts - inflight_scouts[0], idle or 64))))
-                    while scout_queue:
-                        c = scout_queue.pop(0)
-                        if fresh(c):
-                            break
-                    else:
-                        c = None
-                    if c is not None and propose_skeleton("scout", c, riders_scout, 1, "throughput"):
-                        n += 1
-                        continue
-                if picked is None and lb:                    # scouts full (or off) and no basin picked: climb anyway
-                    ready = [b for b in lb if b.pool or (b.wants_refill()
-                                                         and b.refill(rng, [o.centre for o in lb if o is not b], clock(), ranker))]
-                    if ready:
-                        b = min(ready, key=lambda b: b.inflight)
-                        move = b.take()
-                        if move is not None and propose_skeleton("move", move.config, riders, 3, "latency", b, move):
+                        d = max(ready, key=lambda x: targets[x.id] - x.inflight)
+                        move = d.take()
+                        kids = d.siblings(move, rng)
+                        if propose(Unit("move", move.config, d.id, move), kids, 3):
                             n += 1
-                            continue
-                        b.inflight = max(0, b.inflight - 1)
-                # nothing left to climb and the scout share is full, yet workers are idle: idle capacity never
-                # waits - width is cheap, and a basin's sweep in flight cannot use the slot anyway
-                if not scout_queue:
-                    scout_queue.extend(scout_candidates(max(1, min(32, idle or 32))))
-                c = next((c for c in scout_queue if fresh(c)), None)
-                if c is not None:
-                    scout_queue.remove(c)
-                    if propose_skeleton("scout", c, riders_scout, 1, "throughput"):
-                        n += 1
+                        else:
+                            d.dropped(move)
                         continue
+                if send_scout(idle):                          # idle capacity never waits: the scout takes it
+                    n += 1
+                    continue
                 break
             return n
 
-        # ---- results -----------------------------------------------------------------------------------------
-        def note_result(unit: Unit, is_head: bool, o: Outcome) -> None:
+        # ---- results -------------------------------------------------------------------------------------------------
+        def note(unit: Unit, is_head: bool, o: Outcome) -> None:
             now = clock()
             score = o.score if o.ok else None
             failed = (not o.ok) or score is None or score <= 0
-            r = o.result
-            ranker.add(o.config, r.core if (r and not failed) else None,
-                       (r.region_fp / r.n_targets) if (r and not failed and r.n_targets) else None, failed)
-            if not failed and (unit.best is None or score > unit.best):
-                unit.best, unit.best_config = score, o.config
-            b = basins.get(unit.basin) if unit.basin is not None else None
-            if b is not None:
-                if is_head:
-                    b.inflight = max(0, b.inflight - 1)
-                if not b.retired:
-                    moved = b.consider(unit.move if is_head else None, o.config, score, failed, now)
-                    if moved:
-                        log.info("engine: basin %d -> %.4f via %s %s at t+%.1fm", b.id, b.best,
-                                 unit.move.kind if unit.move else "rider", ",".join(unit.move.axes) if unit.move else "",
-                                 elapsed() / 60)
-                    return
-            if is_head and unit.role in ("seed", "design", "scout", "valley"):
-                inflight_scouts[0] = max(0, inflight_scouts[0] - 1)
-            if is_head and unit.role == "valley":
-                judge_valley(unit.head.key, score if not failed else None, now)
+            rr = o.result
+            ranker.add(o.config, rr.core if (rr and not failed) else None,
+                       (rr.region_fp / rr.n_targets) if (rr and not failed and rr.n_targets) else None, failed)
             if not failed:
-                k = unit.head.key
+                k = o.config.key
                 if k not in candidates or score > candidates[k][1]:
                     candidates[k] = (o.config, score)
-                if len(candidates) > 600:                       # keep the pool small: the top 300 by score
-                    for key in sorted(candidates, key=lambda x: -candidates[x][1])[300:]:
+                if len(candidates) > 1200:
+                    for key in sorted(candidates, key=lambda x: -candidates[x][1])[600:]:
                         del candidates[key]
-
-        def live_names() -> List[str]:
-            return book.live(clock())
-
-        def same_region(a: Config, b: Config) -> bool:
-            return far_axes(space, live_names(), a, b) < MIN_FAR
-
-        def test_valley(config: Config, score: float, basin: Basin, now: float) -> bool:
-            """One run at the midpoint between a candidate and the nearest basin's centre (on the live axes): a
-            midpoint as good as both ends means one hill - the candidate becomes a transplant source there; a dip
-            means a valley - the candidate founds a basin. Returns True when the test was sent."""
-            names = live_names()
-            params = dict(config.params)
-            for name in names:
-                s = space.specs[name]
-                if s.allowed or s.type == "bool":
-                    continue
-                u = (space._to_unit(s, config.params.get(name, s.default)) + space._to_unit(s, basin.centre.params.get(name, s.default))) / 2
-                params[name] = space._from_unit(s, u)
-            mid = space._assemble(params)
-            valley_done.add(config.key)
-            if mid is None or not fresh(mid):
-                return False
-            valley[mid.key] = (config, score, basin.id)
-            return propose_skeleton("valley", mid, riders_scout, 2, "throughput")
-
-        def judge_valley(mid_key: str, mid_score: Optional[float], now: float) -> None:
-            item = valley.pop(mid_key, None)
-            if item is None:
+            if unit.role in ("wave", "scout"):
+                if is_head:
+                    if unit.role == "wave":
+                        wave_back[unit.wave] += 1
+                    else:
+                        st["scouts"] = max(0, st["scouts"] - 1)
+                if st["founded"] and not failed:
+                    i = owner_of(o.config)
+                    if i is not None and domains[i].offer(o.config, score, now):
+                        log.info("engine: domain %d -> %.4f, a global point on its hill t+%.1fm", i, score, elapsed() / 60)
                 return
-            config, score, basin_id = item
-            b = basins.get(basin_id)
-            if b is None or b.retired:
+            if unit.role == "midpoint":
+                judge_midpoint(unit.head.key, None if failed else score)
                 return
-            if mid_score is not None and mid_score >= min(score, b.best) - 0.005:   # no dip: the same hill
-                b.sources.append(config)
-                top_cfg, top = (config, score) if score >= mid_score else (candidates.get(mid_key, (None, 0.0)))
-                if top_cfg is not None and b.adopt(top_cfg, top, now):          # the higher point on the hill is its centre
-                    was_centre.add(top_cfg.key)
-                    log.info("engine: basin %d -> %.4f, the %s on its hill (midpoint %.4f) t+%.1fm", b.id, top,
-                             "candidate" if top_cfg is config else "midpoint", mid_score, elapsed() / 60)
-                else:
-                    log.info("engine: candidate %.4f sits on basin %d's hill (midpoint %.4f) t+%.1fm", score, b.id,
-                             mid_score, elapsed() / 60)
+            if unit.role == "findtest":
+                judge_find(unit.head.key, None if failed else score)
                 return
-            if len(live()) < k_max or score > max(x.best for x in live()) + LEAD_MARGIN:
-                log.info("engine: a valley between %.4f and basin %d (midpoint %s) t+%.1fm", score, b.id,
-                         f"{mid_score:.4f}" if mid_score is not None else "failed", elapsed() / 60)
-                found(config, score, now)
-
-        def found(config: Config, score: float, now: float) -> None:
-            lb = live()
-            if len(lb) >= k_max:                                  # no slot: the weakest basin that had its chance
-                settled = [b for b in lb if now - b.born > REPLACE_AGE_S or now - b.improved_at > STALL_S]
-                if not settled:
-                    return
-                weakest = min(settled, key=lambda b: b.best)
-                last_gain = (weakest.history[-1][1] - weakest.history[-2][1]) if len(weakest.history) >= 2 else 0.0
-                if score - weakest.best < max(LEAD_MARGIN, last_gain):
-                    return
-                weakest.retired = True
-                retired_centres.append((weakest.centre, weakest.best))
-                log.info("engine: basin %d (%.4f) replaced by a better region at t+%.1fm", weakest.id, weakest.best,
-                         elapsed() / 60)
-            birth(config, score, now)
-
-        def births_and_retirements() -> None:
-            now = clock()
-            t = left()
-            lb = live()
-            # merge basins that converged (fewer than MIN_FAR live axes apart: one hill)
-            for a, b in [(a, b) for a in lb for b in lb if a.id < b.id]:
-                if not a.retired and not b.retired and same_region(a.centre, b.centre):
-                    worse = a if a.best < b.best else b
-                    worse.retired = True
-                    retired_centres.append((worse.centre, worse.best))
-                    log.info("engine: basin %d merged into its neighbour at t+%.1fm", worse.id, elapsed() / 60)
-            lb = live()
-            ld = leader()
-            for b in lb:
-                if b.exhausted() or (ld is not None and b is not ld and now - b.improved_at > RETIRE_PATIENCE_S
-                                     and b.best < ld.best - RETIRE_BEHIND):
-                    b.retired = True
-                    retired_centres.append((b.centre, b.best))
-                    log.info("engine: basin %d retired at %.4f (%s) t+%.1fm", b.id, b.best,
-                             "exhausted" if b.exhausted() else "behind", elapsed() / 60)
-            if t is not None and t < BIRTH_UNTIL_S:
+            if unit.role == "merge":
+                mj = merges.get(unit.merge)
+                if mj is not None:
+                    mj.back += 1
+                    if not failed and (mj.best is None or score > mj.best[1]):
+                        mj.best = (o.config, score)
                 return
-            lb = live()
-            ld = leader()
-            opening = elapsed() < OPENING_S
-            ranked = sorted(candidates.values(), key=lambda c: -c[1])
-            tests = 0
-            for config, score in ranked[:50]:
-                lb = live()
-                if config.key in was_centre:
-                    continue
-                here = [b for b in lb if same_region(b.centre, config)]
-                if here:                                         # on a known hill: higher than its centre, it IS the centre
-                    b = max(here, key=lambda x: x.best)
-                    if b.adopt(config, score, now):
-                        was_centre.add(config.key)
-                        log.info("engine: basin %d -> %.4f, a scout on its hill, at t+%.1fm", b.id, score, elapsed() / 60)
-                    continue
-                if config.key in valley_done:                    # tested already: on some hill, or waiting for its midpoint
-                    continue
-                if ld is not None and score < max(ld.best, best_known()) - WORTH_A_HILL:
-                    break                                        # the rest is too low to be worth a run each
-                if any(same_region(c, config) and score <= best + LEAD_MARGIN for c, best in retired_centres):
-                    continue                                    # an explored region, and no better than it ended
-                if not lb:                                       # the first basin needs no valley
-                    birth(config, score, now)
-                    continue
-                if not opening and ld is not None and score <= ld.best + LEAD_MARGIN:
-                    break                                        # after the opening only a clear leader founds a basin
-                if len(lb) >= k_max and not opening:
-                    break
-                nearest = min(lb, key=lambda b: b.far(config, live_names()))
-                if test_valley(config, score, nearest, now):     # the hill question is answered by one run
-                    tests += 1
-                if tests >= 4:
-                    break
-
-        def birth(config: Config, score: float, now: float) -> None:
-            b = Basin(next_basin[0], space, book, config, score, now, now)
-            next_basin[0] += 1
-            basins[b.id] = b
-            was_centre.add(config.key)
-            b.refill(rng, [o.centre for o in live() if o is not b], now, ranker)
-            log.info("engine: basin %d born at %.4f (%d moves) t+%.1fm", b.id, score, len(b.pool), elapsed() / 60)
+            d = domains.get(unit.domain) if unit.domain is not None else None
+            if d is None or unit.move is None or status[d.id] == "retired":
+                return
+            if d.consider(unit.move, is_head, o.config, score, failed, now):
+                log.info("engine: domain %d -> %.4f via %s %s t+%.1fm", d.id, d.best, unit.move.kind,
+                         ",".join(unit.move.axes), elapsed() / 60)
 
         def maybe_fit() -> None:
             if ranker.stale() and (fitting[0] is None or fitting[0].done()):
                 fitting[0] = asyncio.create_task(asyncio.to_thread(ranker.fit))
 
-        # ---- the loop ----------------------------------------------------------------------------------------
-        opening()
-        fill()
+        def status_line() -> None:
+            st["last_log"] = clock()
+            lv = [d for i, d in domains.items() if status[i] != "retired"]
+            log.info("engine: t+%.1fm domains %s | merges %s | scouts %d | candidates %d | pending %d", elapsed() / 60,
+                     " ".join(f"{d.id}:{d.best:.3f}/{d.state[:5]}/{d.mode[:1]}/{d.inflight}{'' if status[d.id] == 'live' else '/m'}"
+                              for d in lv), " ".join(f"{m.id}:{m.back}/{m.sent}" for m in merges.values()) or "-",
+                     st["scouts"], len(candidates), len(pending))
+            client.notes["engine"] = {
+                "version": "v4", "domains": [{"id": d.id, "best": round(d.best, 4), "state": d.state, "mode": d.mode,
+                                              "inflight": d.inflight, "status": status[d.id],
+                                              "born_min": round((d.born - t0) / 60, 1)} for d in lv],
+                "merges": len(merges), "scouts": st["scouts"], "candidates": len(candidates), "pending": len(pending),
+                "caps": caps, "dead_axes": sorted(set(book.names) - set(book.live(clock())))}
+
+        # ---- the loop ------------------------------------------------------------------------------------------------
+        sd = seeds()
+        cells = [c for c in latin_hypercube(space, rng, max(0, cap - len(sd))) if all(c.key != x.key for x in sd)]
+        log.info("engine: capacity %d -> up to %d domains; schedule x%.2f (a %d-minute round)", cap, n_domains, scale_t,
+                 round(ROUND_S * scale_t / 60))
+        launch_wave(sd + cells, RIDERS_WAVE0, "seeds + hypercube")
         while True:
             if pending:
-                done, _ = await asyncio.wait(list(pending), return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(list(pending), timeout=TICK_S, return_when=asyncio.FIRST_COMPLETED)
                 for fut in done:
                     unit, is_head = pending.pop(fut)
                     try:
-                        note_result(unit, is_head, fut.result())
-                    except Exception:  # noqa: BLE001 - one bad result must not stop the round
+                        note(unit, is_head, fut.result())
+                    except Exception:  # noqa: BLE001
                         log.exception("engine: result handling failed")
-                births_and_retirements()
                 maybe_fit()
+            try:
+                opening_step()
+                if st["founded"]:
+                    control()
+            except Exception:  # noqa: BLE001 - a controller bug must not end the round
+                log.exception("engine: controller step failed")
             n = fill()
-            if clock() - last_log[0] > 120:
-                last_log[0] = clock()
-                lb = live()
-                log.info("engine: t+%.1fm basins %s | scouts in flight %d | candidates %d | pending %d",
-                         elapsed() / 60, " ".join(f"{b.id}:{b.best:.3f}/{b.inflight}" for b in lb),
-                         inflight_scouts[0], len(candidates), len(pending))
-                client.notes["engine"] = {                      # what the dashboard shows of the search
-                    "basins": [{"id": b.id, "best": round(b.best, 4), "generation": b.generation, "inflight": b.inflight,
-                                "born_min": round((b.born - t0) / 60, 1)} for b in lb],
-                    "scouts_in_flight": inflight_scouts[0], "candidates": len(candidates), "pending": len(pending),
-                    "caps": caps, "dead_axes": sorted(set(book.names) - set(book.live(clock())))}
+            if clock() - st["last_log"] > 120:
+                status_line()
             if client.exhausted and not pending:
                 return
             if not pending and n == 0:

@@ -1,5 +1,5 @@
 """FleetExecutor over the real node agent (subprocesses in --fake mode, no ssh, no GATK): results come back scored,
-a family is one group, GATK runs before the answer set exists, a late latency run is duplicated on a faster node,
+a family is one group, GATK runs before the answer set exists, a late small batch is duplicated on a faster node,
 a node that dies mid-work has its jobs re-queued, bad nodes are rejected."""
 import json
 import os
@@ -110,7 +110,7 @@ class FleetTest(unittest.TestCase):
         time.sleep(0.5)
         self.assertEqual(len(self.wait(3)), 3)
 
-    def test_latency_lane_runs_on_the_fastest_node_with_cheap_riders_only(self):
+    def test_a_small_batch_runs_on_the_fastest_node_with_cheap_riders_only(self):
         ex = self.fleet(("slow", 2, {"MINOS_FAKE_DELAY": "1.2"}), ("fast", 2, {"MINOS_FAKE_DELAY": "0.15"}))
         self.wait_ready(2)
         d = ranges().defaults("gatk").params
@@ -120,19 +120,19 @@ class FleetTest(unittest.TestCase):
         speeds = {n["host"].split("/")[-1] if "/" in n["host"] else n["host"]: n["solo_s"] for n in ex.nodes()}
         fast = min(speeds, key=speeds.get)
         self.assertLess(min(speeds.values()) * 2, max(speeds.values()))
-        # a latency head with a genotyping family + a PCR variant: the family rides, the PCR variant does not; the
-        # whole group lands on the fast node although the slow one is free too
+        # a small-batch head with a genotyping family + a PCR variant: all ride (together under 0.3 of a run, so the
+        # batch stays within 1.3 solo runs); the whole group lands on the fast node although the slow one is free too
         head = Config("gatk", {**d, "min_pruning": 9})
         kids = [Config("gatk", {**d, "min_pruning": 9, GT: v}) for v in (40.0, 50.0)]
         pcr = Config("gatk", {**d, "min_pruning": 9, PCR: "NONE"})
-        ex.submit([EvalJob("L", self.round, head, lane="latency")]
+        ex.submit([EvalJob("L", self.round, head, batch="small")]
                   + [EvalJob(f"k{i}", self.round, c) for i, c in enumerate(kids)] + [EvalJob("P", self.round, pcr)])
         with ex._lock:                                          # submit dispatched synchronously: inspect at once
             fast_s = next(s for n, s in ex._sessions.items() if n == fast)
             gid = fast_s.job_group.get("L")
-            self.assertIsNotNone(gid, "the latency job was not sent to the fastest node")
+            self.assertIsNotNone(gid, "the small batch was not sent to the fastest node")
             with_head = {j for j, g in fast_s.job_group.items() if g == gid}
-        self.assertEqual(with_head, {"L", "k0", "k1"})         # cheap riders packed, the PairHMM variant left out
+        self.assertEqual(with_head, {"L", "k0", "k1", "P"})    # cheap riders packed, the PairHMM sibling too
         self.assertEqual(len(self.wait(4, timeout=30)), 4)
 
     def test_gatk_runs_before_the_answer_set_and_results_wait_for_it(self):
@@ -212,7 +212,7 @@ class GroupingTest(unittest.TestCase):
 
 
 class SpeculationTest(unittest.TestCase):
-    def test_an_overdue_latency_run_is_duplicated_on_a_free_fast_node_and_the_first_result_wins(self):
+    def test_an_overdue_small_batch_is_duplicated_on_a_free_fast_node_and_the_first_result_wins(self):
         from dataclasses import replace
         from common.types import CallSet
         from evaluator.fleet.coordinator import _Session
@@ -223,7 +223,7 @@ class SpeculationTest(unittest.TestCase):
         a = _Session(host=None, workers=2, ready=True, rounds_ready={r.round_id}, solo_s=150.0)
         b = _Session(host=None, workers=2, ready=True, rounds_ready={r.round_id}, solo_s=140.0)
         ex._sessions = {"a": a, "b": b}
-        ex.submit([EvalJob("L", r, Config("gatk", {**d, "min_pruning": 3}), lane="latency")])
+        ex.submit([EvalJob("L", r, Config("gatk", {**d, "min_pruning": 3}), batch="small")])
         self.assertIn("L", b.jobs)                                 # the fastest free node
         ex._speculate()
         self.assertEqual(ex.speculated, 0)                         # fresh start: 150 s there is no worthwhile gain
@@ -240,8 +240,8 @@ class SpeculationTest(unittest.TestCase):
         self.assertEqual([c.job_id for c in ex.poll(0)], ["L"])
 
 
-class LatencyLaneTest(unittest.TestCase):
-    def test_a_latency_job_waits_for_a_fast_node_while_slow_nodes_take_width(self):
+class SmallBatchRoutingTest(unittest.TestCase):
+    def test_a_small_batch_prefers_a_fast_node_and_takes_a_slow_one_when_none_is_free(self):
         from evaluator.fleet.coordinator import _Session
         ex = FleetExecutor(Planner(), inventory=Path("/nonexistent"))
         r = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
@@ -249,16 +249,17 @@ class LatencyLaneTest(unittest.TestCase):
         fast = _Session(host=None, workers=1, ready=True, rounds_ready={r.round_id}, solo_s=100.0)
         slow = _Session(host=None, workers=4, ready=True, rounds_ready={r.round_id}, solo_s=300.0)
         ex._sessions = {"fast": fast, "slow": slow}
-        fast.groups[0] = None                                     # the fast node is busy
-        fast.groups.__setitem__(0, type("G", (), {"jobs": {"x": None}})())
-        ex.submit([EvalJob("L", r, Config("gatk", {**d, "min_pruning": 3}), lane="latency", priority=3),
-                   EvalJob("T", r, Config("gatk", {**d, "min_pruning": 4}))])
-        self.assertIn("T", slow.jobs)                              # the throughput job ran on the slow node
-        self.assertNotIn("L", slow.jobs)                           # the move did not: it waits for the fast node
-        self.assertEqual([it[2].job_id for it in ex._queue], ["L"])
-        del fast.groups[0]
-        ex._pump()
-        self.assertIn("L", fast.jobs)
+        ex.submit([EvalJob("A", r, Config("gatk", {**d, "min_pruning": 3}), batch="small", priority=3)])
+        self.assertIn("A", fast.jobs)                              # a fast node is free: the waited-for result goes there
+        ex.submit([EvalJob("B", r, Config("gatk", {**d, "min_pruning": 4}), batch="small", priority=3)])
+        self.assertIn("B", slow.jobs)                              # no fast node free: a slow node takes it, never idles
+        ex.submit([EvalJob("T", r, Config("gatk", {**d, "min_pruning": 5}))])   # (a session without a process takes
+        self.assertIn("T", slow.jobs)                              # one group per pass, so T goes in its own submit)
+        self.assertEqual(list(ex._queue), [])
+
+    def test_batches_hold_at_most_their_total_work(self):
+        from evaluator.fleet import coordinator as co
+        self.assertEqual((co.SMALL_BATCH, co.BIG_BATCH), (1.3, 2.3))
 
 
 class CodecTest(unittest.TestCase):
@@ -306,7 +307,7 @@ class FleetScheduleTest(unittest.TestCase):
         d = ranges().defaults("gatk").params
         conf = [Config("gatk", {**d, GT: c}) for c in (30.0, 40.0, 50.0, 60.0)]
         ex = FleetExecutor(Planner(), inventory=Path("/tmp/does-not-exist-fleet.json"))
-        ex.runner.variant_cost = lambda main, variant, fidelity: 0.6
+        ex.runner.variant_cost = lambda main, variant, fidelity: 0.7   # 1 + 0.7 fits 2.3 solo runs, a third does not
         ex.submit([EvalJob(f"c{i}", rnd, c) for i, c in enumerate(conf)])
         from evaluator.fleet.coordinator import _Session
         node = _Session(host=None, workers=4, rounds_ready={rnd.round_id})

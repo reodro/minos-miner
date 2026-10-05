@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, List
 
 from common.types import CallSet, EvalJob
 from evaluator.base import Runner
-from evaluator.local import failed, job_key
+from evaluator.local import BIG_BATCH, SMALL_BATCH, failed, job_key
 
 
 class SimExecutor:
@@ -53,7 +53,7 @@ class SimExecutor:
     def _fill(self):
         """Like LocalExecutor: a free slot takes the top job plus queued jobs that can share its run (same branch
         key, up to max_batch); the batch takes the head's duration plus each rider's cost fraction of it, and all
-        its results arrive together. A latency-lane head takes only cheap riders; a latency job never rides."""
+        its results arrive together. A small batch's head takes only cheap riders; a small job never rides."""
         while len(self._running) < self.workers and self._queue:
             _, _, job = heapq.heappop(self._queue)
             if job.job_id in self._cancelled:
@@ -63,16 +63,16 @@ class SimExecutor:
             bk = self._branch(job) if self.batching else None
             cost = getattr(self.runner, "variant_cost", None)
             if bk is not None and cost is not None:
-                cap = 0.02 if job.lane == "latency" else 1.0
+                limit = (SMALL_BATCH if job.batch == "small" else BIG_BATCH) * self.duration(job)   # as the executors
                 keep = []
                 while self._queue and len(batch) < self.max_batch:
                     item = heapq.heappop(self._queue)
                     other = item[2]
                     frac = None
-                    if (other.job_id not in self._cancelled and other.lane != "latency"
+                    if (other.job_id not in self._cancelled and other.batch != "small"
                             and other.round.round_id == job.round.round_id and self._branch(other) == bk):
                         frac = cost(job.config, other.config, job.fidelity)
-                    if frac is not None and frac <= cap:
+                    if frac is not None and d + frac * self.duration(job) <= limit:
                         batch.append(other)
                         d += frac * self.duration(job)
                     else:

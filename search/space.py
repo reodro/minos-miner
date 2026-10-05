@@ -1,4 +1,4 @@
-"""The config space as numbers: features for the surrogate model, random sampling, and local moves.
+"""The config space as numbers: features for the surrogate model, unit positions, valid assembly, random sampling.
 
 Every tunable parameter maps to one feature in [0, 1]: numeric ranges linearly, or on a log scale when they span
 two orders of magnitude or more (rates, heterozygosities); bools 0/1; enums by position. Parameters with a
@@ -15,7 +15,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import random
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional
 
 from common.params import ParamRanges, ParamSpec
 from common.types import Config
@@ -78,38 +78,6 @@ FULL_RUN_PARAMS = ("min_base_quality_score", "min_mapping_quality_score", "assem
 CALL_CONF_GRID = (90.0, 100.0, 80.0, 60.0, 45.0, 30.0)
 CONTAMINATION_GRID = (0.0, 0.01, 0.02, 0.04)
 
-# First full runs, in the order the budget is spent. Each tuple is one expensive parameter of the GATK default
-# and the values next to that default: the default is already a strong config, and a one-step move is the
-# cheapest place to learn whether that axis is flat. Round-robin, so every axis is tried once before any axis
-# is tried twice. Cheap parameters stay at defaults and are swept inside the run.
-_NEAR_STARTS = (
-    ("min_pruning", (3, 4)),
-    ("min_dangling_branch_length", (2, 8)),
-    ("recover_all_dangling_branches", (True,)),
-    ("max_num_haplotypes_in_population", (64, 32)),
-    ("active_probability_threshold", (0.001, 0.005)),
-    ("min_assembly_region_size", (25, 100)),
-    ("max_assembly_region_size", (200, 400)),
-    ("assembly_region_padding", (50, 150)),
-    ("min_base_quality_score", (15, 20)),
-    ("min_mapping_quality_score", (10, 30)),
-    ("max_reads_per_alignment_start", (25, 100)),
-    ("heterozygosity", (0.0003, 0.003)),
-)
-
-# Two starts outside that neighborhood, so the first wave is not a single hill. One is stricter than the
-# default (fewer, cleaner reads and haplotypes). One keeps more indel paths and more reads.
-_FAR_STARTS = (
-    {"min_pruning": 6, "min_base_quality_score": 20, "min_mapping_quality_score": 40,
-     "max_reads_per_alignment_start": 25, "active_probability_threshold": 0.01,
-     "assembly_region_padding": 50, "max_num_haplotypes_in_population": 32},
-    {"recover_all_dangling_branches": True, "min_dangling_branch_length": 2,
-     "max_reads_per_alignment_start": 150, "assembly_region_padding": 200,
-     "min_assembly_region_size": 25, "max_assembly_region_size": 500,
-     "active_probability_threshold": 0.001},
-)
-
-
 class Space:
     def __init__(self, ranges: ParamRanges, tool: str = "gatk", pinned: Optional[Dict[str, object]] = None,
                  caps: Optional[Dict[str, object]] = None):
@@ -128,12 +96,6 @@ class Space:
             self.specs[n] = sp
         self.pinned = dict(PINNED.get(tool, {}) if pinned is None else pinned)
         self.names: List[str] = [n for n, s in sorted(self.specs.items()) if not self._fixed(s) and n not in self.pinned]
-        cheap = set(GENOTYPING_PARAMS) | set(PAIRHMM_PARAMS)
-        self.genotyping: List[str] = [n for n in self.names if n in GENOTYPING_PARAMS]
-        self.pairhmm: List[str] = [n for n in self.names if n in PAIRHMM_PARAMS]
-        # Anything not known to be cheap is expensive, including a parameter the platform adds later.
-        self.expensive: List[str] = [n for n in self.names if n not in cheap]
-        self.expensive_ints: List[str] = [n for n in self.expensive if self.specs[n].type == "int"]
 
     @staticmethod
     def _fixed(s: ParamSpec) -> bool:
@@ -204,132 +166,3 @@ class Space:
             if c is not None:
                 return c
         raise RuntimeError("could not sample a valid config")
-
-    def initial_design(self, rng: random.Random, n: int) -> List[Config]:
-        """n configs to run first. The GATK default, then one step off it on each expensive axis, then two
-        starts outside that neighborhood. Cheap parameters stay at defaults.
-
-        A spread across the cube spends the only full runs we can afford on configs that are nowhere near the
-        one point already known to score. Further starts, once this list is used up, are small moves of the
-        default on expensive parameters only.
-        """
-        if n <= 0:
-            return []
-        out: List[Config] = []
-        seen = set()
-
-        def add(params: Dict[str, object]) -> bool:
-            c = self._assemble(params)
-            if c is None or c.key in seen:
-                return False
-            seen.add(c.key)
-            out.append(c)
-            return True
-
-        add({})
-        near: List[Tuple[str, object]] = []
-        waves = max((len(values) for _, values in _NEAR_STARTS), default=0)
-        for wave in range(waves):
-            for name, values in _NEAR_STARTS:
-                if wave < len(values) and name in self.names:
-                    near.append((name, values[wave]))
-        n_far = 2 if n >= 8 else (1 if n >= 4 else 0)
-        n_far = min(n_far, max(0, n - len(out)))
-        for name, value in near:
-            if len(out) >= n - n_far:
-                break
-            add({name: value})
-        for params in _FAR_STARTS:
-            if len(out) >= n:
-                break
-            if n_far <= 0:
-                break
-            if add(params):
-                n_far -= 1
-        anchor = out[0] if out else None
-        while len(out) < n and anchor is not None:
-            c = self.neighbour(anchor, rng, n_params=1, scale=0.08, pool=self.expensive)
-            if c is None or c.key in seen:
-                name = rng.choice(self.expensive) if self.expensive else None
-                if name is None or not add({name: self._from_unit(self.specs[name], rng.random())}):
-                    break
-                continue
-            seen.add(c.key)
-            out.append(c)
-        return out
-
-    def with_cheap_defaults(self, config: Config) -> Optional[Config]:
-        """Keep `config`'s expensive parameters; put genotyping and PairHMM back at defaults for this round to retune."""
-        params = {n: config.params.get(n, s.default) for n, s in self.specs.items()}
-        for n in self.genotyping + self.pairhmm:
-            params[n] = self.specs[n].default
-        return self._assemble(params)
-
-    def clamp_frozen(self, config: Optional[Config], incumbent: Optional[Config],
-                     frozen: Sequence[str]) -> Optional[Config]:
-        """Pin low-importance parameters at the incumbent so later samples spend their moves on the rest."""
-        if config is None or incumbent is None or not frozen:
-            return config
-        params = dict(config.params)
-        for n in frozen:
-            if n in incumbent.params:
-                params[n] = incumbent.params[n]
-        return self._assemble(params)
-
-    def neighbour(self, config: Config, rng: random.Random, n_params: int = 2, scale: float = 0.15,
-                  pool: Optional[Sequence[str]] = None) -> Optional[Config]:
-        """Move 1..n_params parameters: numeric by a Gaussian step of `scale` in unit space, bool/enum to a random
-        value (possibly the same). `pool` restricts which parameters may move. None if no valid, different
-        neighbour was found."""
-        names = self.names if pool is None else [n for n in pool if n in self.names]
-        if not names:
-            return None
-        for _ in range(50):
-            params = dict(config.params)
-            for n in rng.sample(names, min(len(names), rng.randint(1, max(1, n_params)))):
-                s = self.specs[n]
-                if s.allowed or s.type == "bool":
-                    params[n] = self._from_unit(s, rng.random())
-                else:
-                    params[n] = self._from_unit(s, self._to_unit(s, params.get(n, s.default)) + rng.gauss(0, scale))
-            c = self._assemble(params)
-            if c is not None and c.key != config.key:
-                return c
-        return None
-
-    def _axis_variants(self, config: Config, axes: Sequence[Tuple[str, Sequence]]) -> List[Config]:
-        """One-parameter variants of `config` along each (name, values) axis, skipping the current value."""
-        out: List[Config] = []
-        base = dict(config.params)
-        for name, values in axes:
-            spec = self.specs.get(name)
-            if spec is None or name not in self.names:
-                continue
-            current = base.get(name, spec.default)
-            for value in values:
-                if spec.allowed and value not in spec.allowed:
-                    continue
-                if self._same(spec, current, value):
-                    continue
-                params = dict(base)
-                params[name] = value
-                c = self._assemble(params)
-                if c is not None and c.key != config.key:
-                    out.append(c)
-        return out
-
-    def genotyping_variants(self, config: Config) -> List[Config]:
-        """Calling-threshold and contamination values. Each differs from `config` in one genotyping parameter."""
-        axes = []
-        if "standard_min_confidence_threshold_for_calling" in self.names:
-            axes.append(("standard_min_confidence_threshold_for_calling", CALL_CONF_GRID))
-        if "contamination_fraction_to_filter" in self.names:
-            axes.append(("contamination_fraction_to_filter", CONTAMINATION_GRID))
-        return self._axis_variants(config, axes)
-
-    def pairhmm_variants(self, config: Config) -> List[Config]:
-        """The other `pcr_indel_model` settings. One enum, four values, and it prices as a PairHMM variant."""
-        spec = self.specs.get("pcr_indel_model")
-        if spec is None or "pcr_indel_model" not in self.names:
-            return []
-        return self._axis_variants(config, [("pcr_indel_model", tuple(spec.allowed))])

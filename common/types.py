@@ -125,9 +125,10 @@ class EvalJob:
     config: Config
     fidelity: str = FULL
     priority: int = 0           # higher runs first
-    tag: str = ""               # opaque to the executor: strategy lane, generation, ...
-    lane: str = "throughput"    # "latency": a result the search waits for (a climbing step) - the executor runs it
-                                # on its fastest free node with only cheap riders; "throughput": pack and run anywhere
+    tag: str = ""               # opaque to the executor: what the search wants to know about it (move kind, ...)
+    batch: str = "big"          # "small": a result the search waits for - its batch holds at most 1.3 solo runs of
+                                # work (itself plus cheap riders) and it never rides in another job's batch;
+                                # "big": packed with configs that share its GATK traversal, up to 2.3 solo runs
 
 
 @dataclass(frozen=True)

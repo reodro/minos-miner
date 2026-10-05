@@ -10,9 +10,10 @@ agent (evaluator/fleet/node.py --stdio); jobs go down and scored callsets come b
   the presigned URL) and nodes start GATK at once; publish_answer_set() ships the truth files when the answer set
   exists (and again on every new version) - results made before it are held on the node and scored then
 - scheduling: one queue with dedup and a result cache; a family (configs that can share a GATK run) is always sent as
-  one group; a node gets groups while it has fewer open groups than workers. A latency-lane group goes to the
-  fastest free node that has its round; one running late there is duplicated on a free faster node while the
-  fleet has idle workers: the first result wins and the other run is aborted
+  one group; a node gets groups while it has fewer open groups than workers. A small batch (a result the search
+  waits for) goes to the fastest free node that has its round, or to a slow one when no fast node has a free
+  worker; one running late is duplicated on a free faster node while the fleet has idle workers: the first result
+  wins and the other run is aborted
 - failure: when a session ends, that node's unfinished jobs go straight back to the queue; main reconnects later
 - the inventory is re-read at every round start (publish_round): new hosts join, disabled ones are closed
 """
@@ -36,17 +37,16 @@ from common.settings import SETTINGS
 from common.types import AnswerSet, CallSet, EvalJob, Round
 from evaluator.fleet import codec, selftest
 from evaluator.fleet.inventory import INVENTORY, Host, code_digest, ensure_agent, load
-from evaluator.local import MAX_BATCH_S, SOLO_S, failed, job_key
+from evaluator.local import BIG_BATCH, MAX_BATCH_S, SMALL_BATCH, SOLO_S, failed, job_key
 
 log = logging.getLogger(__name__)
 _UNSET = object()
 LOG_DIR = Path.home() / ".minos" / "fleet" / "logs"
 SPEEDS = Path.home() / ".minos" / "fleet" / "speeds.json"   # host -> measured solo time, so routing is right from the start
-LATENCY_RIDER_MAX = 0.02      # a latency-lane batch admits only riders this cheap (a genotyping variant: 0.011 of a run)
 SOLO_EMA = 0.3                # weight of each new solo-time sample in a node's running estimate
 KEEP_ROUNDS = 3               # rounds kept on main and nodes (older ones are pruned)
-OVERDUE = 1.5                 # a latency group running this many times its expected time is a straggler
-SLOW_FACTOR = 1.5             # a node slower than this times the fastest gets no latency-lane job: it waits for a fast one
+OVERDUE = 1.5                 # a small batch running this many times its expected time is a straggler
+SLOW_FACTOR = 1.5             # a node slower than this times the fastest is "slow": small batches prefer the fast ones
 DUPLICATE_GAIN = 0.25         # a duplicate must finish this share of the remaining time sooner, and at least a
                               # fifth of a run on the faster node (not a few seconds' difference in estimates)
 
@@ -66,7 +66,7 @@ class _Group:
     ids: Tuple[str, ...]                                     # every job sent in it
     units: float                                             # predicted cost in solo runs
     t0: float
-    lane: str
+    batch: str                                               # small | big (its head's)
     due: int                                                 # results this node still owes for it
     duplicate: bool = False                                  # a speculative copy of a run elsewhere
     twin: Optional[Tuple["_Session", int]] = field(default=None, repr=False)   # the other copy (session, group id)
@@ -636,9 +636,10 @@ class FleetExecutor:
         return None
 
     def _pump(self) -> None:
-        """Hand queued groups to nodes. The top job picks the node: a latency-lane job goes to the fastest node
-        with a free worker that has its round (its result is on the search's critical path); a throughput job goes
-        to the node with the largest free share, so work spreads over the fleet instead of filling the first node.
+        """Hand queued groups to nodes. The top job picks the node: a small batch goes to the fastest node with a
+        free worker that has its round (its result is on the search's critical path), or to a slow node when no fast
+        one has a free worker - a slow node never sits idle while small batches wait; a big batch goes to the node
+        with the largest free share, so work spreads over the fleet instead of filling the first node.
         Caller holds the lock."""
         stuck = set()                                          # nodes that could serve nothing this pass
         ready = [s for s in self._sessions.values() if s.ready]
@@ -650,25 +651,21 @@ class FleetExecutor:
             free = [s for s in self._sessions.values()
                     if s.ready and id(s) not in stuck and s.open_groups() < s.workers]
             able = [s for s in free if job.round.round_id in s.rounds_ready]
-            latency_ok = True
-            if able and job.lane == "latency":
+            if able and job.batch == "small":
                 fast = [s for s in able if s.solo_s <= SLOW_FACTOR * fastest]
-                if fast:
-                    s = min(fast, key=lambda x: x.solo_s)
-                else:                                          # only slow nodes free: the move waits, they take width
-                    s, latency_ok = able[0], False
+                s = min(fast or able, key=lambda x: x.solo_s)   # no fast node free: the fastest free slow one
             elif able:
                 s = max(able, key=lambda x: (x.workers - x.open_groups()) / max(1, x.workers))
             elif free:
                 s = free[0]                                    # the top job's round is not ready there: serve what is
             else:
                 break
-            if not self._dispatch(s, latency_ok):
+            if not self._dispatch(s):
                 stuck.add(id(s))
 
-    def _dispatch(self, s: _Session, latency_ok: bool = True) -> bool:
+    def _dispatch(self, s: _Session) -> bool:
         """One group to node `s`; False if it had nothing it could take (or the session is gone)."""
-        groups = self._take_groups(s, latency_ok)
+        groups = self._take_groups(s)
         if not groups:
             return False
         g, units = groups[0]
@@ -681,7 +678,7 @@ class FleetExecutor:
         gid = s.group_seq
         s.group_seq += 1
         s.groups[gid] = _Group({j.job_id: j for j in jobs}, tuple(j.job_id for j in jobs), units, self._now(),
-                               jobs[0].lane, len(jobs), duplicate, twin)
+                               jobs[0].batch, len(jobs), duplicate, twin)
         for j in jobs:
             s.jobs[j.job_id] = j
             s.job_group[j.job_id] = gid
@@ -690,7 +687,7 @@ class FleetExecutor:
         return gid
 
     def _speculate(self) -> None:
-        """Width is cheap, latency is not: a latency-lane run that is overdue on its node, or that a free faster
+        """Width is cheap, latency is not: a small batch that is overdue on its node, or that a free faster
         node could redo before its node is expected to finish, is duplicated there while the fleet has a worker to
         spare (nothing queued could use it: _pump ran first). The first result wins; the other run is aborted.
         Lock held."""
@@ -699,7 +696,7 @@ class FleetExecutor:
             if not s.ready:
                 continue
             for gid, g in list(s.groups.items()):
-                if g.lane != "latency" or g.twin is not None or g.duplicate or not g.jobs:
+                if g.batch != "small" or g.twin is not None or g.duplicate or not g.jobs:
                     continue
                 rid = next(iter(g.jobs.values())).round.round_id
                 others = [o for o in self._sessions.values()
@@ -716,7 +713,7 @@ class FleetExecutor:
                 gid2 = self._send_group(f, jobs, g.units, duplicate=True, twin=(s, gid))
                 g.twin = (f, gid2)
                 self.speculated += 1
-                log.info("%s: latency run of %d jobs at %.0f s of %.0f expected - duplicated on %s (%.0f s there)",
+                log.info("%s: small batch of %d jobs at %.0f s of %.0f expected - duplicated on %s (%.0f s there)",
                          s.name, len(jobs), elapsed, expected, f.name, fresh)
 
     def _variant_frac(self, main: EvalJob, variant: EvalJob) -> Optional[float]:
@@ -726,12 +723,10 @@ class FleetExecutor:
             return 0.0                                         # a planner without costs: the old batch-anything rule
         return cost(main.config, variant.config, main.fidelity)
 
-    def _take_groups(self, s: _Session, latency_ok: bool = True) -> List[Tuple[List[EvalJob], float]]:
+    def _take_groups(self, s: _Session) -> List[Tuple[List[EvalJob], float]]:
         """The top queued job whose round the node has and that can finish in time there, plus queued jobs that can
-        share its GATK run: a throughput head takes riders up to the family cap and the time left; a latency head
-        only riders cheaper than LATENCY_RIDER_MAX (genotyping variants), so its result is not delayed; a
-        latency-lane job never rides in another job's batch. `latency_ok` False: a slow node - latency heads stay
-        queued for a fast one. Times are this node's own (its measured solo time scales every cost).
+        share its GATK run, up to SMALL_BATCH or BIG_BATCH solo runs of work in total (and the time left); a small
+        job never rides in another job's batch. Times are this node's own (its measured solo time scales every cost).
         Returns [(group, predicted cost in solo runs)]."""
         skipped, too_long, group = [], [], None
         room = self._room(s)
@@ -745,7 +740,7 @@ class FleetExecutor:
             if self._skip(job):
                 self._taken(job)
                 continue
-            if job.round.round_id not in s.rounds_ready or (job.lane == "latency" and not latency_ok):
+            if job.round.round_id not in s.rounds_ready:
                 skipped.append(item)
                 continue
             if solo > room:
@@ -754,20 +749,22 @@ class FleetExecutor:
                 continue
             self._taken(job)
             group, seconds, bk = [job], solo, self._branch(job)
-            cap = LATENCY_RIDER_MAX if job.lane == "latency" else 1.0
+            limit = (SMALL_BATCH if job.batch == "small" else BIG_BATCH) * solo
             if bk is not None:
                 for other in list(self._by_branch.get((job.round.round_id, bk), {}).values()):   # the riders: same traversal
                     if len(group) >= self.max_batch:
                         break
-                    if other.job_id not in self._queued or other.lane == "latency":
+                    if other.job_id not in self._queued or other.batch == "small":
                         continue
                     if self._skip(other):
                         self._taken(other)
                         continue
                     frac = self._variant_frac(job, other)
-                    if frac is None or frac > cap:
+                    if frac is None:
                         continue
                     extra = frac * solo
+                    if seconds + extra > limit:
+                        continue
                     if seconds + extra <= room:
                         self._taken(other)
                         group.append(other)
