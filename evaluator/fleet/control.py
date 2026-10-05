@@ -5,7 +5,8 @@
                                                           the reference genomes itself), sync
     python -m evaluator.fleet.control genomes [HOST..]    push main's reference genomes instead (a host that cannot
                                                           reach the platform's reference endpoint)
-    python -m evaluator.fleet.control sync [HOST..]       copy the repo + self-test bundle, rebuild the patch jar
+    python -m evaluator.fleet.control sync [HOST..]       copy the repo + self-test bundle, rebuild the patch jar, run
+                                                          the self-test (its pass lets sessions start without it)
     python -m evaluator.fleet.control selftest [HOST..]   run the node self-test everywhere
     python -m evaluator.fleet.control reap [HOST..]       kill GATK containers left by a crashed node (refuses while an
                                                           agent is running there)
@@ -57,6 +58,7 @@ def copy_repo(h: Host) -> None:
 def status(h: Host) -> dict:
     py = f"{h.repo}/.venv/bin/python"
     script = (f"echo cores=$(nproc); echo ram_gb=$(free -g | awk '/Mem/{{print $2}}'); "
+              f"echo threads_per_core=$(lscpu 2>/dev/null | awk -F: '/Thread\\(s\\) per core/{{gsub(/ /,\"\",$2); print $2}}'); "
               f"echo disk_free=$(df -BG --output=avail {h.data_dir} 2>/dev/null | tail -1 | tr -d ' '); "
               f"echo gatk_image=$(docker image inspect broadinstitute/gatk:4.5.0.0 >/dev/null 2>&1 && echo yes || echo no); "
               f"echo patch_jar=$(test -f {h.repo}/evaluator/gatk_patch/build/minos-patch.jar && echo yes || echo no); "
@@ -68,7 +70,8 @@ def status(h: Host) -> dict:
     if "cores=" not in p.stdout:
         return {"host": h.name, "reachable": False, "error": p.stderr.strip()[-160:]}
     v = dict(line.split("=", 1) for line in p.stdout.splitlines() if "=" in line)
-    return {"host": h.name, "reachable": True, "cores": v.get("cores"), "ram_gb": v.get("ram_gb"),
+    return {"host": h.name, "reachable": True, "cores": v.get("cores"), "threads_per_core": v.get("threads_per_core"),
+            "ram_gb": v.get("ram_gb"),
             "disk_free": v.get("disk_free") or "?", "gatk_image": v.get("gatk_image") == "yes",
             "patch_jar": v.get("patch_jar") == "yes", "genomes": v.get("genomes"),
             "code_same_as_main": v.get("code") == code_digest(), "workers": h.workers or v.get("workers", "?")}
@@ -99,7 +102,11 @@ def sync(h: Host) -> dict:
     b = selftest.make_bundle(SETTINGS.cache_dir, SETTINGS.rounds_dir)
     push(h, selftest.bundle_files(b), f"{h.repo}/cache/selftest/")
     p = sh(h, f"cd {shlex.quote(h.repo)} && bash evaluator/gatk_patch/build.sh", timeout=1200)
-    return {"host": h.name, "ok": p.returncode == 0, "tail": (p.stdout + p.stderr).strip()[-200:]}
+    if p.returncode != 0:
+        return {"host": h.name, "ok": False, "tail": (p.stdout + p.stderr).strip()[-200:]}
+    t = run_selftest(h)                                   # records a pass on the node: sessions skip the test
+    return {"host": h.name, "ok": bool(t.get("ok")), "selftest": "passed" if t.get("ok") else
+            t.get("error") or t.get("digest") or "failed"}
 
 
 def run_selftest(h: Host) -> dict:

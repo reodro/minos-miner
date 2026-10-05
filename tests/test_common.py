@@ -80,3 +80,11 @@ class ScoringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkersTest(unittest.TestCase):
+    def test_the_ram_cap_keeps_a_reserve(self):
+        from common.settings import ram_worker_cap
+        self.assertEqual(ram_worker_cap(98, 95), 61)               # was 73: the node ran out of memory
+        self.assertEqual(ram_worker_cap(16, 15), 5)                # the 8 GB floor
+        self.assertEqual(ram_worker_cap(708, 700), 456)            # 15% of a big machine

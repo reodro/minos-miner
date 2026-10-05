@@ -159,6 +159,8 @@ KNOBS_LIST: List[Knob] = [
          "A small batch running this many times its expected time is duplicated on a free fast node."),
     Knob("evaluator.slow_factor", 1.5, 1.0, 5.0, LIVE, "x",
          "A node slower than this times the fastest is slow: small batches prefer the others."),
+    Knob("evaluator.sick_factor", 3.0, 1.5, 20.0, LIVE, "x",
+         "A node slower than this times the fleet's median gets no small batches at all, only big ones."),
     Knob("main.resubmit_interval_s", 300.0, 0.0, 3600.0, ROUND, "s", "Least time between two submissions."),
     Knob("main.resubmit_margin", 0.0, 0.0, 5.0, ROUND, "score", "A new best must gain this much to be resubmitted."),
     Knob("main.stop_before_deadline_s", 60.0, 10.0, 900.0, ROUND, "s", "The search stops this long before the deadline."),

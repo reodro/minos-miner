@@ -463,7 +463,7 @@ function renderNodes(X, finished) {
   box.replaceChildren(...nodes.map((n) => {
     const busy = finished ? 0 : n.busy;                    // a finished round has no work anywhere
     const state = n.rejected ? chip("rejected", "bad") : finished ? chip("idle") : !n.ready ? chip("not ready", "warn")
-      : n.slow ? chip("slow", "warn") : chip("ready", "good");
+      : n.sick ? chip("very slow", "bad") : n.slow ? chip("slow", "warn") : chip("ready", "good");
     return h("div", {class: `node ${n.ready && !finished ? "" : "down"}`},
       h("div", {class: "head"}, h("span", {text: n.node}), state),
       bar(n.workers ? busy / n.workers : 0, "", null),

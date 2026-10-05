@@ -4,6 +4,10 @@ A node is accepted only when both hold: the VCF digest equals expected_sha256, a
 (the validator scoring path) returns expected_score. A node that can call variants but cannot
 score does not become ready. Main cuts the slice and copies truth/mutations once, then pushes
 that bundle to every node.
+
+The test runs when the node is provisioned or synced (control sync), and a pass is recorded with what it
+vouches for: the code digest, the patch jar and the expected digest. A session start then reuses the pass
+instead of spending 40-130 s on the test again; any change to those three runs it afresh.
 """
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 SPEC_FILE = Path(__file__).with_name("selftest.json")
 _TRUTH = (("truth", "truth.vcf.gz"), ("truth_tbi", "truth.vcf.gz.tbi"),
@@ -107,6 +111,40 @@ def _score(runner_cs, s: dict, cache_dir: str, reference: str) -> dict:
     if scored.score is None:
         raise RuntimeError("HappyScorer returned no score")
     return {"score": float(scored.score), "n_targets": n_targets}
+
+
+PASS_FILE = "pass.json"
+
+
+def fingerprint() -> dict:
+    """What a pass vouches for: the code, the GATK patch jar and the self-test's expected digest."""
+    import hashlib
+    from evaluator.fleet.inventory import code_digest
+    from evaluator.gatk import DEFAULT_PATCH_JAR
+    jar = Path(DEFAULT_PATCH_JAR)
+    return {"code": code_digest(), "jar": hashlib.sha256(jar.read_bytes()).hexdigest()[:16] if jar.exists() else None,
+            "expected": spec()["expected_sha256"]}
+
+
+def cached_pass(cache_dir: str) -> Optional[dict]:
+    """The recorded pass's result when it still matches this node's fingerprint, else None."""
+    try:
+        rec = json.loads((Path(cache_dir) / "selftest" / PASS_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    if rec.get("fingerprint") != fingerprint() or not (rec.get("result") or {}).get("ok"):
+        return None
+    return {**rec["result"], "cached": True}
+
+
+def record(cache_dir: str, result: dict) -> None:
+    """Keep a passing result (a failure removes any old pass)."""
+    path = Path(cache_dir) / "selftest" / PASS_FILE
+    if result.get("ok"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"fingerprint": fingerprint(), "result": result}))
+    elif path.exists():
+        path.unlink()
 
 
 def run(runner, data_dir: str, cache_dir: str) -> dict:

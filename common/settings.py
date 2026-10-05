@@ -54,22 +54,38 @@ GB_PER_WORKER = 1.3     # measured: a 1-thread HaplotypeCaller JVM uses ~1.0-1.2
                         # a cap it does not reach); + headroom for hap.py and the node agent (fleet, 2026-10-03)
 
 
+RAM_RESERVE_GB, RAM_RESERVE_SHARE = 8.0, 0.15   # kept free: page cache, scorers, the node agent. Without it a
+                                                # 98 GB node got 73 workers, ran at 1 GB free and was 5x slower
+                                                # (v4 fleet run, 2026-10-05)
+
+
+def ram_worker_cap(mem_total_gb: float, mem_available_gb: float) -> int:
+    """Workers a machine's RAM can hold: (available - reserve) / GB_PER_WORKER, the reserve being the larger of
+    RAM_RESERVE_GB and RAM_RESERVE_SHARE of the total."""
+    reserve = max(RAM_RESERVE_GB, RAM_RESERVE_SHARE * mem_total_gb)
+    return max(1, math.floor((mem_available_gb - reserve) / GB_PER_WORKER))
+
+
 def _ram_worker_cap() -> int:
-    """Workers this machine's available RAM can hold: floor(MemAvailable / GB_PER_WORKER)."""
+    """This machine's RAM cap (ram_worker_cap from /proc/meminfo)."""
     try:
+        info = {}
         with open("/proc/meminfo") as fh:
             for line in fh:
-                if line.startswith("MemAvailable:"):
-                    gb = int(line.split()[1]) / (1024 * 1024)
-                    return max(1, math.floor(gb / GB_PER_WORKER))
-    except OSError:
+                k, v = line.split(":", 1)
+                if k in ("MemTotal", "MemAvailable"):
+                    info[k] = int(v.split()[0]) / (1024 * 1024)
+        if "MemTotal" in info and "MemAvailable" in info:
+            return ram_worker_cap(info["MemTotal"], info["MemAvailable"])
+    except (OSError, ValueError):
         pass
     return 10 ** 9
 
 
 def default_workers(cores: int = 0) -> int:
     """GATK workers per machine (1 thread each): floor(cores * 0.9), and when the count is this machine's own,
-    also floor(available RAM / GB_PER_WORKER). Same rule on every fleet machine; override with MINOS_WORKERS.
+    also its RAM cap (ram_worker_cap: available RAM minus a reserve, / GB_PER_WORKER). Same rule on every fleet
+    machine; override with MINOS_WORKERS (or a host's "workers" in fleet.json).
 
     An explicit `cores` argument is the CPU rule only, so a caller sizing a remote node is not capped by this
     machine's memory.

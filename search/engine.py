@@ -93,7 +93,7 @@ class MergeJob:
     started: float = 0.0
 
 
-async def settled_capacity(client: EvalClient, workers: int, wait_s: float = 120.0, settle_s: float = 20.0) -> int:
+async def settled_capacity(client: EvalClient, workers: int, wait_s: float = 60.0, settle_s: float = 20.0) -> int:
     """The workers the round has, once a fleet's nodes have joined (local and virtual executors answer at once)."""
     cap = client.capacity()
     nodes = getattr(client.executor, "nodes", None)

@@ -373,7 +373,10 @@ def main() -> None:
         runner = GatkRunner(threads=1, memory_gb=4, patch_jar=DEFAULT_PATCH_JAR, container_prefix=prefix,
                             work_dir=os.path.join(SETTINGS.cache_dir, "callsets"))
         scorer_factory = lambda i: HappyScorer()  # noqa: E731
-        result = selftest.run(runner, SETTINGS.data_dir, SETTINGS.cache_dir)
+        result = None if a.selftest_only else selftest.cached_pass(SETTINGS.cache_dir)   # passed at sync: skip it
+        if result is None:
+            result = selftest.run(runner, SETTINGS.data_dir, SETTINGS.cache_dir)
+            selftest.record(SETTINGS.cache_dir, result)
     if a.selftest_only:
         print(json.dumps(result)); return
     node = Node(workers, runner, scorer_factory, a.score_threads,

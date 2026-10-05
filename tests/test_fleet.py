@@ -343,3 +343,51 @@ class PassphraseTest(unittest.TestCase):
         listed = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True).stdout
         fingerprint = subprocess.run(["ssh-keygen", "-lf", str(key) + ".pub"], capture_output=True, text=True).stdout.split()[1]
         self.assertIn(fingerprint, listed)
+
+
+class NodeHealthTest(unittest.TestCase):
+    def test_speed_is_learned_from_small_groups_only(self):
+        from evaluator.fleet.coordinator import _Session
+        s = _Session(host=None, workers=2, ready=True, solo_s=100.0)
+        s.note_group_done(2.0, 500.0)                              # a big batch: its cost estimate is unreliable
+        self.assertEqual((s.solo_s, s.solo_samples), (100.0, 0))
+        s.note_group_done(1.1, 121.0)                              # a small one: 110 s per solo run
+        self.assertAlmostEqual(s.solo_s, 110.0)
+
+    def test_a_sick_node_gets_big_batches_only(self):
+        from evaluator.fleet.coordinator import _Session
+        ex = FleetExecutor(Planner(), inventory=Path("/nonexistent"))
+        r = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
+        d = ranges().defaults("gatk").params
+        a = _Session(host=None, workers=1, ready=True, rounds_ready={r.round_id}, solo_s=100.0)
+        b = _Session(host=None, workers=1, ready=True, rounds_ready={r.round_id}, solo_s=100.0)
+        c = _Session(host=None, workers=2, ready=True, rounds_ready={r.round_id}, solo_s=400.0)   # > 3x the median
+        ex._sessions = {"a": a, "b": b, "c": c}
+        ex.submit([EvalJob("S1", r, Config("gatk", {**d, "min_pruning": 3}), batch="small", priority=3)])
+        ex.submit([EvalJob("S2", r, Config("gatk", {**d, "min_pruning": 4}), batch="small", priority=3)])
+        self.assertTrue("S1" in a.jobs or "S1" in b.jobs)
+        self.assertTrue("S2" in a.jobs or "S2" in b.jobs)          # the healthy nodes are now full
+        ex.submit([EvalJob("S3", r, Config("gatk", {**d, "min_pruning": 5}), batch="small", priority=3),
+                   EvalJob("B", r, Config("gatk", {**d, "min_mapping_quality_score": 30}), priority=1)])
+        self.assertNotIn("S3", c.jobs)                             # a waited-for result never goes to the sick node
+        self.assertIn("B", c.jobs)                                 # big work does, so it never idles
+        self.assertIn("S3", ex._queued)
+        nodes = {n["solo_s"]: n for n in ex.stats()["nodes"]}
+        self.assertTrue(nodes[400]["sick"])
+        self.assertFalse(nodes[100]["sick"])
+
+
+class SelftestPassTest(unittest.TestCase):
+    def test_a_pass_is_reused_only_while_its_fingerprint_holds(self):
+        from unittest import mock
+        from evaluator.fleet import selftest
+        with tempfile.TemporaryDirectory() as d:
+            fp = {"code": "c1", "jar": "j1", "expected": "e1"}
+            with mock.patch.object(selftest, "fingerprint", lambda: dict(fp)):
+                self.assertIsNone(selftest.cached_pass(d))
+                selftest.record(d, {"ok": True, "digest": "e1", "expected": "e1"})
+                self.assertEqual(selftest.cached_pass(d), {"ok": True, "digest": "e1", "expected": "e1", "cached": True})
+                fp["code"] = "c2"                                  # new code: the test runs again
+                self.assertIsNone(selftest.cached_pass(d))
+                selftest.record(d, {"ok": False, "digest": "x", "expected": "e1"})
+                self.assertFalse((Path(d) / "selftest" / selftest.PASS_FILE).exists())

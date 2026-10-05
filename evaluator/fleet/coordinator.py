@@ -107,7 +107,11 @@ class _Session:
         return len(self.groups)
 
     def note_group_done(self, units: float, seconds: float) -> None:
-        """A whole group came back after `seconds`: one solo-run-equivalent took seconds / units here."""
+        """A whole group came back after `seconds`: one solo-run-equivalent took seconds / units here. Learned
+        from small groups only (at most a small batch's work): the cost table is least wrong there, and big
+        batches' errors made healthy nodes look 2-3x slower in the v4 fleet run."""
+        if units > batch_limit("small") + 1e-6:
+            return
         sample = min(3600.0, max(0.05, seconds / max(units, 0.05)))
         self.solo_s = sample if self.solo_samples == 0 else (1 - SOLO_EMA) * self.solo_s + SOLO_EMA * sample
         self.solo_samples += 1
@@ -599,12 +603,14 @@ class FleetExecutor:
     def stats(self) -> dict:
         """For the public dashboard: nodes are numbered, never named (no IPs)."""
         with self._lock:
-            fastest = min((s.solo_s for s in self._sessions.values() if s.ready), default=SOLO_S)
-            slow = tune("evaluator.slow_factor") * fastest
+            ready = [s for s in self._sessions.values() if s.ready]
+            fastest = min((s.solo_s for s in ready), default=SOLO_S)
+            slow, sick = tune("evaluator.slow_factor") * fastest, self._sick_limit(ready)
             nodes = [dict(node=f"node {i}", ready=s.ready, workers=s.workers, busy=s.open_groups(), jobs=len(s.jobs),
                           small=sum(1 for g in s.groups.values() if g.batch == "small"),
                           done=s.done, gatk_runs=s.gatk_runs, gatk_runs_done=s.gatk_runs_done,
-                          rejected=bool(s.rejected), solo_s=round(s.solo_s), slow=s.ready and s.solo_s > slow)
+                          rejected=bool(s.rejected), solo_s=round(s.solo_s), slow=s.ready and s.solo_s > slow,
+                          sick=s.ready and s.solo_s > sick)
                      for i, s in enumerate(self._sessions.values(), 1)]
             return {"kind": "fleet", "queued": len(self._queued), "nodes": nodes, "done": sum(n["done"] for n in nodes),
                     "gatk_runs": sum(n["gatk_runs"] for n in nodes),
@@ -649,6 +655,7 @@ class FleetExecutor:
         stuck = set()                                          # nodes that could serve nothing this pass
         ready = [s for s in self._sessions.values() if s.ready]
         fastest = min((s.solo_s for s in ready), default=SOLO_S)
+        sick = self._sick_limit(ready)
         while self._queue:
             job = self._peek()
             if job is None:
@@ -656,21 +663,34 @@ class FleetExecutor:
             free = [s for s in self._sessions.values()
                     if s.ready and id(s) not in stuck and s.open_groups() < s.workers]
             able = [s for s in free if job.round.round_id in s.rounds_ready]
+            big_only = False
             if able and job.batch == "small":
-                fast = [s for s in able if s.solo_s <= tune("evaluator.slow_factor") * fastest]
-                s = min(fast or able, key=lambda x: x.solo_s)   # no fast node free: the fastest free slow one
+                well = [s for s in able if s.solo_s <= sick]
+                fast = [s for s in well if s.solo_s <= tune("evaluator.slow_factor") * fastest]
+                if well:
+                    s = min(fast or well, key=lambda x: x.solo_s)   # no fast node free: the fastest free slow one
+                else:                                               # only sick nodes free: they take big work
+                    s, big_only = max(able, key=lambda x: (x.workers - x.open_groups()) / max(1, x.workers)), True
             elif able:
                 s = max(able, key=lambda x: (x.workers - x.open_groups()) / max(1, x.workers))
             elif free:
                 s = free[0]                                    # the top job's round is not ready there: serve what is
             else:
                 break
-            if not self._dispatch(s):
+            if not self._dispatch(s, big_only):
                 stuck.add(id(s))
 
-    def _dispatch(self, s: _Session) -> bool:
-        """One group to node `s`; False if it had nothing it could take (or the session is gone)."""
-        groups = self._take_groups(s)
+    def _sick_limit(self, ready: List["_Session"]) -> float:
+        """Solo time above which a node is sick (evaluator.sick_factor x the ready nodes' median)."""
+        times = sorted(s.solo_s for s in ready)
+        if not times:
+            return float("inf")
+        return tune("evaluator.sick_factor") * times[len(times) // 2]
+
+    def _dispatch(self, s: _Session, big_only: bool = False) -> bool:
+        """One group to node `s` (big batches only when `big_only`); False if it had nothing it could take (or the
+        session is gone)."""
+        groups = self._take_groups(s, big_only)
         if not groups:
             return False
         g, units = groups[0]
@@ -729,7 +749,7 @@ class FleetExecutor:
             return 0.0                                         # a planner without costs: the old batch-anything rule
         return cost(main.config, variant.config, main.fidelity)
 
-    def _take_groups(self, s: _Session) -> List[Tuple[List[EvalJob], float]]:
+    def _take_groups(self, s: _Session, big_only: bool = False) -> List[Tuple[List[EvalJob], float]]:
         """The top queued job whose round the node has and that can finish in time there, plus queued jobs that can
         share its GATK run, up to batch_limit() solo runs of work in total (and the time left); a small
         job never rides in another job's batch. Times are this node's own (its measured solo time scales every cost).
@@ -746,7 +766,7 @@ class FleetExecutor:
             if self._skip(job):
                 self._taken(job)
                 continue
-            if job.round.round_id not in s.rounds_ready:
+            if job.round.round_id not in s.rounds_ready or (big_only and job.batch == "small"):
                 skipped.append(item)
                 continue
             if solo > room:
