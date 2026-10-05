@@ -39,6 +39,7 @@ from evaluator.fleet.inventory import INVENTORY, Host, code_digest, ensure_agent
 from evaluator.local import MAX_BATCH_S, SOLO_S, failed, job_key
 
 log = logging.getLogger(__name__)
+_UNSET = object()
 LOG_DIR = Path.home() / ".minos" / "fleet" / "logs"
 SPEEDS = Path.home() / ".minos" / "fleet" / "speeds.json"   # host -> measured solo time, so routing is right from the start
 LATENCY_RIDER_MAX = 0.02      # a latency-lane batch admits only riders this cheap (a genotyping variant: 0.011 of a run)
@@ -147,7 +148,10 @@ class FleetExecutor:
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
         self._seq = itertools.count()
-        self._queue: list = []
+        self._queue: list = []                                   # heap of (-priority, seq, job); taken items stay until popped
+        self._queued: set = set()                                # job ids actually queued (taken riders leave the heap lazily)
+        self._by_branch: Dict[Tuple[str, Optional[str]], Dict[str, EvalJob]] = defaultdict(dict)   # (round, branch) -> queued jobs
+        self._branch_of: Dict[str, Optional[str]] = {}           # job id -> branch key, computed once
         self._inflight: Dict[Tuple, EvalJob] = {}
         self._waiters = defaultdict(list)
         self._done: Dict[Tuple, CallSet] = {}
@@ -343,7 +347,7 @@ class FleetExecutor:
                     running_elsewhere = set(og.jobs)
             for jid, job in g.jobs.items():
                 if jid not in running_elsewhere and job_key(job) not in self._done:
-                    heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+                    self._push(job)
         s.jobs, s.groups, s.job_group, s.ready = {}, {}, {}, False
         s.rounds_ready, s.rounds_sent, s.asets_sent, s.rounds_failed = set(), set(), set(), set()
         if s.proc and s.proc.poll() is None:
@@ -363,7 +367,7 @@ class FleetExecutor:
                 mine += list(g.jobs)
                 for jid, job in g.jobs.items():
                     if job_key(job) not in self._done:
-                        heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+                        self._push(job)
                 if g.twin is not None and g.twin[0].groups.get(g.twin[1]) is not None:
                     g.twin[0].groups[g.twin[1]].twin = None
                 del s.groups[gid]
@@ -392,6 +396,7 @@ class FleetExecutor:
                 keep.append(item)
         self._queue = keep
         heapq.heapify(self._queue)
+        self._reindex()
         if n:
             log.error("round %s: no node can prepare it - %d queued jobs failed", rid, n)
             self._cv.notify_all()
@@ -475,8 +480,30 @@ class FleetExecutor:
         return room
 
     def _branch(self, job: EvalJob) -> Optional[str]:
-        f = getattr(self.runner, "branch_key", None)
-        return f(job.config, job.fidelity) if f else None
+        bk = self._branch_of.get(job.job_id, _UNSET)
+        if bk is _UNSET:
+            f = getattr(self.runner, "branch_key", None)
+            bk = f(job.config, job.fidelity) if f else None
+            self._branch_of[job.job_id] = bk
+        return bk
+
+    # ---- the queue: a priority heap plus an index by (round, branch) so a head finds its riders without a scan ------
+    def _push(self, job: EvalJob) -> None:
+        heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+        self._queued.add(job.job_id)
+        self._by_branch[(job.round.round_id, self._branch(job))][job.job_id] = job
+
+    def _taken(self, job: EvalJob) -> None:
+        """`job` leaves the queue (dispatched as a head or a rider, or dropped); its heap item is skipped later."""
+        self._queued.discard(job.job_id)
+        self._by_branch[(job.round.round_id, self._branch(job))].pop(job.job_id, None)
+
+    def _reindex(self) -> None:
+        """After the heap was rebuilt from a `keep` list: the index follows."""
+        self._queued = {it[2].job_id for it in self._queue}
+        self._by_branch = defaultdict(dict)
+        for it in self._queue:
+            self._by_branch[(it[2].round.round_id, self._branch(it[2]))][it[2].job_id] = it[2]
 
     def submit(self, jobs: Iterable[EvalJob]) -> None:
         with self._cv:
@@ -488,7 +515,7 @@ class FleetExecutor:
                     self._waiters[k].append(job)
                 else:
                     self._inflight[k] = job
-                    heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+                    self._push(job)
             self._pump()
             self._cv.notify_all()
 
@@ -520,6 +547,7 @@ class FleetExecutor:
                     keep.append(item)
             self._queue = keep
             heapq.heapify(self._queue)
+            self._reindex()
             for s in self._sessions.values():
                 mine = []
                 for gid, g in list(s.groups.items()):
@@ -547,11 +575,12 @@ class FleetExecutor:
                     continue
                 c, bk = 1.0, self._branch(job)
                 if bk is not None and hasattr(self.runner, "variant_cost"):
-                    for p in [q[2] for q in self._queue] + jobs[:i]:
-                        if p.round.round_id == job.round.round_id and self._branch(p) == bk:
-                            v = self.runner.variant_cost(p.config, job.config, job.fidelity)
-                            if v is not None:
-                                c = min(c, v)
+                    same = list(self._by_branch.get((job.round.round_id, bk), {}).values())
+                    same += [p for p in jobs[:i] if self._branch(p) == bk]
+                    for p in same:
+                        v = self.runner.variant_cost(p.config, job.config, job.fidelity)
+                        if v is not None:
+                            c = min(c, v)
                 out.append(c)
             return out
 
@@ -563,7 +592,7 @@ class FleetExecutor:
     def idle_slots(self) -> int:
         with self._lock:
             free = sum(max(0, s.workers - s.open_groups()) for s in self._sessions.values() if s.ready)
-            return max(0, free - len(self._queue))
+            return max(0, free - len(self._queued))
 
     def stats(self) -> dict:
         """For the public dashboard: nodes are numbered, never named (no IPs)."""
@@ -572,7 +601,7 @@ class FleetExecutor:
                           done=s.done, gatk_runs=s.gatk_runs, gatk_runs_done=s.gatk_runs_done,
                           rejected=bool(s.rejected), solo_s=round(s.solo_s))
                      for i, s in enumerate(self._sessions.values(), 1)]
-            return {"kind": "fleet", "queued": len(self._queue), "nodes": nodes, "done": sum(n["done"] for n in nodes),
+            return {"kind": "fleet", "queued": len(self._queued), "nodes": nodes, "done": sum(n["done"] for n in nodes),
                     "gatk_runs": sum(n["gatk_runs"] for n in nodes),
                     "gatk_runs_done": sum(n["gatk_runs_done"] for n in nodes),
                     "workers": sum(n["workers"] for n in nodes if n["ready"]),
@@ -599,8 +628,9 @@ class FleetExecutor:
         """The top live queued job (cancelled or done ones are dropped on the way), or None."""
         while self._queue:
             job = self._queue[0][2]
-            if self._skip(job):
+            if job.job_id not in self._queued or self._skip(job):
                 heapq.heappop(self._queue)
+                self._taken(job)
                 continue
             return job
         return None
@@ -710,41 +740,43 @@ class FleetExecutor:
         while self._queue and group is None:
             item = heapq.heappop(self._queue)
             job = item[2]
+            if job.job_id not in self._queued:                  # taken as a rider earlier: a stale heap item
+                continue
             if self._skip(job):
+                self._taken(job)
                 continue
             if job.round.round_id not in s.rounds_ready or (job.lane == "latency" and not latency_ok):
                 skipped.append(item)
                 continue
             if solo > room:
                 too_long.append(job)
+                self._taken(job)
                 continue
+            self._taken(job)
             group, seconds, bk = [job], solo, self._branch(job)
             cap = LATENCY_RIDER_MAX if job.lane == "latency" else 1.0
             if bk is not None:
-                keep = []
-                while self._queue:
-                    other_item = heapq.heappop(self._queue)
-                    other = other_item[2]
-                    if self._skip(other):
+                for other in list(self._by_branch.get((job.round.round_id, bk), {}).values()):   # the riders: same traversal
+                    if len(group) >= self.max_batch:
+                        break
+                    if other.job_id not in self._queued or other.lane == "latency":
                         continue
-                    extra = None
-                    if (len(group) < self.max_batch and other.lane != "latency"
-                            and other.round.round_id == job.round.round_id and self._branch(other) == bk):
-                        frac = self._variant_frac(job, other)
-                        if frac is not None and frac <= cap:
-                            extra = frac * solo
-                    if extra is not None and seconds + extra <= room:
+                    if self._skip(other):
+                        self._taken(other)
+                        continue
+                    frac = self._variant_frac(job, other)
+                    if frac is None or frac > cap:
+                        continue
+                    extra = frac * solo
+                    if seconds + extra <= room:
+                        self._taken(other)
                         group.append(other)
                         seconds += extra
                         units += extra / solo
-                    else:
-                        keep.append(other_item)
-                for it in keep:
-                    heapq.heappush(self._queue, it)
         for it in skipped:
             heapq.heappush(self._queue, it)
         for job in too_long:
-            heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+            self._push(job)
         return [(group, units)] if group else []
 
     def _skip(self, job: EvalJob) -> bool:
@@ -754,7 +786,7 @@ class FleetExecutor:
             if waiters:
                 self._inflight[k] = waiters[0]
                 self._waiters[k] = waiters[1:]
-                heapq.heappush(self._queue, (-waiters[0].priority, next(self._seq), waiters[0]))
+                self._push(waiters[0])
             else:
                 self._inflight.pop(k, None)
             return True

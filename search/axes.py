@@ -180,3 +180,28 @@ def design_wave(space: Space, rng: random.Random, n: int, backgrounds: Sequence[
             seen.add(c.key)
             out.append(c)
     return out
+
+
+def latin_hypercube(space: Space, rng: random.Random, n: int, names: Optional[Sequence[str]] = None) -> List[Config]:
+    """`n` configs that stratify EVERY axis across its whole range (each axis's range cut into n strata, one point per
+    stratum, strata paired at random between axes), so every axis is seen at n distinct levels and every pair of axes
+    in all its low/mid/high combinations about n/9 times. Categorical axes are stratified over their values. The
+    global opening wave: what the dominant-axes design (design_wave) cannot see, a region that needs the other axes
+    away from a seed's values, this sees."""
+    names = list(names) if names is not None else list(space.names)
+    if n <= 0 or not names:
+        return []
+    columns: Dict[str, List[float]] = {}
+    for name in names:
+        strata = list(range(n))
+        rng.shuffle(strata)
+        columns[name] = [(k + rng.random()) / n for k in strata]
+    out: List[Config] = []
+    seen = set()
+    for i in range(n):
+        params = {name: space._from_unit(space.specs[name], columns[name][i]) for name in names}
+        c = space._assemble(params)
+        if c is not None and c.key not in seen:
+            seen.add(c.key)
+            out.append(c)
+    return out

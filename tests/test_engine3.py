@@ -1,4 +1,5 @@
 import random
+import re
 import unittest
 
 from common.types import AnswerSet, Config, Regime, Round, Variant
@@ -24,7 +25,8 @@ class Stub:
 def virtual_round(cap, minutes=72, seed=0, duration=150.0, crashes=None, hills=1):
     r = ranges()
     runner = FakeRunner(r, seed=seed, batching=True, hills=hills)
-    ex = SimExecutor(runner, cap, duration=lambda job: duration, crashes=crashes or (lambda job: False))
+    dur = duration if callable(duration) else (lambda job: duration)
+    ex = SimExecutor(runner, cap, duration=dur, crashes=crashes or (lambda job: False))
     out = run_round(ROUND, Stub(), ex, FakeScorer(runner), engine3.searcher(r, cap), DryRunSubmitter(), r,
                     LoopSettings(stop_before_deadline_s=60), baselines=[r.defaults("gatk")], deadline_ts=minutes * 60)
     return out, ex
@@ -46,9 +48,7 @@ class DomainTest(unittest.TestCase):
         space, book, d = domain()
         live = live_axes(book)
         moves = d.refill(live, random.Random(0), target=120)
-        self.assertEqual({m.kind for m in moves}, {"n1", "n2", "probe"})      # the first sweep carries the injection
-        probes = [m for m in moves if m.kind == "probe" and m.axes == ("assembly_region_padding",)]
-        self.assertGreaterEqual(len(probes), 5)
+        self.assertEqual({m.kind for m in moves}, {"n1", "n2"})                 # no injection: the hypercube covers the ranges
         n1 = [m for m in moves if m.kind == "n1"]
         self.assertTrue(all(len(m.axes) == 1 for m in n1))
         pcr = [m for m in n1 if m.axes == ("pcr_indel_model",)]
@@ -138,7 +138,7 @@ class DomainTest(unittest.TestCase):
         self.assertTrue(d.consider(win, True, win.config, 88.2, False, 5.0))    # a shake point above the best: move there
         self.assertEqual(d.centre.key, win.config.key)
 
-    def test_a_flat_batch_switches_to_fine_mode_and_two_flat_batches_freeze(self):
+    def test_a_flat_batch_switches_to_fine_mode_and_exhaustion_at_the_floor_freezes(self):
         space, book, d = domain()
         rng = random.Random(0)
         live = live_axes(book)
@@ -165,7 +165,26 @@ class DomainTest(unittest.TestCase):
         self.assertEqual(d.fine_scale, 0.5)
         self.assertNotIn(("assembly_region_padding",), [m.axes for m in again if m.kind == "n1"])
         d.close_batch()
-        self.assertTrue(d.frozen)                                              # two batches without a gain
+        self.assertFalse(d.frozen)                                             # flat batches alone do not freeze
+        for _ in range(12):                                                    # every finer scale, all losing
+            for m in again:
+                d.take(); d.consider(m, True, m.config, 87.0, False, 3.0)
+            d.sideways = SIDEWAYS_MAX
+            again = d.refill(live, rng)
+            if d.frozen:
+                break
+        self.assertTrue(d.frozen)                                              # exhausted down to every axis's floor
+        self.assertTrue(d.exhausted_at_floor)
+
+    def test_a_domain_without_a_visible_gain_for_12_minutes_is_stalled(self):
+        from search.domain import RESOLUTION, STALL_S
+        space, book, d = domain()
+        self.assertFalse(d.stalled(STALL_S - 1))
+        self.assertTrue(d.stalled(STALL_S + 1))
+        d._recentre(space._assemble({"min_pruning": 3}), 88.0 + RESOLUTION / 2, 100.0, ("min_pruning",))   # below resolution
+        self.assertTrue(d.stalled(100.0 + STALL_S + 1))
+        d._recentre(space._assemble({"min_pruning": 4}), 88.0 + RESOLUTION, 200.0, ("min_pruning",))       # adds up: real
+        self.assertFalse(d.stalled(200.0 + STALL_S - 1))
 
     def test_siblings_are_cheap_variations_of_a_structural_move_only(self):
         space, book, d = domain()
@@ -214,13 +233,29 @@ class DomainTest(unittest.TestCase):
         live = live_axes(book)
         n = d.start_final(live, rng, target=60)
         self.assertGreater(n, 0)
-        self.assertEqual({m.kind for m in d.pool}, {"final", "shake"})
+        self.assertEqual({m.kind for m in d.pool}, {"final"})                  # no filler: the scout takes spare workers
         scale0 = d.final_scale
         for m in list(d.pool):
             d.take(); d.consider(m, True, m.config, 87.0, False, 1.0)
         more = d.refill(live, rng, 60)
         self.assertTrue(more)
         self.assertLess(d.final_scale, scale0)
+
+
+class HypercubeTest(unittest.TestCase):
+    def test_every_axis_is_stratified_across_its_range(self):
+        from search.axes import latin_hypercube
+        space = Space(ranges())
+        cells = latin_hypercube(space, random.Random(0), 200)
+        self.assertGreaterEqual(len(cells), 190)
+        for name in ("assembly_region_padding", "min_mapping_quality_score", "standard_min_confidence_threshold_for_calling"):
+            s = space.specs[name]
+            us = sorted(space._to_unit(s, c.params[name]) for c in cells)
+            self.assertLess(us[0], 0.05); self.assertGreater(us[-1], 0.95)
+            tenths = {min(9, int(u * 10)) for u in us}
+            self.assertEqual(len(tenths), 10)                                    # every tenth of the range is visited
+        self.assertEqual({c.params["pcr_indel_model"] for c in cells}, {"NONE", "HOSTILE", "AGGRESSIVE", "CONSERVATIVE"})
+        self.assertEqual(len({c.key for c in cells}), len(cells))
 
 
 class EngineRoundTest(unittest.TestCase):
@@ -238,8 +273,16 @@ class EngineRoundTest(unittest.TestCase):
             out, ex = virtual_round(950, minutes=40)
         text = "\n".join(logs.output)
         self.assertIn("up to 6 domains", text)
+        self.assertIn("hypercube cells", text)
+        self.assertIn("wave 2 at", text)
         self.assertGreaterEqual(text.count(" born at "), 3)
+        self.assertIn("(a scout find)", text)                                  # rolling domains from the scout
         self.assertIn("funnel at", text)
+        funnel = [l for l in logs.output if "funnel at" in l and " keeps " in l][0]
+        kept = [float(x.split(":")[1].split("/")[0]) for x in funnel.split("keeps ")[1].split()]
+        best_before = max(float(m) for l in logs.output[:logs.output.index(funnel)]
+                          for m in re.findall(r"-> ([\d.]+) via", l))
+        self.assertGreaterEqual(max(kept), best_before - 1e-6)                # the holder of the best is kept
         self.assertGreater(ex.utilization(), 0.85)
         self.assertGreater(out.evaluated, 8000)
         self.assertGreater(out.best.score, 91.0)
@@ -251,6 +294,18 @@ class EngineRoundTest(unittest.TestCase):
         last = [l for l in logs.output if " domains " in l][-1]
         leader = max(float(x.split(":")[1].split("/")[0]) for x in last.split("domains ")[1].split(" | ")[0].split())
         self.assertGreaterEqual(leader, out.best.score - 0.3)
+
+    def test_a_slow_tail_does_not_hold_the_timed_steps(self):
+        """30% of the configs run 9 minutes (the hypercube's heavy cells): wave 2 still goes out on time, the
+        idle workers are used, the opening comes when due."""
+        heavy = lambda job: 540.0 if int(job.config.key[:2], 16) % 10 < 3 else 150.0
+        with self.assertLogs("search.engine3", level="INFO") as logs:
+            out, ex = virtual_round(950, minutes=20, duration=heavy)
+        wave2 = [l for l in logs.output if "wave 2 at" in l][0]
+        self.assertLessEqual(float(wave2.split("t+")[1].split("m")[0]), 5.1)
+        opening = [l for l in logs.output if "opening done" in l][0]
+        self.assertLessEqual(float(opening.split("t+")[1].split("m")[0]), 11.0)   # virtual time moves by result arrivals
+        self.assertGreater(ex.utilization(), 0.8)
 
     def test_crashes_are_counted_and_not_fatal(self):
         bad = lambda job: int(job.config.key[:2], 16) % 8 == 0

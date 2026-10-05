@@ -16,13 +16,12 @@ equal scores are common, and categorical axes have no step at all. The domain th
   shaking           only in coarse mode and only once the sweep is exhausted: perturb k axes of the best (k = 2, 3, 5,
                     8 in turn), then one neighbourhood round around the best of the points; the domain moves there
                     only if that beats its best (variable neighbourhood search's escape, started near the good point)
-  injection         a new domain's first sweep also carries a full-range probe of every axis (PROBE_POINTS evenly
-                    spaced values): the legacy project's allele injection, its best move per evaluation
   bracket           at the end of each batch (BATCH tests completed in this domain): 4 values across every live axis
                     around the centre, run in parallel, plus all pairs among the 5 strongest axes - the feasible form
                     of a dense grid; also early, on spare workers, once per centre. In fine mode its offsets shrink
-  freeze            FREEZE_BATCHES batches without a gain: the domain is frozen - its best stays a candidate, its
-                    workers go to the others, its region is not explored again
+  freeze            the fine sweep exhausted down to every axis's floor, or no gain of RESOLUTION (cumulative) for
+                    STALL_S: the domain is frozen - its best stays a candidate, its workers go to the others, its
+                    region is not explored again
   siblings          a structural move carries SIBLINGS cheap variations of itself (one genotyping, one PairHMM step):
                     the question "does this move work better with another threshold / PCR model", for 13% of a run,
                     packed into the move's traversal by the evaluator
@@ -59,7 +58,9 @@ TRIPLE_AXES = 5
 TRIPLES_MAX = 40
 COARSE_SCALES = (1.0, 0.5, 2.0)
 FINE_GAIN = 0.05                       # a batch below this gain: the slope has flattened - fine mode
-FREEZE_BATCHES = 2                     # this many batches without a gain: frozen
+FREEZE_BATCHES = 2                     # (kept for the record) batches without a gain; freezing is by exhaustion now
+RESOLUTION = 0.05                      # the local score resolves the truth only above this: smaller gains are noise
+STALL_S = 12 * 60                      # no gain >= RESOLUTION (cumulative) for this long: frozen
 BACK_FRAC = 0.8                        # a set of moves counts as back once this share of it is
 STEP_MAX = 0.5
 SIBLINGS = 2
@@ -129,6 +130,9 @@ class Domain:
         self.history: List[Tuple[float, float]] = [(now, score)]
         self.retired = False
         self.frozen = False
+        self.real_gain_at = now                          # the last time the gains since then reached RESOLUTION
+        self.small_gains = 0.0
+        self.exhausted_at_floor = False
 
     # ---- state ----------------------------------------------------------------------------------------------
     def far(self, other: Config, names: Sequence[str]) -> int:
@@ -331,10 +335,6 @@ class Domain:
             for sc in COARSE_SCALES:
                 out += self.neighbourhood1(self.centre, self.best, live, scale=sc)
             out += self.neighbourhood2(live, rng)
-            if self.generation == 0:                              # injection: the whole range of every axis, once
-                for axis in live:
-                    for v in self.probe_values(axis):
-                        self._add("probe", self.centre, self.best, {axis: v}, 1, out)
         else:
             sc = self.fine_scale
             out += self.neighbourhood1(self.centre, self.best, live, scale=sc, skip=self.flat_axes)
@@ -369,7 +369,9 @@ class Domain:
                 self.fine_scale *= 0.5
                 self.fresh_centre = True
                 return self.refill(live, rng, target)
-            return out                                            # at the floor: nothing left; the batch rule freezes it
+            self.exhausted_at_floor = True                        # nothing left at any scale: frozen
+            self.frozen = True
+            return out
         # coarse and exhausted: shake
         room = max(SHAKE_POINTS, target - self.inflight)
         sh = self.shake
@@ -409,11 +411,7 @@ class Domain:
             out += self.neighbourhood2(live, rng, scale=self.final_scale, kind="final")
             if out:
                 self.sweep_sent, self.sweep_back = len(out), 0
-        room = max(SHAKE_POINTS, target - self.inflight - len(out))
-        self.shakes += 1
-        self.shake = Shake(self.shakes, 2)
-        out += self.shake_points(live, rng, 2, self.shake.id, room, scale=FINAL_SHAKE_SCALE)
-        self.pool.extend(out)
+        self.pool.extend(out)                                     # no filler: spare workers belong to the scout
         return out
 
     def start_bracket_moves(self, live: Sequence[str]) -> List[Move]:
@@ -444,9 +442,11 @@ class Domain:
             self.fine_scale = 1.0
             self.fresh_centre = True
             self.pool = [m for m in self.pool if m.kind not in ("shake", "local")]
-        if len(self.gains) >= FREEZE_BATCHES and all(g <= ACCEPT_MIN for g in self.gains[-FREEZE_BATCHES:]):
-            self.frozen = True
         return gain
+
+    def stalled(self, now: float) -> bool:
+        """No gain the truth can see for STALL_S: the climb is over on this hill."""
+        return now - self.real_gain_at >= STALL_S
 
     def start_final(self, live: Sequence[str], rng: random.Random, target: int = 0) -> int:
         """The last minutes on this one point: neighbourhood 1 at half steps, all pairs of the top axes, small shakes."""
@@ -569,6 +569,10 @@ class Domain:
             self.steps[axis] = max(self._step_floor(axis), self.steps[axis] * 0.5)
 
     def _recentre(self, config: Config, score: float, now: float, axes: Sequence[str], sideways: bool = False) -> None:
+        if not sideways:
+            self.small_gains += score - self.best
+            if self.small_gains >= RESOLUTION - 1e-9:        # gains below the resolution only count once they add up
+                self.real_gain_at, self.small_gains = now, 0.0
         self.centre, self.best = config, score
         if not sideways:
             self.improved_at = now
