@@ -18,21 +18,42 @@ _TRUTH_PER_CLASS = {"snp_hom": 5000, "snp_het": 11000, "indel_1bp": 1600,
 
 
 class FakeRunner:
-    def __init__(self, ranges: ParamRanges, seed: int = 0):
-        self.ranges, self.seed = ranges, seed
+    def __init__(self, ranges: ParamRanges, seed: int = 0, batching: bool = False, hills: int = 1):
+        """batching: expose GATK's branch key and variant costs, so an executor batches riders as the fleet does
+        (the engine's tests); off, every config is its own run (the older strategies' tests). hills: the landscape
+        has this many peaks (the second and later ones a little lower), so births, valleys and merges are tested."""
+        self.ranges, self.seed, self.batching, self.hills = ranges, seed, batching, max(1, hills)
         self.configs = {}
 
     def quality(self, config: Config) -> float:
         specs = self.ranges.tools[config.tool]
-        rng = random.Random(f"{self.seed}:{config.tool}")
-        d2 = 0.0
-        for name in sorted(specs):
-            s = specs[name]
-            if s.type not in ("int", "float") or s.min is None or s.max is None or s.max == s.min:
-                continue
-            opt = rng.random()
-            d2 += ((float(config.params.get(name, s.default)) - s.min) / (s.max - s.min) - opt) ** 2
-        return math.exp(-d2)
+        best = 0.0
+        for h in range(self.hills):
+            rng = random.Random(f"{self.seed}:{config.tool}" + (f":hill{h}" if h else ""))
+            d2 = 0.0
+            for name in sorted(specs):
+                s = specs[name]
+                if s.type not in ("int", "float") or s.min is None or s.max is None or s.max == s.min:
+                    continue
+                opt = rng.random()
+                d2 += ((float(config.params.get(name, s.default)) - s.min) / (s.max - s.min) - opt) ** 2
+            best = max(best, (1.0 - 0.03 * h) * math.exp(-d2))
+        return best
+
+    def branch_key(self, config: Config, fidelity: str = FULL):
+        """Like GatkRunner: configs differing only in branchable (genotyping/PairHMM/assembly/activity) params
+        share a traversal in the simulator. None (nothing shares) unless `batching`."""
+        if not self.batching:
+            return None
+        from evaluator.gatk import BRANCH_PARAMS
+        return Config(config.tool, {k: v for k, v in config.params.items() if k not in BRANCH_PARAMS}).key + fidelity
+
+    def variant_cost(self, main: Config, variant: Config, fidelity: str = FULL):
+        from evaluator.gatk import BRANCH_PARAMS, VARIANT_COST, _TIER_OF
+        if not self.batching or self.branch_key(main, fidelity) != self.branch_key(variant, fidelity):
+            return None
+        changed = [p for p in BRANCH_PARAMS if main.params.get(p) != variant.params.get(p)]
+        return max((VARIANT_COST[_TIER_OF[p]] for p in changed), default=0.0)
 
     def run(self, round: Round, config: Config, fidelity: str = FULL) -> CallSet:
         self.configs[config.key] = config

@@ -6,10 +6,13 @@ agent (evaluator/fleet/node.py --stdio); jobs go down and scored callsets come b
 
 - joining: main pushes the self-test bundle, starts the agent, and accepts the node only if its self-test passed and
   its code digest equals main's
-- rounds: publish_round() pushes each round's truth files (and, in replays, the BAM) to every node with rsync; on
-  live rounds nodes fetch the BAM from the presigned URL themselves
+- rounds: publish_round() ships the round itself (the BAM with rsync in replays; on live rounds nodes fetch it from
+  the presigned URL) and nodes start GATK at once; publish_answer_set() ships the truth files when the answer set
+  exists (and again on every new version) - results made before it are held on the node and scored then
 - scheduling: one queue with dedup and a result cache; a family (configs that can share a GATK run) is always sent as
-  one group; a node gets groups while it has fewer open groups than workers
+  one group; a node gets groups while it has fewer open groups than workers. A latency-lane group goes to the
+  fastest free node that has its round; one running late there is duplicated on a free faster node while the
+  fleet has idle workers: the first result wins and the other run is aborted
 - failure: when a session ends, that node's unfinished jobs go straight back to the queue; main reconnects later
 - the inventory is re-read at every round start (publish_round): new hosts join, disabled ones are closed
 """
@@ -33,19 +36,39 @@ from common.settings import SETTINGS
 from common.types import AnswerSet, CallSet, EvalJob, Round
 from evaluator.fleet import codec, selftest
 from evaluator.fleet.inventory import INVENTORY, Host, code_digest, ensure_agent, load
-from evaluator.local import MAX_BATCH_S, SOLO_S, extra_seconds, failed, job_key
+from evaluator.local import MAX_BATCH_S, SOLO_S, failed, job_key
 
 log = logging.getLogger(__name__)
 LOG_DIR = Path.home() / ".minos" / "fleet" / "logs"
-KEEP_ROUNDS = 3                                              # rounds kept on main and nodes (older ones are pruned)
+SPEEDS = Path.home() / ".minos" / "fleet" / "speeds.json"   # host -> measured solo time, so routing is right from the start
+LATENCY_RIDER_MAX = 0.02      # a latency-lane batch admits only riders this cheap (a genotyping variant: 0.011 of a run)
+SOLO_EMA = 0.3                # weight of each new solo-time sample in a node's running estimate
+KEEP_ROUNDS = 3               # rounds kept on main and nodes (older ones are pruned)
+OVERDUE = 1.5                 # a latency group running this many times its expected time is a straggler
+SLOW_FACTOR = 1.5             # a node slower than this times the fastest gets no latency-lane job: it waits for a fast one
+DUPLICATE_GAIN = 0.25         # a duplicate must finish this share of the remaining time sooner, and at least a
+                              # fifth of a run on the faster node (not a few seconds' difference in estimates)
 
 
 @dataclass
 class _Published:
     round: Round
-    answer_set: AnswerSet
+    answer_set: Optional[AnswerSet] = None                   # None until main has built it
     bam_url: Optional[str] = None
     bai_url: Optional[str] = None
+
+
+@dataclass
+class _Group:
+    """One GATK run on a node: a head and its riders."""
+    jobs: Dict[str, EvalJob]                                 # job_id -> job, still wanted from this run
+    ids: Tuple[str, ...]                                     # every job sent in it
+    units: float                                             # predicted cost in solo runs
+    t0: float
+    lane: str
+    due: int                                                 # results this node still owes for it
+    duplicate: bool = False                                  # a speculative copy of a run elsewhere
+    twin: Optional[Tuple["_Session", int]] = field(default=None, repr=False)   # the other copy (session, group id)
 
 
 @dataclass
@@ -55,21 +78,36 @@ class _Session:
     workers: int = 0
     ready: bool = False
     rounds_ready: set = field(default_factory=set)
-    rounds_sent: set = field(default_factory=set)            # (round_id, answer-set version) shipped to the node
-    rounds_failed: set = field(default_factory=set)          # round_ids the node could not prepare
-    groups: List[set] = field(default_factory=list)          # job_ids per open group (one GATK run each)
+    rounds_sent: set = field(default_factory=set)            # round_ids shipped to the node
+    asets_sent: set = field(default_factory=set)             # (round_id, answer-set version) shipped to the node
+    rounds_failed: set = field(default_factory=set)          # round_ids the node could not prepare or score
+    groups: Dict[int, _Group] = field(default_factory=dict)  # open GATK runs by group id
     jobs: Dict[str, EvalJob] = field(default_factory=dict)   # outstanding job_id -> job
+    job_group: Dict[str, int] = field(default_factory=dict)  # job_id -> group id
+    group_seq: int = 0
     done: int = 0                                            # results delivered (dashboard)
     gatk_runs: int = 0                                       # groups handed to it: one GATK run each (dashboard)
-    gatk_runs_done: int = 0                                  # ... whose every result came back
+    gatk_runs_done: int = 0                                  # ... whose every result came back from it
     outq: "queue.Queue[Optional[str]]" = field(default_factory=queue.Queue)
     closed: bool = False
     finished: bool = False                                   # its session thread has ended
     rejected: str = ""
     logf: Optional[object] = None                            # the node's stderr, kept per host
+    solo_s: float = SOLO_S                                   # measured: seconds one solo GATK run takes THERE (EMA)
+    solo_samples: int = 0
+
+    @property
+    def name(self) -> str:
+        return self.host.name if self.host is not None else "?"
 
     def open_groups(self) -> int:
-        return sum(1 for g in self.groups if g)
+        return len(self.groups)
+
+    def note_group_done(self, units: float, seconds: float) -> None:
+        """A whole group came back after `seconds`: one solo-run-equivalent took seconds / units here."""
+        sample = min(3600.0, max(0.05, seconds / max(units, 0.05)))
+        self.solo_s = sample if self.solo_samples == 0 else (1 - SOLO_EMA) * self.solo_s + SOLO_EMA * sample
+        self.solo_samples += 1
 
     def send(self, msg: dict) -> bool:
         """Queue a message for the node. Writing happens on the session's writer thread, so a slow link never
@@ -121,9 +159,32 @@ class FleetExecutor:
         self._stopping = False
         self._now = time.time
         self._finish_by: Optional[float] = None                  # do not send a batch that would still be running then
+        self.speculated = 0                                      # latency groups duplicated on a faster node
+        self._speeds: Dict[str, float] = self._load_speeds()
+        self.speculation_won = 0                                 # ... whose duplicate delivered a result first
         LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # ---- hosts --------------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _load_speeds() -> Dict[str, float]:
+        try:
+            return {k: float(v) for k, v in json.loads(SPEEDS.read_text()).items()}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_speeds(self) -> None:
+        """Every node's measured solo time, by host: the next run routes right from its first minute."""
+        for s in self._sessions.values():
+            if s.solo_samples:
+                self._speeds[s.name] = round(s.solo_s, 1)
+        try:
+            SPEEDS.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SPEEDS.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._speeds, indent=1))
+            tmp.replace(SPEEDS)
+        except OSError:
+            pass
+
     def start(self) -> "FleetExecutor":
         self.refresh_hosts()
         return self
@@ -154,7 +215,7 @@ class FleetExecutor:
                     self._connect(s)
                     self._read(s)
                 except Exception as e:  # noqa: BLE001 - one host failing must not stop the fleet
-                    log.warning("%s: session error: %s", s.host.name, e)
+                    log.warning("%s: session error: %s", s.name, e)
                 with self._lock:
                     self._drop(s, "session ended")
                 if s.rejected or s.closed or self._stopping:
@@ -168,7 +229,8 @@ class FleetExecutor:
         bundle = selftest.make_bundle(SETTINGS.cache_dir, SETTINGS.rounds_dir)
         push(h, [bundle["bam"], bundle["bai"]], f"{h.repo}/cache/selftest/")
         args = h.extra.get("node_args", "") + (f" --workers {int(h.workers)}" if h.workers else "")
-        env = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {"DATA_DIR": h.data_dir, **h.extra.get("env", {})}.items())
+        shared = {"MINOS_NODE_SHARED_DATA": "1"} if h.local else {}          # main's rounds are not the node's to delete
+        env = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {"DATA_DIR": h.data_dir, **shared, **h.extra.get("env", {})}.items())
         repo = shlex.quote(h.repo)
         cmd = h.ssh(f"cd {repo} && {env} {repo}/.venv/bin/python -m evaluator.fleet.node --stdio {args}")
         s.logf = open(LOG_DIR / f"{h.name.replace(':', '_')}.log", "a")
@@ -204,46 +266,113 @@ class FleetExecutor:
             elif msg.get("code") != self.code:
                 s.rejected = f"code differs from main ({msg.get('code')} != {self.code}): run control sync"
             if s.rejected:
-                log.error("%s: rejected - %s", s.host.name, s.rejected)
+                log.error("%s: rejected - %s", s.name, s.rejected)
                 s.hang_up()
                 return
             s.workers, s.ready = int(msg["workers"]), True
-            log.info("%s: ready, %d workers", s.host.name, s.workers)
+            known = self._speeds.get(s.name)
+            if known and s.solo_samples == 0:                     # last time's measurement, until this run has its own
+                s.solo_s = float(known)
+            log.info("%s: ready, %d workers%s", s.name, s.workers, f", {s.solo_s:.0f} s per run last time" if known else "")
             threading.Thread(target=self._send_rounds, args=(s,), daemon=True).start()
         elif t == "round_ready":
             s.rounds_ready.add(msg["round_id"])
             self._pump()
         elif t == "round_failed":
-            log.error("%s: round %s unusable there: %s", s.host.name, msg["round_id"], msg.get("error"))
-            s.rounds_failed.add(msg["round_id"])
-            self._fail_if_unservable(msg["round_id"])
+            log.error("%s: round %s unusable there: %s", s.name, msg["round_id"], msg.get("error"))
+            self._unserve(s, msg["round_id"])
         elif t == "result":
-            cs = codec.callset_from(msg["callset"])
-            if cs.round_id in self._ended:
-                return                                            # the round is over; its jobs were already freed
-            job = s.jobs.pop(cs.job_id, None)
-            for g in s.groups:
-                g.discard(cs.job_id)
-            open_before = len(s.groups)
-            s.groups = [g for g in s.groups if g]
-            s.gatk_runs_done += open_before - len(s.groups)
-            if job is not None:
-                s.done += 1
-                self._finish(cs, job)
-            self._pump()
+            self._result(s, codec.callset_from(msg["callset"]))
+
+    def _result(self, s: _Session, cs: CallSet) -> None:
+        """A scored callset from node `s`. The first result for a job wins (a speculative duplicate elsewhere is then
+        aborted); a group whose every result came from this node times the node. Lock held."""
+        if cs.round_id in self._ended:
+            return                                                # the round is over; its jobs were already freed
+        job = s.jobs.pop(cs.job_id, None)
+        gid = s.job_group.pop(cs.job_id, None)
+        g = s.groups.get(gid) if gid is not None else None
+        if g is not None:
+            g.jobs.pop(cs.job_id, None)
+            g.due -= 1
+            if g.due <= 0:                                        # every result of the run came back from here
+                s.note_group_done(g.units, self._now() - g.t0)
+                s.gatk_runs_done += 1
+                del s.groups[gid]
+                if s.solo_samples % 10 == 1:
+                    self._save_speeds()
+            elif not g.jobs:                                      # the rest was delivered by its twin
+                del s.groups[gid]
+        if job is not None:
+            s.done += 1
+            if g is not None and g.duplicate and job_key(job) not in self._done:
+                self.speculation_won += 1
+            self._finish(cs, job)
+            if g is not None and g.twin is not None:
+                self._twin_served(g, cs.job_id)
+        self._pump()
+
+    def _twin_served(self, g: _Group, job_id: str) -> None:
+        """`job_id` came back from `g`'s node first: its copy in the twin run is not needed; once nothing of that run
+        is needed any more, its node aborts it (the GATK container is killed, the worker freed)."""
+        other, ogid = g.twin
+        og = other.groups.get(ogid)
+        if og is None:
+            g.twin = None
+            return
+        og.jobs.pop(job_id, None)
+        other.jobs.pop(job_id, None)
+        other.job_group.pop(job_id, None)
+        if not og.jobs:
+            del other.groups[ogid]
+            other.send({"type": "abort_jobs", "job_ids": list(og.ids)})
+            g.twin = None
 
     def _drop(self, s: _Session, why: str) -> None:
-        """Session over: its unfinished jobs go back to the queue at once. Caller holds the lock."""
+        """Session over: its unfinished jobs go back to the queue at once - except those its twin run elsewhere is
+        still computing. Caller holds the lock."""
         if s.jobs:
-            log.warning("%s: %s - %d jobs re-queued", s.host.name, why, len(s.jobs))
-        for job in s.jobs.values():
-            if job_key(job) not in self._done:
-                heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
-        s.jobs, s.groups, s.ready = {}, [], False
-        s.rounds_ready, s.rounds_sent, s.rounds_failed = set(), set(), set()
+            log.warning("%s: %s - %d jobs re-queued", s.name, why, len(s.jobs))
+        for g in s.groups.values():
+            running_elsewhere: set = set()
+            if g.twin is not None:
+                other, ogid = g.twin
+                og = other.groups.get(ogid)
+                if og is not None:
+                    og.twin = None                                # the other copy goes on alone
+                    running_elsewhere = set(og.jobs)
+            for jid, job in g.jobs.items():
+                if jid not in running_elsewhere and job_key(job) not in self._done:
+                    heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+        s.jobs, s.groups, s.job_group, s.ready = {}, {}, {}, False
+        s.rounds_ready, s.rounds_sent, s.asets_sent, s.rounds_failed = set(), set(), set(), set()
         if s.proc and s.proc.poll() is None:
             s.hang_up()
         self._cv.notify_all()
+        self._pump()
+
+    def _unserve(self, s: _Session, rid: str) -> None:
+        """Node `s` cannot serve round `rid` (it could not prepare it, or its truth never arrived there): nothing
+        more of it goes there, its unfinished work of the round goes back to the queue, and if no ready node can
+        serve the round its queued jobs fail. Lock held."""
+        s.rounds_failed.add(rid)
+        s.rounds_ready.discard(rid)
+        mine = []
+        for gid, g in list(s.groups.items()):
+            if any(j.round.round_id == rid for j in g.jobs.values()):
+                mine += list(g.jobs)
+                for jid, job in g.jobs.items():
+                    if job_key(job) not in self._done:
+                        heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+                if g.twin is not None and g.twin[0].groups.get(g.twin[1]) is not None:
+                    g.twin[0].groups[g.twin[1]].twin = None
+                del s.groups[gid]
+        for jid in mine:
+            s.jobs.pop(jid, None)
+            s.job_group.pop(jid, None)
+        if mine:
+            s.send({"type": "abort", "round_id": rid})
+        self._fail_if_unservable(rid)
         self._pump()
 
     def _fail_if_unservable(self, rid: str) -> None:
@@ -268,37 +397,68 @@ class FleetExecutor:
             self._cv.notify_all()
 
     # ---- rounds -------------------------------------------------------------------------------------------------------
-    def publish_round(self, round: Round, answer_set: AnswerSet, bam_url: Optional[str] = None,
-                      bai_url: Optional[str] = None) -> None:
+    def publish_round(self, round: Round, bam_url: Optional[str] = None, bai_url: Optional[str] = None) -> None:
+        """The round itself - its BAM (pushed from main in replays, fetched from the presigned URL by each node on
+        live rounds) and region - before its answer set exists: nodes start GATK at once and hold the results."""
         self.refresh_hosts()
         with self._lock:
             self._rounds.pop(round.round_id, None)
-            self._rounds[round.round_id] = _Published(round, answer_set, bam_url, bai_url)
+            self._rounds[round.round_id] = _Published(round, None, bam_url, bai_url)
             while len(self._rounds) > KEEP_ROUNDS:              # oldest first (dicts keep insertion order)
                 self._rounds.pop(next(iter(self._rounds)))
             sessions = [s for s in self._sessions.values() if s.ready]
         for s in sessions:
             threading.Thread(target=self._send_rounds, args=(s,), daemon=True).start()
 
+    def publish_answer_set(self, round_id: str, answer_set: AnswerSet) -> None:
+        """The round's truth files (a first version, or a newer one): every node scores with it from now on, starting
+        with the results it held."""
+        with self._lock:
+            p = self._rounds.get(round_id)
+            if p is None:
+                log.warning("answer set for an unpublished round %s ignored", round_id)
+                return
+            p.answer_set = answer_set
+            sessions = [s for s in self._sessions.values() if s.ready]
+        for s in sessions:
+            threading.Thread(target=self._send_rounds, args=(s,), daemon=True).start()
+
     def _send_rounds(self, s: _Session) -> None:
+        """Ship to node `s` whatever it has not got yet: each kept round (once), then its answer set (once per
+        version). Files go by rsync before the message; a failed shipment makes the round unservable there."""
         with self._lock:
             rounds = list(self._rounds.items())
         keep = [rid for rid, _ in rounds]
         for rid, p in rounds:
-            key = (rid, p.answer_set.version)
             with self._lock:
-                if key in s.rounds_sent or not s.ready:
+                if not s.ready:
+                    return
+                send_round = rid not in s.rounds_sent and rid not in s.rounds_failed
+                if send_round:
+                    s.rounds_sent.add(rid)
+            if send_round:
+                try:
+                    s.send({**round_message(s.host, p.round, p.bam_url, p.bai_url), "keep": keep})
+                except Exception as e:  # noqa: BLE001 - e.g. rsync failed: this node cannot serve the round
+                    log.error("%s: could not ship round %s: %s", s.name, rid, e)
+                    with self._lock:
+                        s.rounds_sent.discard(rid)
+                        self._unserve(s, rid)
                     continue
-                s.rounds_sent.add(key)
-                s.rounds_ready.discard(rid)                      # a new version: wait for the node to re-prepare
-            try:
-                s.send({**round_message(s.host, p.round, p.answer_set, p.bam_url, p.bai_url), "keep": keep})
-            except Exception as e:  # noqa: BLE001 - e.g. rsync failed: this node cannot serve the round
-                log.error("%s: could not ship round %s: %s", s.host.name, rid, e)
-                with self._lock:
-                    s.rounds_sent.discard(key)
-                    s.rounds_failed.add(rid)
-                    self._fail_if_unservable(rid)
+            with self._lock:
+                a = p.answer_set
+                key = (rid, a.version) if a is not None else None
+                send_aset = key is not None and key not in s.asets_sent and rid not in s.rounds_failed
+                if send_aset:
+                    s.asets_sent.add(key)
+            if send_aset:
+                try:
+                    s.send(answer_set_message(s.host, p.round, a))
+                except Exception as e:  # noqa: BLE001
+                    log.error("%s: could not ship the answer set of %s: %s", s.name, rid, e)
+                    with self._lock:
+                        s.asets_sent.discard(key)
+                        self._unserve(s, rid)
 
     # ---- Executor protocol ----------------------------------------------------------------------------------------
     def set_finish_by(self, ts: Optional[float]) -> None:
@@ -306,8 +466,10 @@ class FleetExecutor:
         with self._lock:
             self._finish_by = ts
 
-    def _room(self) -> float:
-        room = MAX_BATCH_S
+    def _room(self, s: Optional["_Session"] = None) -> float:
+        """Seconds a batch started now on node `s` may take: the family cap (MAX_BATCH_S for a node at the planning
+        solo time, scaled by the node's own measured solo time) and the time left before the final submission."""
+        room = MAX_BATCH_S * (s.solo_s / SOLO_S if s is not None else 1.0)
         if self._finish_by is not None:
             room = min(room, self._finish_by - self._now())
         return room
@@ -333,6 +495,7 @@ class FleetExecutor:
     def poll(self, timeout: float) -> List[CallSet]:
         deadline = time.time() + timeout
         with self._cv:
+            self._speculate()                                     # main polls every second: the straggler check
             while not self._ready and time.time() < deadline:
                 self._cv.wait(max(0.0, deadline - time.time()))
             out, self._ready = self._ready, []
@@ -358,14 +521,16 @@ class FleetExecutor:
             self._queue = keep
             heapq.heapify(self._queue)
             for s in self._sessions.values():
-                mine = [jid for jid, j in s.jobs.items() if j.round.round_id == round_id]
+                mine = []
+                for gid, g in list(s.groups.items()):
+                    if any(j.round.round_id == round_id for j in g.jobs.values()):
+                        mine += list(g.jobs)
+                        del s.groups[gid]
                 if not mine:
                     continue
                 for jid in mine:
                     self._inflight.pop(job_key(s.jobs.pop(jid)), None)
-                for g in s.groups:
-                    g.difference_update(mine)
-                s.groups = [g for g in s.groups if g]
+                    s.job_group.pop(jid, None)
                 s.send({"type": "abort", "round_id": round_id})
             self._pump()
 
@@ -405,18 +570,20 @@ class FleetExecutor:
         with self._lock:
             nodes = [dict(node=f"node {i}", ready=s.ready, workers=s.workers, busy=s.open_groups(), jobs=len(s.jobs),
                           done=s.done, gatk_runs=s.gatk_runs, gatk_runs_done=s.gatk_runs_done,
-                          rejected=bool(s.rejected))
+                          rejected=bool(s.rejected), solo_s=round(s.solo_s))
                      for i, s in enumerate(self._sessions.values(), 1)]
             return {"kind": "fleet", "queued": len(self._queue), "nodes": nodes, "done": sum(n["done"] for n in nodes),
                     "gatk_runs": sum(n["gatk_runs"] for n in nodes),
                     "gatk_runs_done": sum(n["gatk_runs_done"] for n in nodes),
                     "workers": sum(n["workers"] for n in nodes if n["ready"]),
-                    "running": sum(n["busy"] for n in nodes if n["ready"])}
+                    "running": sum(n["busy"] for n in nodes if n["ready"]),
+                    "speculated": self.speculated, "speculation_won": self.speculation_won}
 
     def nodes(self) -> List[dict]:
         with self._lock:
             return [dict(host=n, ready=s.ready, workers=s.workers, open_groups=s.open_groups(), jobs=len(s.jobs),
-                         rounds=len(s.rounds_ready), rejected=s.rejected) for n, s in self._sessions.items()]
+                         rounds=len(s.rounds_ready), rejected=s.rejected, solo_s=round(s.solo_s, 1))
+                    for n, s in self._sessions.items()]
 
     def close(self) -> None:
         """Stop every node (closing its stdin ends the agent, which kills its GATK containers)."""
@@ -428,38 +595,131 @@ class FleetExecutor:
                     s.hang_up()
 
     # ---- scheduling -------------------------------------------------------------------------------------------------
-    def _pump(self) -> None:
-        """Hand queued groups to nodes with free workers that have the group's round ready. Caller holds the lock."""
-        for s in self._sessions.values():
-            while s.ready and s.open_groups() < s.workers and self._queue:
-                groups = self._take_groups(s.rounds_ready)
-                if not groups:
-                    break
-                g = groups[0]
-                for j in g:
-                    s.jobs[j.job_id] = j
-                s.groups.append({j.job_id for j in g})
-                s.gatk_runs += 1
-                if not s.send({"type": "jobs", "groups": [[codec.job_to(j) for j in g]]}):
-                    break                                      # the reader sees the session end and re-queues
+    def _peek(self) -> Optional[EvalJob]:
+        """The top live queued job (cancelled or done ones are dropped on the way), or None."""
+        while self._queue:
+            job = self._queue[0][2]
+            if self._skip(job):
+                heapq.heappop(self._queue)
+                continue
+            return job
+        return None
 
-    def _take_groups(self, rounds_ready: set) -> List[List[EvalJob]]:
-        """The top queued job whose round the node has and that can finish in time, plus queued jobs that can
-        share its GATK run without pushing the batch past the family cap or the time left."""
+    def _pump(self) -> None:
+        """Hand queued groups to nodes. The top job picks the node: a latency-lane job goes to the fastest node
+        with a free worker that has its round (its result is on the search's critical path); a throughput job goes
+        to the node with the largest free share, so work spreads over the fleet instead of filling the first node.
+        Caller holds the lock."""
+        stuck = set()                                          # nodes that could serve nothing this pass
+        ready = [s for s in self._sessions.values() if s.ready]
+        fastest = min((s.solo_s for s in ready), default=SOLO_S)
+        while self._queue:
+            job = self._peek()
+            if job is None:
+                break
+            free = [s for s in self._sessions.values()
+                    if s.ready and id(s) not in stuck and s.open_groups() < s.workers]
+            able = [s for s in free if job.round.round_id in s.rounds_ready]
+            latency_ok = True
+            if able and job.lane == "latency":
+                fast = [s for s in able if s.solo_s <= SLOW_FACTOR * fastest]
+                if fast:
+                    s = min(fast, key=lambda x: x.solo_s)
+                else:                                          # only slow nodes free: the move waits, they take width
+                    s, latency_ok = able[0], False
+            elif able:
+                s = max(able, key=lambda x: (x.workers - x.open_groups()) / max(1, x.workers))
+            elif free:
+                s = free[0]                                    # the top job's round is not ready there: serve what is
+            else:
+                break
+            if not self._dispatch(s, latency_ok):
+                stuck.add(id(s))
+
+    def _dispatch(self, s: _Session, latency_ok: bool = True) -> bool:
+        """One group to node `s`; False if it had nothing it could take (or the session is gone)."""
+        groups = self._take_groups(s, latency_ok)
+        if not groups:
+            return False
+        g, units = groups[0]
+        self._send_group(s, g, units)
+        return not s.closed and s.proc is not None
+
+    def _send_group(self, s: _Session, jobs: List[EvalJob], units: float, duplicate: bool = False,
+                    twin: Optional[Tuple[_Session, int]] = None) -> int:
+        """Send `jobs` as one GATK run to node `s`; returns its group id. Lock held."""
+        gid = s.group_seq
+        s.group_seq += 1
+        s.groups[gid] = _Group({j.job_id: j for j in jobs}, tuple(j.job_id for j in jobs), units, self._now(),
+                               jobs[0].lane, len(jobs), duplicate, twin)
+        for j in jobs:
+            s.jobs[j.job_id] = j
+            s.job_group[j.job_id] = gid
+        s.gatk_runs += 1
+        s.send({"type": "jobs", "groups": [[codec.job_to(j) for j in jobs]]})
+        return gid
+
+    def _speculate(self) -> None:
+        """Width is cheap, latency is not: a latency-lane run that is overdue on its node, or that a free faster
+        node could redo before its node is expected to finish, is duplicated there while the fleet has a worker to
+        spare (nothing queued could use it: _pump ran first). The first result wins; the other run is aborted.
+        Lock held."""
+        now = self._now()
+        for s in list(self._sessions.values()):
+            if not s.ready:
+                continue
+            for gid, g in list(s.groups.items()):
+                if g.lane != "latency" or g.twin is not None or g.duplicate or not g.jobs:
+                    continue
+                rid = next(iter(g.jobs.values())).round.round_id
+                others = [o for o in self._sessions.values()
+                          if o is not s and o.ready and rid in o.rounds_ready and o.open_groups() < o.workers]
+                if not others:
+                    continue
+                f = min(others, key=lambda o: o.solo_s)
+                expected, elapsed, fresh = s.solo_s * g.units, now - g.t0, f.solo_s * g.units
+                remaining = expected - elapsed
+                worthwhile = remaining - fresh >= max(0.2 * f.solo_s, DUPLICATE_GAIN * remaining)
+                if fresh > self._room(f) or not (elapsed > OVERDUE * expected or worthwhile):
+                    continue
+                jobs = list(g.jobs.values())
+                gid2 = self._send_group(f, jobs, g.units, duplicate=True, twin=(s, gid))
+                g.twin = (f, gid2)
+                self.speculated += 1
+                log.info("%s: latency run of %d jobs at %.0f s of %.0f expected - duplicated on %s (%.0f s there)",
+                         s.name, len(jobs), elapsed, expected, f.name, fresh)
+
+    def _variant_frac(self, main: EvalJob, variant: EvalJob) -> Optional[float]:
+        """Extra cost of `variant` inside `main`'s run, as a fraction of a solo run; None = cannot share it."""
+        cost = getattr(self.runner, "variant_cost", None)
+        if cost is None:
+            return 0.0                                         # a planner without costs: the old batch-anything rule
+        return cost(main.config, variant.config, main.fidelity)
+
+    def _take_groups(self, s: _Session, latency_ok: bool = True) -> List[Tuple[List[EvalJob], float]]:
+        """The top queued job whose round the node has and that can finish in time there, plus queued jobs that can
+        share its GATK run: a throughput head takes riders up to the family cap and the time left; a latency head
+        only riders cheaper than LATENCY_RIDER_MAX (genotyping variants), so its result is not delayed; a
+        latency-lane job never rides in another job's batch. `latency_ok` False: a slow node - latency heads stay
+        queued for a fast one. Times are this node's own (its measured solo time scales every cost).
+        Returns [(group, predicted cost in solo runs)]."""
         skipped, too_long, group = [], [], None
-        room = self._room()
+        room = self._room(s)
+        solo = s.solo_s
+        units = 1.0
         while self._queue and group is None:
             item = heapq.heappop(self._queue)
             job = item[2]
             if self._skip(job):
                 continue
-            if job.round.round_id not in rounds_ready:
+            if job.round.round_id not in s.rounds_ready or (job.lane == "latency" and not latency_ok):
                 skipped.append(item)
                 continue
-            if SOLO_S > room:
+            if solo > room:
                 too_long.append(job)
                 continue
-            group, seconds, bk = [job], SOLO_S, self._branch(job)
+            group, seconds, bk = [job], solo, self._branch(job)
+            cap = LATENCY_RIDER_MAX if job.lane == "latency" else 1.0
             if bk is not None:
                 keep = []
                 while self._queue:
@@ -468,12 +728,15 @@ class FleetExecutor:
                     if self._skip(other):
                         continue
                     extra = None
-                    if (len(group) < self.max_batch and other.round.round_id == job.round.round_id
-                            and self._branch(other) == bk):
-                        extra = extra_seconds(self.runner, job, other)
+                    if (len(group) < self.max_batch and other.lane != "latency"
+                            and other.round.round_id == job.round.round_id and self._branch(other) == bk):
+                        frac = self._variant_frac(job, other)
+                        if frac is not None and frac <= cap:
+                            extra = frac * solo
                     if extra is not None and seconds + extra <= room:
                         group.append(other)
                         seconds += extra
+                        units += extra / solo
                     else:
                         keep.append(other_item)
                 for it in keep:
@@ -482,7 +745,7 @@ class FleetExecutor:
             heapq.heappush(self._queue, it)
         for job in too_long:
             heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
-        return [group] if group else []
+        return [(group, units)] if group else []
 
     def _skip(self, job: EvalJob) -> bool:
         k = job_key(job)
@@ -521,17 +784,27 @@ def push(h: Host, files: List[str], dest_dir: str) -> None:
         raise RuntimeError(f"rsync to {h.name}: {p.stderr[-300:]}")
 
 
-def round_message(h: Host, r: Round, a: AnswerSet, bam_url: Optional[str], bai_url: Optional[str]) -> dict:
-    """Push this round's files to the host and describe the round with the host's own paths."""
-    rdir, adir = f"{h.data_dir}/rounds/{r.tag}", f"{h.repo}/cache/fleet/{r.tag}/v{a.version}"   # the node's own cache
-    truth = [a.notes["truth_vcf"], a.notes["mutations_vcf"]]
-    push(h, truth + [f + ".tbi" for f in truth if Path(f + ".tbi").exists()], adir + "/")
+def _node_paths(h: Host, r: Round) -> Tuple[str, str]:
+    """(the round's directory, the reference FASTA) as the node sees them."""
+    return f"{h.data_dir}/rounds/{r.tag}", f"{h.data_dir}/reference/{r.chrom}/{r.chrom}.fa"
+
+
+def round_message(h: Host, r: Round, bam_url: Optional[str], bai_url: Optional[str]) -> dict:
+    """Push this round's BAM to the host when main has it (a replay) and describe the round with the host's paths."""
+    rdir, ref = _node_paths(h, r)
     if not (bam_url and bai_url):                              # replay: main's own copy of the BAM
         push(h, [r.bam, r.bam + ".bai"], rdir + "/")
-    ref = f"{h.data_dir}/reference/{r.chrom}/{r.chrom}.fa"
     rnd = replace(r, bam=f"{rdir}/{Path(r.bam).name}", reference=ref, released_dir=None)
+    return {"type": "round", "round": codec.round_to(rnd), "bam_url": bam_url, "bai_url": bai_url}
+
+
+def answer_set_message(h: Host, r: Round, a: AnswerSet) -> dict:
+    """Push this version's truth files to the host's own cache and describe the answer set with the host's paths."""
+    _, ref = _node_paths(h, r)
+    adir = f"{h.repo}/cache/fleet/{r.tag}/v{a.version}"
+    truth = [a.notes["truth_vcf"], a.notes["mutations_vcf"]]
+    push(h, truth + [f + ".tbi" for f in truth if Path(f + ".tbi").exists()], adir + "/")
     notes = {"truth_vcf": f"{adir}/{Path(a.notes['truth_vcf']).name}",
              "mutations_vcf": f"{adir}/{Path(a.notes['mutations_vcf']).name}", "region": r.region, "reference": ref}
-    return {"type": "round", "round": codec.round_to(rnd),
-            "answer_set": {"version": a.version, "n_targets": a.n_targets, "notes": notes},
-            "bam_url": bam_url, "bai_url": bai_url}
+    return {"type": "answer_set", "round_id": r.round_id,
+            "answer_set": {"version": a.version, "n_targets": a.n_targets, "notes": notes}}

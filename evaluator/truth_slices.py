@@ -21,7 +21,7 @@ from pathlib import Path
 from common.settings import SETTINGS
 
 if SETTINGS.minos_subnet_dir not in sys.path:
-    sys.path.insert(0, SETTINGS.minos_subnet_dir)
+    sys.path.append(SETTINGS.minos_subnet_dir)
 
 CACHE_DIR = Path(SETTINGS.cache_dir) / "truth_slices"
 _lock = threading.Lock()

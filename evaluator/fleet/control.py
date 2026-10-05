@@ -1,7 +1,10 @@
 """Control every sub-VPS from main, over SSH, using the inventory (fleet.json in the repo folder).
 
     python -m evaluator.fleet.control status              reachable? cores, workers, docker, patch jar, genomes, code, disk
-    python -m evaluator.fleet.control provision [HOST..]  copy the repo + main's genomes, run scripts/setup_node.sh
+    python -m evaluator.fleet.control provision [HOST..]  copy the repo, run scripts/setup_node.sh (the node fetches
+                                                          the reference genomes itself), sync
+    python -m evaluator.fleet.control genomes [HOST..]    push main's reference genomes instead (a host that cannot
+                                                          reach the platform's reference endpoint)
     python -m evaluator.fleet.control sync [HOST..]       copy the repo + self-test bundle, rebuild the patch jar
     python -m evaluator.fleet.control selftest [HOST..]   run the node self-test everywhere
     python -m evaluator.fleet.control reap [HOST..]       kill GATK containers left by a crashed node (refuses while an
@@ -69,19 +72,20 @@ def status(h: Host) -> dict:
             "code_same_as_main": v.get("code") == code_digest(), "workers": h.workers or v.get("workers", "?")}
 
 
-def push_genomes(h: Host) -> None:
-    """Main's reference genomes (FASTA, index, dict, SDF) to the host, every chromosome main has; the node's setup
-    then downloads only what is still missing. No dependence on the platform's endpoint for what main already has."""
+def push_genomes(h: Host) -> dict:
+    """Main's reference genomes (FASTA, index, dict, SDF) to the host, every chromosome main has. Provisioning does
+    not do this: a node fetches its genomes from the platform's reference endpoint (scripts/fetch_genome.sh in
+    setup_node.sh, and on demand for a round's chromosome) far faster than main's uplink pushes 1.3 GB per node."""
     sh(h, f"mkdir -p {shlex.quote(h.data_dir + '/reference')}")
     p = subprocess.run(h.rsync([f"{SETTINGS.data_dir}/reference/"], f"{h.data_dir}/reference/"), capture_output=True,
                        text=True, timeout=7200)
     if p.returncode != 0:
         raise RuntimeError(f"pushing genomes: {p.stderr[-300:]}")
+    return {"host": h.name, "ok": True}
 
 
 def provision(h: Host) -> dict:
     copy_repo(h)
-    push_genomes(h)
     p = sh(h, f"cd {shlex.quote(h.repo)} && DATA_DIR={shlex.quote(h.data_dir)} bash scripts/setup_node.sh", timeout=7200)
     s = sync(h)
     ok = p.returncode == 0 and s["ok"]
@@ -133,10 +137,11 @@ def on_hosts(fn: Callable[[Host], dict], names: List[str]) -> List[dict]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="python -m evaluator.fleet.control")
-    ap.add_argument("cmd", choices=["status", "provision", "sync", "selftest", "reap"])
+    ap.add_argument("cmd", choices=["status", "provision", "genomes", "sync", "selftest", "reap"])
     ap.add_argument("hosts", nargs="*", help="limit to these hosts (default: every enabled host)")
     a = ap.parse_args()
-    fn = {"status": status, "provision": provision, "sync": sync, "selftest": run_selftest, "reap": reap}[a.cmd]
+    fn = {"status": status, "provision": provision, "genomes": push_genomes, "sync": sync, "selftest": run_selftest,
+          "reap": reap}[a.cmd]
     for row in on_hosts(fn, a.hosts):
         print(json.dumps(row))
 

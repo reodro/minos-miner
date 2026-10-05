@@ -450,12 +450,28 @@ def score_cpus() -> Optional[float]:
     return value if value > 0 else None
 
 
+def score_threads() -> Optional[int]:
+    """hap.py's own thread count for one scoring (MINOS_SCORE_THREADS, default 1; 0 = upstream's --threads 4).
+    Under the 1-CPU limit four threads only contend: measured 2026-10-05, a cold full scoring 13.6 s -> 10.5 s with
+    one thread, identical results."""
+    raw = (os.environ.get("MINOS_SCORE_THREADS") or "").strip()
+    value = int(raw) if raw else 1
+    return value if value > 0 else None
+
+
 def with_score_limit(args: List[str]) -> List[str]:
-    """`docker run ... <hap.py image>` with the scoring CPU limit added (unless it already has one)."""
+    """`docker run ... <hap.py image>` with the scoring CPU limit added (unless it already has one), and hap.py's
+    --threads replaced by MINOS_SCORE_THREADS when set."""
     cpus = score_cpus()
-    if cpus is None or "run" not in args[:3] or not any("hap-py" in a or "hap.py" in a for a in args):
+    if "run" not in args[:3] or not any("hap-py" in a or "hap.py" in a for a in args):
         return args
-    if any(a == "--cpus" or a.startswith("--cpus=") for a in args):
+    args = list(args)
+    threads = score_threads()
+    if threads is not None:
+        for j in range(len(args) - 1):
+            if args[j] == "--threads":
+                args[j + 1] = str(threads)
+    if cpus is None or any(a == "--cpus" or a.startswith("--cpus=") for a in args):
         return args
     i = args.index("run") + 1
     return args[:i] + [f"--cpus={cpus:g}"] + args[i:]

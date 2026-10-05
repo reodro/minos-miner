@@ -38,7 +38,7 @@ from common.settings import SETTINGS
 from common.types import CLASSES, FULL, AnswerSet, CallSet, ClassCounts, Round, ScoreResult
 
 if SETTINGS.minos_subnet_dir not in sys.path:
-    sys.path.insert(0, SETTINGS.minos_subnet_dir)
+    sys.path.append(SETTINGS.minos_subnet_dir)
 
 GAP = 1000
 RATIO_KEYS = ("titv_truth_snp", "titv_query_snp", "hethom_truth_snp", "hethom_query_snp")
@@ -185,6 +185,25 @@ class _Store:
 
     def put_meta(self, k: str, v: str) -> None:
         self._db().execute("INSERT OR IGNORE INTO meta (k, v) VALUES (?, ?)", (k, v))
+
+
+_CONTENT_IDS: Dict[tuple, str] = {}
+
+
+def _content_id(path) -> str:
+    """sha1 of a (small) file, cached by path, size and mtime."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "missing"
+    k = (str(path), st.st_size, st.st_mtime_ns)
+    if k not in _CONTENT_IDS:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        _CONTENT_IDS[k] = h.hexdigest()[:16]
+    return _CONTENT_IDS[k]
 
 
 def _skey(key: tuple) -> str:
@@ -450,12 +469,15 @@ class DecisionCacheScorer:
                 self._stats[k] += v
 
     def _cache_for(self, answer_set: AnswerSet) -> _RoundCache:
+        """The cache of this answer set; keyed by the truth files' CONTENT as well as their paths, so two answer sets
+        written to the same path (a rebuilt truth, another builder on the same round) never share hap.py lines."""
         n = answer_set.notes
         truth, mutations, region, reference = (n.get(k) for k in ("truth_vcf", "mutations_vcf", "region", "reference"))
         if not (truth and mutations and region and reference):
             raise NotImplementedError("DecisionCacheScorer needs truth/mutations VCFs, region and reference in "
                                       "answer_set.notes (writing them from reconstructed records is not implemented)")
-        key = (answer_set.round_id, answer_set.version, str(truth), str(mutations), region, str(reference))
+        key = (answer_set.round_id, answer_set.version, str(truth), _content_id(truth), str(mutations),
+               _content_id(mutations), region, str(reference))
         with self._lock:
             cache = self._caches.get(key)
             if cache is None:

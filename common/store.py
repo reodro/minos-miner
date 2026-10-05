@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import sqlite3
 import time
 from typing import List, Optional
@@ -43,20 +44,26 @@ class ResultStore:
         return [ScoreResult.from_dict(json.loads(r[0])) for r in self.db.execute(q, args)]
 
     def portfolio(self, limit: int = 4, tool: str = "gatk") -> List[Config]:
-        """Best config of each other round's database in this file's directory, newest file first.
+        """Best config of each EARLIER round's database in this file's directory, latest round first.
 
-        Scores are not returned: a new round has a new donor and region, so only the configs are reused.
-        The in-memory store and this round's own file contribute nothing.
+        Files are named <round tag>.sqlite; only rounds before this one count, so a replay of an old round never
+        sees configs found in later rounds (a live round only has earlier ones anyway). Scores are not returned:
+        a new round has a new donor and region, so only the configs are reused. The in-memory store contributes
+        nothing.
         """
         if limit <= 0 or not self.path or self.path == ":memory:":
             return []
-        directory = os.path.dirname(os.path.abspath(self.path))
         me = os.path.abspath(self.path)
-        paths = [p for p in glob.glob(os.path.join(directory, "*.sqlite")) if os.path.abspath(p) != me]
-        paths.sort(key=os.path.getmtime, reverse=True)
+        tag = _round_tag(me)
+        if tag is None:
+            return []                                   # not a round file: we cannot tell earlier from later
+        directory = os.path.dirname(me)
+        earlier = [(t, p) for p in glob.glob(os.path.join(directory, "*.sqlite"))
+                   for t in [_round_tag(p)] if t is not None and t < tag]
+        earlier.sort(reverse=True)
         out: List[Config] = []
         seen = set()
-        for path in paths:
+        for _, path in earlier:
             config = _best_config(path, tool)
             if config is not None and config.key not in seen:
                 seen.add(config.key)
@@ -64,6 +71,12 @@ class ResultStore:
             if len(out) >= limit:
                 break
         return out
+
+
+def _round_tag(path: str) -> Optional[str]:
+    """The round tag a results file is named after (YYYYMMDDTHHMMSSZ), or None."""
+    stem = os.path.basename(path)[:-len(".sqlite")] if path.endswith(".sqlite") else ""
+    return stem if re.fullmatch(r"\d{8}T\d{6}Z", stem) else None
 
 
 def _best_config(path: str, tool: str) -> Optional[Config]:

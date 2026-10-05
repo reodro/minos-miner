@@ -19,6 +19,7 @@ SOLO_S = 132.0                # one full GATK run at production load
 REPAIR_S = 34.0               # a diverged variant's repair run
 WARM_S = SOLO_S * 0.011       # genotyping one variant in a JVM that already walked the family
 MAX_BATCH_S = 4.5 * 60        # split a family that would run longer than this and leave the rest queued
+LATENCY_RIDER_MAX = 0.02      # a latency-lane batch admits only riders this cheap (a genotyping variant: 0.011)
 
 
 def extra_seconds(runner, main: EvalJob, variant: EvalJob) -> Optional[float]:
@@ -74,10 +75,13 @@ class LocalExecutor:
         self._solo = set()                         # job ids that must not be batched again
         self._repair: Dict[str, CallSet] = {}      # job id -> its diverged batch output, for runner.repair
         self._ended = set()                        # round ids whose results are no longer wanted (end_round)
+        self._dropped = set()                      # job ids whose results are no longer wanted (cancel_running)
+        self._retried = set()                      # job ids whose batch died in GATK's own code (head rerun alone)
         self._lock = threading.Lock()
         self._wake = threading.Event()             # set by submit(): an idle poll() waits on it instead of spinning
         self.batches_run = 0
         self.repairs_run = 0
+        self.retries = 0                                # jobs re-queued after an rc=3 crash
         self.gatk_runs = 0                              # GATK runs actually started (solo, batch or repair)
         self.gatk_runs_done = 0                         # ... and finished
         self.done = 0                                   # callsets delivered (dashboard)
@@ -170,6 +174,7 @@ class LocalExecutor:
                 continue
             batch, seconds = [job], main_s
             bk = self._branch(job)
+            cap_s = LATENCY_RIDER_MAX * SOLO_S if job.lane == "latency" else float("inf")   # cheap riders only
             if bk is not None:
                 keep = []
                 while self._queue:
@@ -177,9 +182,12 @@ class LocalExecutor:
                     other = item[2]
                     extra = None
                     if (len(batch) < self.max_batch and other.job_id not in self._cancelled
+                            and other.lane != "latency"                     # a latency job is always its own head
                             and other.round.round_id == job.round.round_id and self._branch(other) == bk
                             and (not served or self._served_warm(other))):
                         extra = extra_seconds(self.runner, job, other)
+                        if extra is not None and extra > cap_s:
+                            extra = None
                     if extra is not None and seconds + extra <= room:
                         batch.append(other)
                         seconds += extra
@@ -224,11 +232,23 @@ class LocalExecutor:
                 jobs = self._running.pop(f)
                 for job, cs in zip(jobs, f.result()):
                     k = job_key(job)
-                    if job.round.round_id in self._ended:        # its round is over: nobody wants this result
+                    if job.round.round_id in self._ended or job.job_id in self._dropped:   # nobody wants it
                         self._inflight.pop(k, None)
                         self._waiters.pop(k, None)
                         self._repair.pop(job.job_id, None)
                         continue
+                    if (not cs.ok and (cs.error or "").startswith("rc=3") and len(jobs) > 1
+                            and job.job_id not in self._retried):
+                        # GATK died in its own code inside a batch (the patch's variant path, for some heads on some
+                        # regions; the same config passes on its own). The head runs again alone, still in flight;
+                        # its riders fail here (riders only exist inside a batch).
+                        self._retried.add(job.job_id)
+                        if job is jobs[0]:
+                            self._solo.add(job.job_id)
+                            self.retries += 1
+                            heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+                            continue
+                        cs = replace(cs, error=(cs.error or "") + " | batch crashed; its head runs alone")
                     if not cs.ok and cs.error == DIVERGED:
                         # its batch output was not exact: repair it if the runner can, else run it alone
                         # (still counts as in flight)
@@ -252,10 +272,27 @@ class LocalExecutor:
         with self._lock:
             self._cancelled.update(job_ids)
 
+    def cancel_running(self, job_ids: Iterable[str]) -> None:
+        """Jobs whose result is no longer wanted even if they are running (a duplicate run elsewhere delivered
+        first): queued ones are dropped, a running batch made only of them is killed when the runner can
+        (`kill_configs`), and nothing is delivered for them."""
+        ids = set(job_ids)
+        targets: Dict[str, List[str]] = {}
+        with self._lock:
+            self._cancelled.update(ids)
+            self._dropped.update(ids)
+            for jobs in self._running.values():
+                if all(j.job_id in ids for j in jobs):      # a batch with wanted results runs on
+                    targets.setdefault(jobs[0].round.round_id, []).extend(j.config.key for j in jobs)
+        kill = getattr(self.runner, "kill_configs", None)
+        if kill:
+            for rid, keys in targets.items():
+                kill(rid, keys)
+
     def stats(self) -> dict:
         with self._lock:
             return {"kind": "local", "workers": self.workers, "running": len(self._running), "queued": len(self._queue),
-                    "batches_run": self.batches_run, "repairs_run": self.repairs_run, "done": self.done,
+                    "batches_run": self.batches_run, "repairs_run": self.repairs_run, "retries": self.retries, "done": self.done,
                     "gatk_runs": self.gatk_runs, "gatk_runs_done": self.gatk_runs_done}
 
     def end_round(self, round_id: str) -> None:

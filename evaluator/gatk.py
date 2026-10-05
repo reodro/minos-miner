@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from common.scoring import finalize
 from common.settings import SETTINGS
@@ -39,7 +39,7 @@ from common.types import CLASSES, FULL, AnswerSet, CallSet, ClassCounts, Config,
 log = logging.getLogger(__name__)
 
 if SETTINGS.minos_subnet_dir not in sys.path:
-    sys.path.insert(0, SETTINGS.minos_subnet_dir)
+    sys.path.append(SETTINGS.minos_subnet_dir)
 
 GATK_IMAGE = "broadinstitute/gatk:4.5.0.0"
 GATK_JAR_IN_IMAGE = "/gatk/gatk-package-4.5.0.0-local.jar"
@@ -97,14 +97,44 @@ SAFE_ANNOTATION_EXCLUSIONS = (
 )
 
 
+LOG4J_NOISE = ("StatusConsoleListener", "StatusLogger")   # log4j's own complaints (no hostname in the sandbox ...)
+
+
+def _without_log4j_noise(stderr: str) -> List[str]:
+    """stderr lines minus log4j's own status reports and their stack traces (no hostname in the sandbox, ...)."""
+    out, skipping = [], False
+    for line in (stderr or "").splitlines():
+        if any(n in line for n in LOG4J_NOISE):
+            skipping = True
+            continue
+        if skipping and (line.startswith(("\t", " ", "Caused by:", "...")) or not line.strip()):
+            continue
+        skipping = False
+        out.append(line)
+    return out
+
+
 def gatk_error(stderr: str) -> str:
-    """GATK's actual error, not the command line it echoes: the USER ERROR block or the exception line."""
-    lines = (stderr or "").splitlines()
+    """GATK's actual error, not the command line it echoes: the USER ERROR block, else the exception line (the
+    first "Caused by" is more telling than the wrapper), never log4j's own status noise."""
+    lines = _without_log4j_noise(stderr)
     for i, line in enumerate(lines):
         if "A USER ERROR has occurred" in line:
             return " ".join(l.strip() for l in lines[i:i + 3])
-    exc = [l.strip() for l in lines if "Exception" in l or l.startswith("ERROR")]
+    caused = [l.strip() for l in lines if l.strip().startswith("Caused by:")]
+    if caused:
+        return caused[0]
+    exc = [l.strip() for l in lines if "Exception" in l or "Error" in l.split(":")[0] or l.startswith("ERROR")]
     return exc[0] if exc else " ".join(lines[-3:])[-600:]
+
+
+def keep_stderr(out: Path, p: subprocess.CompletedProcess) -> None:
+    """A failed run's stderr (its tail), next to where its VCF would have been: the reason stays diagnosable after
+    the round, the result line carries only the extracted error."""
+    try:
+        Path(str(out) + ".stderr").write_text(f"rc={p.returncode}\n" + (p.stderr or "")[-20000:])
+    except OSError:
+        pass
 
 
 def records_digest(vcf: Path) -> str:
@@ -227,6 +257,8 @@ class GatkRunner:
         self._warm = {}                              # (round_id, branch_key) -> _WarmSession
         self._warm_lock = threading.Lock()
         self._warm_reserved = 0
+        self._live: Dict[str, tuple] = {}            # container name -> (round_id, config keys it computes)
+        self._live_lock = threading.Lock()
 
     def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path, jvm_props: Optional[dict] = None) -> list:
         from templates.tool_params import validate_and_build_flags   # upstream
@@ -271,13 +303,38 @@ class GatkRunner:
             subprocess.run(["docker", "kill", *ids], capture_output=True)
         return len(ids)
 
-    def _docker(self, cmd: list, warm_dir: Optional[Path] = None, warm_main: Optional[tuple] = None) -> subprocess.CompletedProcess:
+    def kill_configs(self, round_id: str, keys: Iterable[str]) -> int:
+        """Kill the running containers computing any of these configs for the round (their results are not wanted:
+        a duplicate run elsewhere delivered first). Returns how many were killed."""
+        want = set(keys)
+        with self._live_lock:
+            names = [n for n, (rid, ks) in self._live.items() if rid == round_id and ks & want]
+        for name in names:
+            self._kill(name)
+        return len(names)
+
+    def _docker(self, cmd: list, warm_dir: Optional[Path] = None, warm_main: Optional[tuple] = None,
+                owner: Optional[tuple] = None, reserved: bool = True) -> subprocess.CompletedProcess:
         """Run a GATK container; on timeout also kill the container (killing the docker client leaves it running).
+        `owner` = (round_id, config keys): while it runs, kill_configs can find it.
 
         warm_dir set: the process stays up after the traversal when it writes ready=ok, so a later genotyping
-        variant can be submitted to it. A ready of "no", or a process that exits, is an ordinary run.
+        variant can be submitted to it (warm_main set: it is kept as that family's session; None: it is told to
+        stop at once - a warm-style run). A ready of "no", or a process that exits, is an ordinary run.
+        `reserved`: warm_dir holds one of the MAX_WARM slots, given back here.
         """
         name = cmd[cmd.index("--name") + 1]
+        if owner is not None:
+            with self._live_lock:
+                self._live[name] = owner
+        try:
+            return self._docker_run(cmd, name, warm_dir, warm_main, reserved)
+        finally:
+            with self._live_lock:
+                self._live.pop(name, None)
+
+    def _docker_run(self, cmd: list, name: str, warm_dir: Optional[Path], warm_main: Optional[tuple],
+                    reserved: bool = True) -> subprocess.CompletedProcess:
         if warm_dir is None:
             try:
                 if self.runtime == "docker":
@@ -304,8 +361,9 @@ class GatkRunner:
             if old is not None:
                 old.stop()
             return subprocess.CompletedProcess(cmd, 0, "", "")
-        with self._warm_lock:
-            self._warm_reserved = max(0, self._warm_reserved - 1)
+        if reserved:
+            with self._warm_lock:
+                self._warm_reserved = max(0, self._warm_reserved - 1)
         if proc.poll() is None:
             (warm_dir / "stop").write_text("1\n")
             try:
@@ -316,7 +374,7 @@ class GatkRunner:
         rc = proc.returncode if proc.returncode is not None else 1
         err = ""
         try:
-            err = (warm_dir / "jvm.log").read_text()[-2000:]
+            err = (warm_dir / "jvm.log").read_text()[-20000:]   # enough to hold the exception line, not just its stack
         except OSError:
             pass
         if self.runtime != "docker":
@@ -383,12 +441,14 @@ class GatkRunner:
         t0 = time.time()
         try:
             p = self._docker(self.command(round, config, fidelity, out, jvm_props=props),
-                             warm_dir=warm_dir, warm_main=(round, config, fidelity) if warm_dir else None)
+                             warm_dir=warm_dir, warm_main=(round, config, fidelity) if warm_dir else None,
+                             owner=(round.round_id, frozenset([config.key])))
         except Exception:
             self._release_warm_reservation(warm_dir)
             raise
         dt = time.time() - t0
         if p.returncode != 0 or not out.exists():
+            keep_stderr(out, p)
             return CallSet(round.round_id, config.key, "", "", dt, ok=False,
                            error=f"rc={p.returncode} {gatk_error(p.stderr)}", fidelity=fidelity)
         return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
@@ -412,12 +472,17 @@ class GatkRunner:
         changed = [p for p in BRANCH_PARAMS if main.params.get(p, defaults[p]) != variant.params.get(p, defaults[p])]
         return max((VARIANT_COST[_TIER_OF[p]] for p in changed), default=0.0)
 
-    def run_batch(self, round: Round, configs: List[Config], fidelity: str = FULL) -> List[CallSet]:
+    def run_batch(self, round: Round, configs: List[Config], fidelity: str = FULL, warm: bool = False) -> List[CallSet]:
         """One patched run: configs[0] is the main output, the rest are variants of it (BRANCH_PARAMS only).
 
         A variant whose own run would have downsampled reads differently (random-stream divergence, see
         gatk_patch) comes back as CallSet(ok=False, error=DIVERGED, vcf=<kept batch output>): its output is not
         exact everywhere; repair() fixes it.
+
+        `warm`: run warm-style even when no warm slot is free (the JVM is told to stop right after the traversal).
+        The plain batch path dies in the main's assembly ("Graph must have ref source and sink vertices") for some
+        heads - 6 of 6 runs with assembly_region_padding 0-1 - and the same batch passes 6 of 6 times warm-style;
+        the executor retries a crashed batch this way.
         """
         if len(configs) == 1 or self.patch_jar is None:
             return [self.run(round, c, fidelity) for c in configs]
@@ -429,6 +494,10 @@ class GatkRunner:
         spec = main.parent / f"variants_{uuid.uuid4().hex[:10]}.tsv"
         spec.write_text("".join(variant_line(c, f"/data/output/{o.name}") for c, o in zip(configs[1:], outs)))
         warm_dir = self._reserve_warm(main.parent, configs[0], fidelity)
+        kept = warm_dir is not None
+        if warm_dir is None and warm:
+            warm_dir = main.parent / f"warm_{uuid.uuid4().hex[:10]}"
+            warm_dir.mkdir(parents=True)
         props = {"minos.gt.variants": f"/data/output/{spec.name}"}
         if warm_dir is not None:
             props["minos.warm.dir"] = f"/data/output/{warm_dir.name}"
@@ -436,14 +505,16 @@ class GatkRunner:
         try:
             try:
                 p = self._docker(self.command(round, configs[0], fidelity, main, jvm_props=props),
-                                 warm_dir=warm_dir, warm_main=(round, configs[0], fidelity) if warm_dir else None)
+                                 warm_dir=warm_dir, warm_main=(round, configs[0], fidelity) if kept else None,
+                                 owner=(round.round_id, frozenset(c.key for c in configs)), reserved=kept)
             except Exception:
-                self._release_warm_reservation(warm_dir)
+                self._release_warm_reservation(warm_dir if kept else None)
                 raise
         finally:
             spec.unlink(missing_ok=True)
         dt = time.time() - t0
         if p.returncode != 0 or not main.exists():
+            keep_stderr(main, p)
             err = f"rc={p.returncode} {gatk_error(p.stderr)}"
             return [CallSet(round.round_id, c.key, "", "", dt, ok=False, error=err, fidelity=fidelity) for c in configs]
         out = [CallSet(round.round_id, configs[0].key, str(main), records_digest(main), dt, fidelity=fidelity)]
@@ -527,7 +598,8 @@ class GatkRunner:
         t0 = time.time()
         p = self._docker(self.command(round, config, fidelity, rep_vcf,
                                       jvm_props={"minos.repair.log": f"/data/output/{regions.name}",
-                                                 "minos.repair.out": f"/data/output/{rep_log.name}"}))
+                                                 "minos.repair.out": f"/data/output/{rep_log.name}"}),
+                         owner=(round.round_id, frozenset([config.key])))
         dt = time.time() - t0
         spliced = False
         if p.returncode == 0 and rep_vcf.exists() and rep_log.exists():

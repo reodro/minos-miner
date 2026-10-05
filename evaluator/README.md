@@ -22,6 +22,7 @@ main) - and `GatkRunner`, `HappyScorer`, `LocalExecutor`, `SimExecutor`, `FakeRu
 | `DecisionCacheScorer` | exact (identical `ScoreResult`s to `HappyScorer`): hap.py runs only for clusters this machine has not scored yet; the cluster cache is a per-round SQLite store shared by every scorer process on the machine (`evaluator.scorer()` returns it) |
 | `HappyScorer` | the reference: upstream's hap.py path, one full run per callset (the truth sliced once per round) |
 | `SimExecutor` | virtual clock for testing strategies and scheduling without GATK |
+| `ScoringPool` | main's own scoring (no fleet) in one scorer process per GATK worker sharing the decision cache - what a node does for its results; one thread scores ~6 results/min, 14 GATK workers make ~17 |
 | Fleet (`fleet/`) | `FleetExecutor` on main + node agents on sub-VPSs: GATK **and scoring** on the nodes, main only proposes |
 
 ## Making one evaluation cheaper (kept)
@@ -57,6 +58,33 @@ runs the extra configs ("variants") inside one run and writes one VCF per varian
 - Costs live in `gatk.VARIANT_COST`; a variant pays the most expensive stage it changes.
 - A batch is one job on one core: many assembly/activity variants in one batch finish late (latency).
 - `assembly_region_padding` is not branchable (it also sets read-shard padding); GVCF modes never batch.
+- A batch that dies inside GATK (rc=3: an exception, not a bad argument) has its **head rerun alone** and its riders
+  fail. The batch path throws `Graph must have ref source and sink vertices` in the main's assembly for some heads
+  on some regions (every crashing head so far had `min_dangling_branch_length` 19-20; padding 0-1 heads crashed in
+  plain mode only, others warm-style too) while every such config passes on its own. The cause inside the patch is
+  open (`run_batch(..., warm=True)` runs warm-style without keeping the JVM, kept for experiments); the search also
+  never proposes padding below 5 (never in the top 200 of 7,067 true-scored configs).
+
+### Lanes: throughput vs latency
+
+Every job carries a lane (`EvalJob.lane`, set by the search through `client.propose_many(..., lane=...)`):
+
+- **throughput** (default): packed up to 32 configs and the batch time cap, run on the node with the largest free
+  share. Scouts, families, anything whose result is not waited on.
+- **latency**: a result the search waits for (a climbing step). It is always the head of its own batch, takes
+  only riders cheaper than 2% of a run (genotyping variants), never rides in another batch, and goes to the fastest
+  free node that has its round. A fleet's nodes differ up to 4-5x per worker; the critical path should not land on
+  the slow ones.
+
+Each node's solo-run time is measured from its finished batches (an EMA of wall time / predicted cost units;
+`FleetExecutor.nodes()` shows `solo_s`) and scales that node's batch cap and rider costs; the planning constant
+`SOLO_S` (132 s) is only the starting value.
+
+A late latency run is not waited for. Width is cheap and latency is not, so while the fleet has a worker to spare
+(nothing queued could use it) a latency group that has run longer than 1.5x its expected time on its node, or that a
+free faster node could redo before its node is expected to finish, is duplicated there - same head, same riders.
+The first result wins; the other node kills its run (`abort_jobs`: the executor's `cancel_running`, the runner's
+`kill_configs`) and reports nothing for it. `FleetExecutor.stats()` counts `speculated` and `speculation_won`.
 
 ### Exactness and randomness (read this before touching the patch)
 
@@ -96,6 +124,7 @@ fleet.json in the repo folder on main (git-ignored; format in fleet.example.json
    {"host": "5.6.7.8"}]                                # inherits user, key and passphrase
 
 python -m evaluator.fleet.control provision            # fresh machines: copy repo, run scripts/setup_node.sh
+python -m evaluator.fleet.control genomes              # push main's reference genomes (endpoint unreachable there)
 python -m evaluator.fleet.control status | sync | selftest | reap
 python -m main replay|live ... --fleet                 # mine with the fleet (main starts the node agents)
 ```
@@ -111,10 +140,16 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
 - **Joining**: main pushes the self-test bundle and starts the agent; the node is used only if its **self-test**
   (a fixed config on a 3.6 MB BAM slice, ~11 s) reproduces `fleet/selftest.json`'s digest exactly **and** its code
   digest equals main's (`control sync` fixes a mismatch).
-- **Rounds**: main pushes each round's truth files with rsync (and the BAM in replays); on live rounds each node
-  downloads the BAM from the presigned URL itself.
+- **Rounds**: `publish_round` ships the round itself first - main pushes the BAM with rsync in replays, on live
+  rounds each node downloads it from the presigned URL - and a node starts GATK the moment it has it, while main is
+  still building the answer set. `publish_answer_set` ships the truth files when the answer set exists (and every
+  newer version): a node holds the results it made before that and scores them the moment the truth lands. A
+  chromosome a node has not got is fetched from the platform's reference endpoint on demand.
 - **Failure**: when a session ends (node died, network dropped), that node's unfinished jobs go straight back to the
   queue; main reconnects later. When main stops, every node stops and kills the GATK containers it started.
+- **A node on main's own machine** (`{"host": "local"}` in the inventory; the bench runs this way: `--fleet
+  test/engine/fleet_local.json`) runs the real agent without ssh and gets `MINOS_NODE_SHARED_DATA=1`: the rounds it
+  forgets are main's stored rounds, so it never deletes a round directory.
 - **End of round**: after the final submission main calls `end_round`: queued jobs of the round are dropped and every
   node holding its work gets "abort" - it drops the round's local queue, kills exactly that round's containers
   (names carry the round tag) and reports nothing more for it, so all workers are free at the start of the next round.
@@ -136,11 +171,13 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   rented 64-core machines. dockerd starts ~16 containers/s, and ~240 concurrent containers made it refuse new ones
   (rc=125); on a 180-core node with ~160 GATK containers plus scoring containers the load average passed 300 with
   30-45% of the CPU idle.
-- **Setup a node**: `control provision` copies the repo and **main's reference genomes** (rsync), then runs
-  `scripts/setup_node.sh` over SSH: docker, JDK, venv from `requirements.txt`, the GATK image, the **hap.py image
-  at upstream's pinned digest** and the **bcftools image** scoring uses (all pre-pulled, so the first scoring does
-  not stall or fail), the patch jar, and any genome main did not have (from the platform's reference endpoint).
-  Pushing genomes from main runs at ~1.3 MB/s per node over a 35 ms link (~12 min for 907 MB).
+- **Setup a node**: `control provision` copies the repo, then runs `scripts/setup_node.sh` over SSH: docker
+  (Ubuntu's, unless the image already ships one - vast.ai VMs do), JDK, venv from `requirements.txt`, the GATK
+  image, the **hap.py image at upstream's pinned digest** and the **bcftools image** scoring uses (all pre-pulled,
+  so the first scoring does not stall or fail), the patch jar, and the reference genomes **chr14-22** (every round
+  so far was on one of them; any other is fetched on demand) from the platform's reference endpoint. `control
+  genomes` pushes main's copies instead for a host that cannot reach the endpoint - at ~1.3 MB/s per node over a
+  35 ms link that is ~17 min for the nine chromosomes, which is why provisioning does not do it.
 - **Blocked registries**: some providers block Docker Hub and quay.io (both on AWS). Docker Hub images then come
   through Google's mirror (`/etc/docker/daemon.json`: `{"registry-mirrors": ["https://mirror.gcr.io"]}`; digests
   are identical, pinned digests resolve); quay.io's bcftools image is copied from main
@@ -170,17 +207,10 @@ python -m main replay|live ... --fleet                 # mine with the fleet (ma
   processes turn out to be common, a disk-backed cache per node (SQLite or files keyed by cluster) shares it.
 - **Blocked registries, automated**: `setup_node.sh` could set the Docker Hub mirror when a pull fails, and
   `control provision` could copy quay.io's bcftools image from main when its pull fails.
-- **Node-side genome download**: nodes fetching their reference from UCSC (`scripts/fetch_genome.sh`) instead of
-  main's rsync push would cut provisioning from ~12 min to ~1-2 min.
 - **Scoring in the self-test**: the self-test checks GATK output only; a node that cannot score (missing image)
   passes it. Add one scored callset to it.
 - **Randomized exactness test** (not run yet): random base configs, random multi-parameter families, deep and
   non-deep rounds. All exactness tests so far used 3 base configs.
-- **Family cost cap / splitting**: a batch's time is solo + sum of variant costs; split families that would run
-  longer than ~4-5 min and spread them over idle workers.
-- **End-of-round scheduling**: in the last minutes, do not start a job whose expected runtime (solo ~132 s at load,
-  a batch ~ solo + its variants' costs) exceeds the time left before the final submission - it would only be killed
-  by `end_round`. Prefer cheap work then (genotyping variants of the best configs, +1.4 s each).
 
 ## Ideas (not planned; decide with data)
 

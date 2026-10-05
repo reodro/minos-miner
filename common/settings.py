@@ -50,14 +50,18 @@ class Settings:
         return os.path.join(self.reference_dir, chrom, f"{chrom}.fa")
 
 
+GB_PER_WORKER = 1.3     # measured: a 1-thread HaplotypeCaller JVM uses ~1.0-1.2 GB resident (its -Xmx4g heap is
+                        # a cap it does not reach); + headroom for hap.py and the node agent (fleet, 2026-10-03)
+
+
 def _ram_worker_cap() -> int:
-    """One HaplotypeCaller is 4 GB. A 1,000-core host starts min(cores, RAM/4GB) JVMs, not one per core."""
+    """Workers this machine's available RAM can hold: floor(MemAvailable / GB_PER_WORKER)."""
     try:
         with open("/proc/meminfo") as fh:
             for line in fh:
                 if line.startswith("MemAvailable:"):
                     gb = int(line.split()[1]) / (1024 * 1024)
-                    return max(1, math.floor(gb / 4.0))
+                    return max(1, math.floor(gb / GB_PER_WORKER))
     except OSError:
         pass
     return 10 ** 9
@@ -65,7 +69,7 @@ def _ram_worker_cap() -> int:
 
 def default_workers(cores: int = 0) -> int:
     """GATK workers per machine (1 thread each): floor(cores * 0.9), and when the count is this machine's own,
-    also floor(available RAM / 4 GB). Same rule on every fleet machine; override with MINOS_WORKERS.
+    also floor(available RAM / GB_PER_WORKER). Same rule on every fleet machine; override with MINOS_WORKERS.
 
     An explicit `cores` argument is the CPU rule only, so a caller sizing a remote node is not capped by this
     machine's memory.

@@ -5,6 +5,7 @@ it goes through a PR reviewed by every owner.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
@@ -60,9 +61,9 @@ class Config:
     tool: str                   # "gatk" | "deepvariant" | "bcftools"
     params: Dict[str, object] = field(default_factory=dict)
 
-    @property
+    @functools.cached_property
     def key(self) -> str:
-        """Stable content hash: equal configs always share a key."""
+        """Stable content hash: equal configs always share a key (computed once per instance)."""
         blob = json.dumps({"tool": self.tool, "params": self.params}, sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -125,6 +126,8 @@ class EvalJob:
     fidelity: str = FULL
     priority: int = 0           # higher runs first
     tag: str = ""               # opaque to the executor: strategy lane, generation, ...
+    lane: str = "throughput"    # "latency": a result the search waits for (a climbing step) - the executor runs it
+                                # on its fastest free node with only cheap riders; "throughput": pack and run anywhere
 
 
 @dataclass(frozen=True)

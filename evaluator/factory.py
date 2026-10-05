@@ -45,3 +45,12 @@ def fleet_executor(inventory: str):
         _FLEET["ex"] = FleetExecutor(planner, inventory=Path(inventory).expanduser()).start()
         logging.info("fleet: nodes from %s", inventory)
     return _FLEET["ex"]
+
+
+def scoring_pool(parallel: int):
+    """Scoring on this machine in `parallel` scorer processes sharing the per-round decision cache - what a fleet node
+    does for its own results (main's one scoring thread manages ~6 results a minute; 14 GATK workers make ~17)."""
+    import os
+    from common.settings import SETTINGS
+    from evaluator.pool import ScoringPool
+    return ScoringPool(parallel, score_dir=os.path.join(SETTINGS.cache_dir, "dcache"))

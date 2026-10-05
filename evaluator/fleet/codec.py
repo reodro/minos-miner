@@ -17,12 +17,12 @@ def round_from(d: dict) -> Round:
 
 def job_to(j: EvalJob) -> dict:
     return {"job_id": j.job_id, "round": round_to(j.round), "config": j.config.to_dict(), "fidelity": j.fidelity,
-            "priority": j.priority, "tag": j.tag}
+            "priority": j.priority, "tag": j.tag, "lane": j.lane}
 
 
 def job_from(d: dict) -> EvalJob:
     return EvalJob(d["job_id"], round_from(d["round"]), Config.from_dict(d["config"]), d["fidelity"], d["priority"],
-                   d["tag"])
+                   d["tag"], d.get("lane", "throughput"))
 
 
 def score_to(s: Optional[ScoreResult]) -> Optional[dict]:

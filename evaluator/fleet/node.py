@@ -2,9 +2,15 @@
 
     main opens:  ssh host 'cd /minos/minos-miner && .venv/bin/python -m evaluator.fleet.node --stdio'
 
-main -> node   {"type": "round", "round": {...}, "answer_set": {...}, "bam_url": ..., "bai_url": ..., "keep": [...]}
+main -> node   {"type": "round", "round": {...}, "bam_url": ..., "bai_url": ..., "keep": [...]}
+                   the round itself: GATK can start once the BAM is here (a live BAM is fetched from the presigned
+                   URL; a reference chromosome this node lacks is downloaded)
+               {"type": "answer_set", "round_id", "answer_set": {"version", "n_targets", "notes"}}
+                   its truth files (main pushed them first): scoring starts, with the results held so far
                {"type": "jobs", "groups": [[job, ...], ...]}          one group = one GATK run (a family)
                {"type": "abort", "round_id"}                          round over: drop its jobs, kill its containers
+               {"type": "abort_jobs", "job_ids": [...]}               a duplicate run elsewhere delivered first:
+                                                                      kill these runs, report nothing for them
 node -> main   {"type": "ready", "ok": bool, "digest", "expected", "code", "workers"}   after the self-test
                {"type": "round_ready", "round_id"} | {"type": "round_failed", "round_id", "error"}
                {"type": "result", "callset": {...}}                   carries its score; the VCF stays here
@@ -31,52 +37,32 @@ from dataclasses import replace
 from typing import Dict, Optional
 
 from common.settings import SETTINGS, default_workers
-from common.types import AnswerSet, CallSet, Regime
+from common.types import AnswerSet, CallSet, Regime, Round
 from evaluator.fleet import codec, selftest
-from evaluator.fleet.inventory import code_digest
+from evaluator.fleet.inventory import REPO, code_digest
+from evaluator.pool import _proc_init, _proc_score_unit
 
 log = logging.getLogger("node")
 
-_PROC_SCORER = None
 
 
-def _proc_init(work_dir: str) -> None:
-    """A scorer process: its own interpreter (own GIL), scoring with upstream's hap.py path. It exits as soon as its
-    parent (the node agent, or any other caller) is gone - even after a hard kill - so no scorer runs on its own."""
-    global _PROC_SCORER
-    parent = os.getppid()
-
-    def watchdog():
-        while os.getppid() == parent:
-            time.sleep(2)
-        os._exit(1)
-
-    threading.Thread(target=watchdog, daemon=True).start()
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s node: %(message)s")
-    from evaluator.sandbox import install_scoring_shim
-    install_scoring_shim()                     # this process imports scoring itself; the parent's shim does not carry over
-    from evaluator.decision_cache import DecisionCacheScorer
-    _PROC_SCORER = DecisionCacheScorer(work_dir=work_dir)    # every scorer process shares work_dir's per-round store
-
-
-def _proc_score(cs: CallSet, aset: AnswerSet) -> tuple:
-    """Score one callset in a scorer process: (callset, ScoreResult), or (failed callset, None) carrying the error."""
+def _file_id(path: str) -> str:
+    """sha1 of a (small) file, or 'missing': identifies a truth file by content."""
+    import hashlib
     try:
-        return cs, _PROC_SCORER.score(cs, aset)
-    except Exception as e:  # noqa: BLE001 - a callset hap.py cannot score is a failed result, never a 0.0
-        return replace(cs, ok=False, error=f"scoring failed on node: {e}"), None
+        with open(path, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:16]
+    except OSError:
+        return "missing"
 
 
-def _proc_score_unit(css: list, aset: AnswerSet) -> list:
-    """Score one GATK batch's callsets in a scorer process, one after another: their clusters not yet cached on this
-    node are packed into as few hap.py runs as possible (score_many). If that fails, each is scored on its own, so one
-    bad callset cannot fail the others."""
-    if len(css) == 1:
-        return [_proc_score(css[0], aset)]
-    try:
-        return list(zip(css, _PROC_SCORER.score_many(css, aset)))
-    except Exception:  # noqa: BLE001
-        return [_proc_score(c, aset) for c in css]
+def fetch_reference(chrom: str, data_dir: str) -> None:
+    """A chromosome this node has not got: its reference files (FASTA, index, dict, SDF) from the platform's
+    endpoint, as setup fetches them (scripts/fetch_genome.sh skips files already present)."""
+    log.info("fetching the reference for %s", chrom)
+    env = {**os.environ, "CHROMS": chrom, "DATA_DIR": data_dir}
+    subprocess.run(["bash", str(REPO / "scripts" / "fetch_genome.sh")], env=env, check=True, timeout=1800,
+                   capture_output=True, text=True)
 
 
 class Node:
@@ -90,9 +76,12 @@ class Node:
         self.workers = workers
         self.runner, self.scorer_factory = runner, scorer_factory
         self.executor = LocalExecutor(runner, workers=workers)
-        self._rounds: Dict[str, tuple] = {}                  # round_id -> (local Round, AnswerSet)
+        self._rounds: Dict[str, Round] = {}                  # round_id -> local Round (BAM and reference here)
+        self._asets: Dict[str, AnswerSet] = {}               # round_id -> the answer set scoring uses (latest version)
+        self._held: Dict[str, list] = {}                     # round_id -> scoring units made before its answer set
+        self._held_lock = threading.Lock()
         self._in: "queue.Queue[dict]" = queue.Queue()
-        self._to_score: "queue.Queue[CallSet]" = queue.Queue()
+        self._to_score: "queue.Queue[list]" = queue.Queue()
         self._out_lock = threading.Lock()
         self._stop = threading.Event()
         self.score_threads = score_threads or workers
@@ -104,6 +93,9 @@ class Node:
             self._pool = ProcessPoolExecutor(self.score_threads, mp_context=multiprocessing.get_context("spawn"),
                                              initializer=_proc_init, initargs=(score_dir,))
         self._aborted: set = set()
+        self._dropped: set = set()                           # job ids whose results nobody wants (abort_jobs)
+        self._shared_data = os.environ.get("MINOS_NODE_SHARED_DATA") == "1"   # main's own data dir (host "local"):
+                                                                            # its rounds are not ours to delete
         self._by_digest: Dict[tuple, tuple] = {}             # (round, answer-set version, records digest) -> result
         self._by_digest_lock = threading.Lock()
         self._group_of: Dict[str, int] = {}                  # job id -> the GATK batch (group) it was sent in
@@ -134,22 +126,47 @@ class Node:
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     subprocess.run(["curl", "-sSfL", "--retry", "4", "-o", path + ".part", url], check=True, timeout=1200)
                     os.replace(path + ".part", path)
-            for p in (rnd.bam, rnd.bam + ".bai", rnd.reference, msg["answer_set"]["notes"]["truth_vcf"]):
+            if not os.path.exists(rnd.reference):
+                fetch_reference(rnd.chrom, SETTINGS.data_dir)
+            for p in (rnd.bam, rnd.bam + ".bai", rnd.reference):
                 if not os.path.exists(p):
                     raise FileNotFoundError(p)
-            a = msg["answer_set"]
-            aset = AnswerSet(rnd.round_id, a["version"], Regime.UNKNOWN, None, [], [], a["n_targets"], notes=a["notes"])
-            self._rounds[rnd.round_id] = (rnd, aset)
+            self._rounds[rnd.round_id] = rnd
             self.send({"type": "round_ready", "round_id": rnd.round_id})
         except Exception as e:  # noqa: BLE001 - reported to main, which then gives this node no work for the round
             log.exception("round %s not usable here", rnd.round_id)
             self.send({"type": "round_failed", "round_id": rnd.round_id, "error": str(e)[:300]})
 
+    def set_answer_set(self, msg: dict) -> None:
+        """The round's truth (a first version, or a newer one): scoring uses it from now on, starting with the units
+        held since GATK ran ahead of it."""
+        rid, a = msg["round_id"], msg["answer_set"]
+        notes = dict(a["notes"])
+        try:
+            for p in (notes["truth_vcf"], notes.get("mutations_vcf")):
+                if p and not os.path.exists(p):
+                    raise FileNotFoundError(p)
+        except Exception as e:  # noqa: BLE001 - main then stops sending this round here
+            log.exception("answer set of %s not usable here", rid)
+            self.send({"type": "round_failed", "round_id": rid, "error": str(e)[:300]})
+            return
+        notes["truth_id"] = _file_id(notes["truth_vcf"]) + "/" + _file_id(notes.get("mutations_vcf", ""))
+        aset = AnswerSet(rid, a["version"], Regime.UNKNOWN, None, [], [], a["n_targets"], notes=notes)
+        with self._held_lock:
+            self._asets[rid] = aset
+            held = self._held.pop(rid, [])
+        for unit in held:
+            self._to_score.put(unit)
+        log.info("round %s: answer set v%d (%d held units to score)", rid, aset.version, len(held))
+
     def forget_rounds(self, keep: set) -> None:
         """Rounds main no longer keeps: drop their answer sets and scoring caches, and delete their BAM and callsets
         (a node serves for days on a small disk)."""
-        for rid in [r for r in self._rounds if r not in keep]:
-            rnd, _ = self._rounds.pop(rid)
+        for rid in [r for r in set(self._rounds) | set(self._asets) if r not in keep]:
+            rnd = self._rounds.pop(rid, None)
+            with self._held_lock:
+                self._asets.pop(rid, None)
+                self._held.pop(rid, None)
             for sc in self._scorers:
                 drop = getattr(sc, "drop", None)
                 if drop:
@@ -157,8 +174,15 @@ class Node:
             with self._by_digest_lock:
                 for k in [k for k in self._by_digest if k[0] == rid]:
                     del self._by_digest[k]
-            for d in (os.path.dirname(rnd.bam), os.path.join(SETTINGS.cache_dir, "callsets", rnd.tag),
-                      os.path.join(SETTINGS.cache_dir, "fleet", rnd.tag), os.path.join(SETTINGS.cache_dir, "dcache", rnd.tag)):
+            tag = Round.tag_of(rid)
+            self._dropped = {j for j in self._dropped if not j.startswith(tag + "-")}
+            if rnd is None:
+                continue
+            dirs = [os.path.join(SETTINGS.cache_dir, "callsets", rnd.tag), os.path.join(SETTINGS.cache_dir, "fleet", rnd.tag),
+                    os.path.join(SETTINGS.cache_dir, "dcache", rnd.tag)]
+            if not self._shared_data:
+                dirs.append(os.path.dirname(rnd.bam))
+            for d in dirs:
                 safe = any(os.path.abspath(d).startswith(os.path.abspath(root) + os.sep)
                            for root in (SETTINGS.data_dir, SETTINGS.cache_dir))     # never outside our own folders
                 if os.path.isdir(d) and safe:
@@ -167,27 +191,47 @@ class Node:
     def take_jobs(self, msg: dict) -> None:
         for group in msg["groups"]:
             jobs = [codec.job_from(d) for d in group]
+            local = self._rounds.get(jobs[0].round.round_id)
+            if local is None:                                 # never sent before round_ready; a safe answer anyway
+                for j in jobs:
+                    self.send({"type": "result", "callset": codec.callset_to(
+                        CallSet(j.round.round_id, j.config.key, "", "", 0.0, ok=False, error="round not prepared here",
+                                job_id=j.job_id, fidelity=j.fidelity))})
+                continue
             token = next(self._group_ids)
             for j in jobs:
                 self._group_of[j.job_id] = token
-            local, _ = self._rounds[jobs[0].round.round_id]
             self.executor.submit([replace(j, round=local) for j in jobs])   # one call: a family stays one batch
+
+    def abort_jobs(self, job_ids: list) -> None:
+        """Their results were delivered by a duplicate run elsewhere: kill the runs here, report nothing for them."""
+        ids = set(job_ids)
+        self._dropped.update(ids)
+        for jid in ids:
+            self._group_of.pop(jid, None)
+        self.executor.cancel_running(ids)
 
     # ---- scoring -------------------------------------------------------------------------------------------------
     def _scorer(self, i: int) -> None:
         """One feeder per scorer process (in thread mode, for tests: a scorer itself). It takes one GATK batch's
         callsets at a time and scores them one after another, so a worker's slot never runs more than one scoring:
-        no burst of parallel hap.py runs when a family finishes (with --threads 4 each, they oversubscribed big nodes)."""
+        no burst of parallel hap.py runs when a family finishes (with --threads 4 each, they oversubscribed big nodes).
+        A unit whose round has no answer set yet is held until it arrives."""
         scorer = None if self._pool else self._scorers[0]
         while not self._stop.is_set():
             try:
                 unit = self._to_score.get(timeout=1.0)
             except queue.Empty:
                 continue
-            unit = [c for c in unit if c.round_id in self._rounds]   # a round pruned meanwhile: nothing to report
+            unit = [c for c in unit if c.round_id in self._rounds and c.job_id not in self._dropped]
             if not unit:
-                continue
-            aset = self._rounds[unit[0].round_id][1]
+                continue                                       # a round pruned meanwhile: nothing to report
+            rid = unit[0].round_id
+            with self._held_lock:
+                aset = self._asets.get(rid)
+                if aset is None:
+                    self._held.setdefault(rid, []).append(unit)
+                    continue
             done: Dict[int, tuple] = {}
             todo, first_of = [], {}
             for n, c in enumerate(unit):
@@ -221,11 +265,13 @@ class Node:
                 if n not in done:                              # a duplicate within the unit: take its twin's result
                     done[n] = self._seen(c, aset) or (replace(c, ok=False, error="scoring failed on node"), None)
                 c, r = done[n]
-                if c.round_id not in self._aborted:
+                if c.round_id not in self._aborted and c.job_id not in self._dropped:
                     self.send({"type": "result", "callset": codec.callset_to(replace(c, score=r) if r else c)})
 
     def _digest_key(self, c: CallSet, aset: AnswerSet) -> Optional[tuple]:
-        return (c.round_id, aset.version, c.sha256) if c.sha256 else None
+        """Identical records against the same truth CONTENT give the same score (never across two truths that
+        happened to land on the same path)."""
+        return (c.round_id, aset.version, aset.notes.get("truth_id", ""), c.sha256) if c.sha256 else None
 
     def _seen(self, c: CallSet, aset: AnswerSet) -> Optional[tuple]:
         """A callset whose records are byte-identical to one already scored here gets that score (or that failure):
@@ -262,15 +308,19 @@ class Node:
                 if msg["type"] == "round":
                     self.forget_rounds(set(msg.get("keep") or [msg["round"]["round_id"]]) | {msg["round"]["round_id"]})
                     threading.Thread(target=self.prepare_round, args=(msg,), daemon=True).start()
+                elif msg["type"] == "answer_set":
+                    self.set_answer_set(msg)
                 elif msg["type"] == "jobs":
                     self.take_jobs(msg)
                 elif msg["type"] == "abort":                  # main ended the round: stop its work, report nothing
                     self._aborted.add(msg["round_id"])
                     self.executor.end_round(msg["round_id"])
+                elif msg["type"] == "abort_jobs":
+                    self.abort_jobs(msg["job_ids"])
             units: Dict[object, list] = {}
             for cs in self.executor.poll(0.5):
                 token = self._group_of.pop(cs.job_id, None)
-                if cs.round_id in self._aborted:
+                if cs.round_id in self._aborted or cs.job_id in self._dropped:
                     continue
                 if cs.ok:                                      # one scoring unit per GATK batch delivered together
                     units.setdefault(token if token is not None else f"solo:{cs.job_id}", []).append(cs)
@@ -304,12 +354,11 @@ def main() -> None:
     if a.fake:                                # tests: no GATK; env knobs simulate slow runs and bad nodes
         from common.params import ParamRanges
         from evaluator.fake import FakeRunner, FakeScorer
-        from evaluator.fleet.inventory import REPO
         runner = FakeRunner(ParamRanges.from_file(str(REPO / "tests" / "fixtures" / "parameter_ranges.json")))
         delay = float(os.environ.get("MINOS_FAKE_DELAY", "0"))
         if delay:
             run = runner.run
-            runner.run = lambda *x, **k: (time.sleep(delay), run(*x, **k))[1]
+            runner.run = lambda *x, **k: (time.sleep(delay), replace(run(*x, **k), runtime_s=delay))[1]
         scorer_factory = lambda i: FakeScorer(runner)  # noqa: E731
         ok = os.environ.get("MINOS_FAKE_SELFTEST") != "fail"
         result = {"ok": ok, "digest": "fake" if ok else "bad", "expected": "fake"}

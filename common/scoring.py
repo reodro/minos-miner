@@ -14,7 +14,7 @@ from common.settings import SETTINGS
 from common.types import CLASSES, ClassCounts, ScoreResult
 
 if SETTINGS.minos_subnet_dir not in sys.path:
-    sys.path.insert(0, SETTINGS.minos_subnet_dir)
+    sys.path.append(SETTINGS.minos_subnet_dir)
 
 from utils.scoring import (  # noqa: E402  (upstream minos_subnet)
     DIFFICULTY_WEIGHTS,
