@@ -13,7 +13,7 @@ from typing import Callable, Dict, Iterable, List
 
 from common.types import CallSet, EvalJob
 from evaluator.base import Runner
-from evaluator.local import BIG_BATCH, SMALL_BATCH, failed, job_key
+from evaluator.local import batch_limit, failed, job_key
 
 
 class SimExecutor:
@@ -63,7 +63,7 @@ class SimExecutor:
             bk = self._branch(job) if self.batching else None
             cost = getattr(self.runner, "variant_cost", None)
             if bk is not None and cost is not None:
-                limit = (SMALL_BATCH if job.batch == "small" else BIG_BATCH) * self.duration(job)   # as the executors
+                limit = batch_limit(job.batch) * self.duration(job)   # as the executors
                 keep = []
                 while self._queue and len(batch) < self.max_batch:
                     item = heapq.heappop(self._queue)

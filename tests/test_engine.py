@@ -7,10 +7,13 @@ from main import DryRunSubmitter, LoopSettings, run_round
 from search.axes import AxisBook, latin_hypercube
 from search.space import GENOTYPING_PARAMS, Space
 from search import genetic
-from search.climber import ACCEPT_MIN, DECISIVE, Climber
+from common.tuning import tune
+from search.climber import Climber
 from search.hills import Hills
 import search.engine as engine
 from tests.helpers import ranges
+
+ACCEPT_MIN, DECISIVE = tune("climb.accept_min"), tune("climb.decisive")
 
 ROUND = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
 
@@ -74,7 +77,7 @@ class GeneticTest(unittest.TestCase):
         rng = random.Random(1)
         cells = latin_hypercube(space, rng, 2)
         kids = genetic.merge_children(space, cells[0], cells[1], rng, names, n_random=40, n_mutated=0)
-        self.assertGreater(len(genetic.differing(space, names, cells[0], cells[1])), genetic.EXHAUSTIVE_MAX)
+        self.assertGreater(len(genetic.differing(space, names, cells[0], cells[1])), tune("merges.exhaustive_max"))
         self.assertTrue(10 < len(kids) <= 40)
 
     def test_a_generation_keeps_several_hills(self):

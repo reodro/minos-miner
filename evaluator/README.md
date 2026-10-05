@@ -79,17 +79,19 @@ Every job says how big its batch may get (`EvalJob.batch`, set by the search thr
 `client.propose_many(..., batch=...)`):
 
 - **big** (default): packed with other queued configs that share its GATK traversal, up to 32 configs and
-  `BIG_BATCH` = 2.3 solo runs of work in total, run on the node with the largest free share. Wave 0, the scout,
+  `evaluator.big_batch` = 2.3 solo runs of work in total, run on the node with the largest free share. Wave 0, the scout,
   riders: nothing waits on one of them.
 - **small**: a result the search waits for (a climbing move, a merge child, a generation child, a midpoint test). It
-  is always the head of its own batch, holds at most `SMALL_BATCH` = 1.3 solo runs of work in total (itself plus
+  is always the head of its own batch, holds at most `evaluator.small_batch` = 1.3 solo runs of work in total (itself plus
   cheap riders such as its genotyping and PairHMM siblings), never rides in another batch, and goes to the fastest
   free node that has its round, or to the fastest free slow node when no fast one has a free worker. Packing
   structural variants of one centre in one batch runs them one after another on one worker - 30 assembly variants
   take ~16 run-times - which is why a waited-for result must stay small.
 
-Both limits are total work, the head included, in the node's own solo time (`evaluator/local.py`; the coordinator
-and the simulator use the same constants). `MAX_BATCH_S` is the big limit in planning seconds (2.3 x 132 s).
+Both limits are total work, the head included, in the node's own solo time. They are settings in
+`common/tuning.py`, changeable on main during a round; `batch_limit()` and `max_batch_s()` in `evaluator/local.py`
+read them for the local executor, the coordinator and the simulator alike. Nodes always use the defaults, which only
+matters for a node's own re-packing: the groups it runs are formed on main.
 
 Each node's solo-run time is measured from its finished batches (an EMA of wall time / predicted cost units;
 `FleetExecutor.nodes()` shows `solo_s`) and scales that node's batch cap and rider costs; the planning constant

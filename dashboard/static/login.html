@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minos dashboard · log in</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/login.js" defer></script>
+</head>
+<body>
+<div class="login-wrap">
+  <form class="login" id="login" autocomplete="on">
+    <h1><i></i>Minos dashboard</h1>
+    <label for="user">User name<input id="user" name="username" autocomplete="username" required value="admin"></label>
+    <label for="password">Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+    <div class="err" id="err" role="alert"></div>
+    <button class="btn primary" id="go" type="submit">Log in</button>
+  </form>
+</div>
+</body>
+</html>

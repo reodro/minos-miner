@@ -33,6 +33,7 @@ from answer_set.base import AnswerSetProvider
 from common.params import ParamRanges
 from common.settings import SETTINGS
 from common.store import ResultStore
+from common.tuning import TUNING
 from common.types import Config, Regime, Round
 from evaluator.base import Executor, Scorer
 from main.loop import AnswerSetUnavailable, LoopSettings, RoundOutcome, run_round_async
@@ -70,7 +71,10 @@ def mine_round(round: Round, parts: Parts, deadline_ts: Optional[float], bam_url
                bai_url: Optional[str] = None) -> MinedRound:
     if parts.status:
         parts.status.round_started(round, deadline_ts, parts.baselines)
-    mined = _mine_round(round, parts, deadline_ts, bam_url, bai_url)
+    try:
+        mined = _mine_round(round, parts, deadline_ts, bam_url, bai_url)
+    finally:
+        TUNING.round_ended()                      # settings that waited for the round's end apply now
     if parts.status:
         parts.status.round_ended(mined)
     return mined

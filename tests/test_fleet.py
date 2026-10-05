@@ -258,8 +258,8 @@ class SmallBatchRoutingTest(unittest.TestCase):
         self.assertEqual(list(ex._queue), [])
 
     def test_batches_hold_at_most_their_total_work(self):
-        from evaluator.fleet import coordinator as co
-        self.assertEqual((co.SMALL_BATCH, co.BIG_BATCH), (1.3, 2.3))
+        from evaluator.local import batch_limit
+        self.assertEqual((batch_limit("small"), batch_limit("big")), (1.3, 2.3))
 
 
 class CodecTest(unittest.TestCase):

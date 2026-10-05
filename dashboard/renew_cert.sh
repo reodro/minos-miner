@@ -12,6 +12,6 @@ mkdir -p "$HERE/.certs/webroot"
 if ! cmp -s "$DATA/certificates/$IP.crt" "$HERE/.certs/cert.pem"; then
     install -m 600 "$DATA/certificates/$IP.crt" "$HERE/.certs/cert.pem"
     install -m 600 "$DATA/certificates/$IP.key" "$HERE/.certs/key.pem"
-    systemctl restart minos-dashboard
+    systemctl try-restart minos-dashboard 2>/dev/null || true   # the dashboard, when one is installed
     echo "installed new certificate"
 fi

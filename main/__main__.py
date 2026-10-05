@@ -60,13 +60,17 @@ def make_parts(rnd: Round, r: ParamRanges, submitter, workers: int, fleet=None, 
     import evaluator
     import search
     import answer_set
+    from common.tuning import TUNING, tune
     from main.loop import LoopSettings
     from main.miner import Parts
+    TUNING.round_started()                    # settings that wait for a new round take effect now
     executor = fleet if fleet is not None else evaluator.local_executor(workers)
     os.makedirs(os.path.join(SETTINGS.cache_dir, "results"), exist_ok=True)
     store = ResultStore(os.path.join(SETTINGS.cache_dir, "results", f"{rnd.tag}.sqlite"))
     return Parts(answer_set.builder(), executor, evaluator.scorer(), search.searcher(r, workers), submitter, r,
-                 [r.defaults("gatk")], LoopSettings(resubmit_interval_s=300.0, stop_before_deadline_s=60.0), store,
+                 [r.defaults("gatk")], LoopSettings(resubmit_interval_s=tune("main.resubmit_interval_s"),
+                                                    resubmit_margin=tune("main.resubmit_margin"),
+                                                    stop_before_deadline_s=tune("main.stop_before_deadline_s")), store,
                  status=_board(), scoring=scoring)
 
 
@@ -131,6 +135,8 @@ def main() -> None:
         from main.review import find_run
         review_now(find_run(args.run)); return
     _board().kind = args.cmd
+    from common.tuning import TUNING
+    TUNING.use_file()                             # tuning.json overrides (the dashboard edits it); re-read on change
     import evaluator
     fleet = evaluator.fleet_executor(args.fleet) if args.fleet else None
     scoring = None if fleet is not None else evaluator.scoring_pool(args.workers)   # the nodes score on a fleet

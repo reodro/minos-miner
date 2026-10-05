@@ -1,10 +1,14 @@
 """What the dashboard shows: main writes a live snapshot and a per-round history; the dashboard only reads them.
 
-    <status_dir>/live.json                  the current round, rewritten every few seconds (atomic replace)
+    <status_dir>/live.json                  the current round, rewritten every few seconds (atomic replace);
+                                            "schema" 2: + "settings" (common.tuning: in force, pending, rejected,
+                                            changes) and the engine's notes under search.engine (phase, schedule,
+                                            waves, every domain with origin and parents, merges, scout, events)
     <status_dir>/rounds.jsonl               one "round" line per finished run (sections answer_set / evaluator /
                                             search), later "review" and "rank" lines from main.review
     <status_dir>/runs/<run_id>/             what main.review needs once the truth is released:
-        manifest.json                       final + baseline config, every config's params and local score
+        manifest.json                       final + baseline config, every config's params and local score,
+                                            the settings at the start and every change made during the run
         answer_set.json.gz                  our answer set as used at the end of the run
 
 A run is one mining of one round ("<tag>-<start epoch>"): a stored round can be replayed many times.
@@ -25,8 +29,10 @@ from pathlib import Path
 from typing import Optional
 
 from common.settings import SETTINGS
+from common.tuning import TUNING
 from common.types import CLASSES
 
+SCHEMA = 2                                # live.json layout version (the dashboard checks it)
 TRANSITIONS = {("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")}
 
 log = logging.getLogger(__name__)
@@ -62,6 +68,7 @@ class StatusBoard:
         self._util: list = []                               # running / workers samples for average utilization
         self._ex0: Optional[dict] = None                    # executor counters at the round's first tick
         self._seen: set = set()                             # config keys already plotted
+        self._tuning0: Optional[dict] = None                # the settings in force when the round started
         self._recent = _Recent()
         logging.getLogger().addHandler(self._recent)
 
@@ -71,6 +78,7 @@ class StatusBoard:
 
     def _started(self, round, deadline_ts, baselines):
         self._client, self._answer, self._util, self._ex0, self._seen = None, None, [], None, set()
+        self._tuning0 = dict(TUNING.values)
         self._baseline = baselines[0].key if baselines else None
         self._baseline_cfg = baselines[0].to_dict() if baselines else None
         now = time.time()
@@ -80,7 +88,7 @@ class StatusBoard:
                       "answer_set": None, "search": {"evaluated": 0, "failed": 0, "in_flight": 0, "best": None,
                                                      "scored": 0, "zero": 0, "gatk_runs": 0, "points": [],
                                                      "best_timeline": [], "eval_timeline": []},
-                      "submissions": [], "executor": None}
+                      "submissions": [], "executor": None, "schema": SCHEMA, "settings": TUNING.snapshot()}
         self._write(force=True)
 
     def answer_set(self, a) -> None:
@@ -129,6 +137,7 @@ class StatusBoard:
         for k in ("best_timeline", "eval_timeline"):
             s[k] = s[k][-2000:]
         self.state["submissions"] = [[t, key, score] for t, key, score in out.submissions]
+        self.state["settings"] = TUNING.snapshot()
         stats = getattr(executor, "stats", None)
         ex = stats() if stats else None
         if ex is not None:
@@ -218,6 +227,8 @@ class StatusBoard:
         failed = dict(getattr(out, "failed_configs", None) or {})
         manifest = {k: row[k] for k in ("run_id", "kind", "round_id", "tag", "region", "mode", "started", "ended")}
         manifest.update(final_config=final, baseline_config=self._baseline, configs=configs, failed=failed)
+        manifest["tuning"] = {"at_start": self._tuning0,
+                              "changes": [c for c in TUNING.snapshot()["changes"] if c["t"] >= (row.get("started") or 0)]}
         (d / "manifest.json").write_text(json.dumps(manifest))
         a = client.answer_set if client else self._answer
         if a is not None:

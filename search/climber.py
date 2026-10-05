@@ -10,7 +10,7 @@ progress rate, and `state`.
                the centre moves, triples join the pairs, and each exhausted fine sweep halves the scale once more
   acceptance   the centre moves to the best result of the sweep once most of it is back (a decisive gain at once); the
                sweep's other winners are re-applied on the new centre first. An equal-score neighbour is a sideways
-               move once a sweep is back without a gain (a walk across the plateau, at most SIDEWAYS_MAX in a row)
+               move once a sweep is back without a gain (a walk across the plateau, at most climb.sideways_max in a row)
   perturbation when a fine sweep is exhausted at every setting's smallest step: shake K settings of the centre (K = 2,
                3, 5, 8 in turn), then one local round around the best shaken point; the result replaces the centre if
                it is better OR EQUAL (ParamILS's acceptance). A full cycle of K values without that: state "exhausted"
@@ -26,22 +26,18 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from common.types import Config
+from common.tuning import tune
 from search.axes import AxisBook
 from search.space import GENOTYPING_PARAMS, PAIRHMM_PARAMS, Space
 
-ACCEPT_MIN = 0.005          # the answer set's resolution between neighbours: a smaller gain is not a gain
-DECISIVE = 0.05             # a gain this large moves the centre at once; smaller ones wait for the sweep
+# Tunable (common/tuning.py): climb.accept_min (the answer set's resolution between neighbours: a smaller gain is
+# not a gain), climb.decisive (a gain that moves the centre at once), climb.back_frac (a set of moves counts as back
+# at this share), climb.sideways_max, climb.equal_accepts, climb.shake_k, climb.shake_points, riders.siblings.
 EQUAL = 1e-9
-BACK_FRAC = 0.8             # a set of moves counts as back once this share of it is
-SIDEWAYS_MAX = 3
 COARSE_SCALES = (1.0, 0.5, 2.0)
 PAIR_AXES, TRIPLE_AXES, TRIPLES_MAX = 8, 5, 40
-SHAKE_K = (2, 3, 5, 8)
-SHAKE_POINTS = 12
 SHAKE_SCALE = 0.3
-EQUAL_ACCEPTS = 2           # better-or-equal acceptances per perturbation cycle (more would wander the plateau)
 STEP_MAX = 0.5
-SIBLINGS = 2
 PROGRESS_WINDOW_S = 600.0
 CHEAP = tuple(GENOTYPING_PARAMS) + tuple(PAIRHMM_PARAMS)
 SWEEP_KINDS = ("n1", "n2", "n3", "reapply", "share", "final", "pairing")
@@ -84,7 +80,7 @@ class Climber:
         self.recent: List[str] = []                        # settings of accepted moves, most recent last
         self.axis_gain: Dict[str, float] = {}
         self.queued: List[Tuple[str, Dict[str, object]]] = []    # (kind, changes) to try on the next sweep first
-        self.cycle = 0                                     # index into SHAKE_K
+        self.cycle = 0                                     # index into climb.shake_k
         self.cycle_stage = "points"                        # points | local
         self.cycle_sent = self.cycle_back = 0
         self.cycle_best: Optional[Tuple[Config, float]] = None
@@ -204,8 +200,10 @@ class Climber:
                 self._add("shake", self.centre, self.best, ch, out, self.cycle)
         return out
 
-    def siblings(self, move: Move, rng: random.Random, n: int = SIBLINGS) -> List[Config]:
+    def siblings(self, move: Move, rng: random.Random, n: Optional[int] = None) -> List[Config]:
         """One genotyping and one PairHMM variation of a structural move (none for a cheap-tier move)."""
+        if n is None:
+            n = tune("riders.siblings")
         if n <= 0 or all(a in CHEAP for a in move.axes):
             return []
         out: List[Config] = []
@@ -258,9 +256,9 @@ class Climber:
             self.pool.extend(out)
             if out or self.state == "final":
                 return out
-        if self.state in ("climb", "final") and self.sweep_back < BACK_FRAC * max(1, self.sweep_sent):
+        if self.state in ("climb", "final") and self.sweep_back < tune("climb.back_frac") * max(1, self.sweep_sent):
             return []                                      # the sweep is still coming back
-        if self.state in ("climb", "final") and self.equals and not self.winners and self.sideways < SIDEWAYS_MAX:
+        if self.state in ("climb", "final") and self.equals and not self.winners and self.sideways < tune("climb.sideways_max"):
             self.sideways += 1
             self._recentre(self.equals[-1], self.best, self.history[-1][0], (), own=False)
             return self.refill(live, rng, room)
@@ -288,15 +286,15 @@ class Climber:
     def _perturb(self, live: Sequence[str], rng: random.Random, room: int) -> List[Move]:
         out: List[Move] = []
         if self.cycle_sent == 0:                           # start this K: its shaken points
-            if self.cycle >= len(SHAKE_K):
+            if self.cycle >= len(tune("climb.shake_k")):
                 self.state = "exhausted"
                 return []
-            out = self.shake_points(live, rng, SHAKE_K[self.cycle], max(SHAKE_POINTS, min(room, 60)))
+            out = self.shake_points(live, rng, tune("climb.shake_k")[self.cycle], max(tune("climb.shake_points"), min(room, 60)))
             self.cycle_stage, self.cycle_sent, self.cycle_back, self.cycle_best = "points", len(out), 0, None
             if not out:
                 self.cycle += 1
                 return self._perturb(live, rng, room)
-        elif self.cycle_back < BACK_FRAC * self.cycle_sent:
+        elif self.cycle_back < tune("climb.back_frac") * self.cycle_sent:
             return []
         elif self.cycle_stage == "points":                 # the points are back: one local round around the best
             if self.cycle_best is None:
@@ -316,8 +314,8 @@ class Climber:
         """End of one perturbation step: better or equal replaces the centre (ParamILS), else the next K."""
         cfg, sc = self.cycle_best if self.cycle_best else (None, None)
         if cfg is not None and sc >= self.best - EQUAL and cfg.key != self.centre.key and \
-                (sc > self.best + ACCEPT_MIN or self.equal_accepts < EQUAL_ACCEPTS):
-            own = sc > self.best + ACCEPT_MIN
+                (sc > self.best + tune("climb.accept_min") or self.equal_accepts < tune("climb.equal_accepts")):
+            own = sc > self.best + tune("climb.accept_min")
             if not own:
                 self.equal_accepts += 1
             self._recentre(cfg, sc, self.history[-1][0], (), own=own)
@@ -348,7 +346,7 @@ class Climber:
     def offer(self, config: Config, score: float, now: float) -> bool:
         """A global point (a wave cell, a scout) the registry puts on this hill: the centre moves there when it is
         better by the resolution. Not counted as the domain's own progress."""
-        if config.key == self.centre.key or score <= self.best + ACCEPT_MIN:
+        if config.key == self.centre.key or score <= self.best + tune("climb.accept_min"):
             return False
         self._recentre(config, score, now, (), own=False)
         return True
@@ -385,11 +383,11 @@ class Climber:
         if move.kind in ("shake", "local") and self.state == "perturb" and move.cycle == self.cycle:
             if self.cycle_best is None or score > self.cycle_best[1]:
                 self.cycle_best = (config, score)
-        if score > self.best + DECISIVE:                  # decisive: at once, whatever produced it
+        if score > self.best + tune("climb.decisive"):                  # decisive: at once, whatever produced it
             self._credit(move, score)
             self._recentre(config, score, now, move.axes if current else (), own=True)
             return True
-        if score > self.best + ACCEPT_MIN and move.kind in SWEEP_KINDS and self.state in ("climb", "final"):
+        if score > self.best + tune("climb.accept_min") and move.kind in SWEEP_KINDS and self.state in ("climb", "final"):
             self._credit(move, score)
             self.winners.append((move, config, score))
             return self._maybe_recentre(now)
@@ -403,7 +401,7 @@ class Climber:
                 self.axis_gain[a] = self.axis_gain.get(a, 0.0) + (score - move.centre_score)
 
     def _maybe_recentre(self, now: float) -> bool:
-        if not self.winners or self.sweep_back < BACK_FRAC * max(1, self.sweep_sent):
+        if not self.winners or self.sweep_back < tune("climb.back_frac") * max(1, self.sweep_sent):
             return False
         move, config, score = max(self.winners, key=lambda t: t[2])
         others = [(m, c, s) for m, c, s in self.winners if c.key != config.key and m.centre_key == move.centre_key]

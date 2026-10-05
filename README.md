@@ -43,7 +43,8 @@ round opens ─▶ main: download BAM, announce round
   On one machine scoring runs in a background thread; with a fleet (`--fleet`) main controls the sub-VPSs over SSH,
   they run GATK **and** score (in scorer processes), and main only proposes and submits (see evaluator/README.md).
 - After the round, `main.review` judges every part against the released truth (answer-set accuracy, true scores,
-  pick gap, rank); a public read-only dashboard on main shows the live round and the history (dashboard/README.md).
+  pick gap, rank). A live dashboard on main, behind a login, shows the round and edits the search's settings
+  (dashboard/README.md); the settings live in `common/tuning.py`, with overrides in a git-ignored `tuning.json`.
 - Related configs (a *family*: same config except cheap parameters) go to the executor together and run as **one**
   GATK job; each still gets its own exact result.
 
@@ -109,7 +110,7 @@ The GIAB NIST VCFs + BEDs (`$DATA_DIR/giab/`) are not scripted yet. Fleet nodes 
 .venv/bin/python -m main live --wallet W --hotkey H --demo        # live miner (untested; demo mode first)
 ```
 
-A public read-only dashboard (live round + history, https://<main's IP>:8443) runs on main: see [dashboard/README.md](dashboard/README.md).
+The live dashboard (https://<main's IP>:8443, behind a login) runs on main: see [dashboard/README.md](dashboard/README.md).
 
 `replay` prints what the miner would have submitted and reviews the run: answer-set accuracy, the **true** scores
 of the final, baseline and top configs, and the rank among the real submissions.

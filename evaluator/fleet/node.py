@@ -7,7 +7,8 @@ main -> node   {"type": "round", "round": {...}, "bam_url": ..., "bai_url": ...,
                    URL; a reference chromosome this node lacks is downloaded)
                {"type": "answer_set", "round_id", "answer_set": {"version", "n_targets", "notes"}}
                    its truth files (main pushed them first): scoring starts, with the results held so far
-               {"type": "jobs", "groups": [[job, ...], ...]}          one group = one GATK run (a family)
+               {"type": "jobs", "groups": [[job, ...], ...], "limits"}  one group = one GATK run (a family); limits =
+                                                                       main's batch limits in force, packed by them
                {"type": "abort", "round_id"}                          round over: drop its jobs, kill its containers
                {"type": "abort_jobs", "job_ids": [...]}               a duplicate run elsewhere delivered first:
                                                                       kill these runs, report nothing for them
@@ -189,6 +190,10 @@ class Node:
                     shutil.rmtree(d, ignore_errors=True)
 
     def take_jobs(self, msg: dict) -> None:
+        limits = msg.get("limits")                            # main's batch limits in force (settings on main)
+        if isinstance(limits, dict):
+            self.executor.limits = {k: float(v) for k, v in limits.items()
+                                    if k in ("small", "big") and isinstance(v, (int, float)) and v >= 1.0}
         for group in msg["groups"]:
             jobs = [codec.job_from(d) for d in group]
             local = self._rounds.get(jobs[0].round.round_id)

@@ -37,7 +37,8 @@ from common.settings import SETTINGS
 from common.types import AnswerSet, CallSet, EvalJob, Round
 from evaluator.fleet import codec, selftest
 from evaluator.fleet.inventory import INVENTORY, Host, code_digest, ensure_agent, load
-from evaluator.local import BIG_BATCH, MAX_BATCH_S, SMALL_BATCH, SOLO_S, failed, job_key
+from common.tuning import tune
+from evaluator.local import SOLO_S, batch_limit, failed, job_key, max_batch_s
 
 log = logging.getLogger(__name__)
 _UNSET = object()
@@ -45,8 +46,9 @@ LOG_DIR = Path.home() / ".minos" / "fleet" / "logs"
 SPEEDS = Path.home() / ".minos" / "fleet" / "speeds.json"   # host -> measured solo time, so routing is right from the start
 SOLO_EMA = 0.3                # weight of each new solo-time sample in a node's running estimate
 KEEP_ROUNDS = 3               # rounds kept on main and nodes (older ones are pruned)
-OVERDUE = 1.5                 # a small batch running this many times its expected time is a straggler
-SLOW_FACTOR = 1.5             # a node slower than this times the fastest is "slow": small batches prefer the fast ones
+# Tunable (common/tuning.py): evaluator.overdue (a small batch running this many times its expected time is a
+# straggler), evaluator.slow_factor (a node slower than this times the fastest is "slow": small batches prefer the
+# fast ones), evaluator.small_batch / evaluator.big_batch (evaluator.local.batch_limit).
 DUPLICATE_GAIN = 0.25         # a duplicate must finish this share of the remaining time sooner, and at least a
                               # fifth of a run on the faster node (not a few seconds' difference in estimates)
 
@@ -472,9 +474,9 @@ class FleetExecutor:
             self._finish_by = ts
 
     def _room(self, s: Optional["_Session"] = None) -> float:
-        """Seconds a batch started now on node `s` may take: the family cap (MAX_BATCH_S for a node at the planning
+        """Seconds a batch started now on node `s` may take: the family cap (max_batch_s() for a node at the planning
         solo time, scaled by the node's own measured solo time) and the time left before the final submission."""
-        room = MAX_BATCH_S * (s.solo_s / SOLO_S if s is not None else 1.0)
+        room = max_batch_s() * (s.solo_s / SOLO_S if s is not None else 1.0)
         if self._finish_by is not None:
             room = min(room, self._finish_by - self._now())
         return room
@@ -597,9 +599,12 @@ class FleetExecutor:
     def stats(self) -> dict:
         """For the public dashboard: nodes are numbered, never named (no IPs)."""
         with self._lock:
+            fastest = min((s.solo_s for s in self._sessions.values() if s.ready), default=SOLO_S)
+            slow = tune("evaluator.slow_factor") * fastest
             nodes = [dict(node=f"node {i}", ready=s.ready, workers=s.workers, busy=s.open_groups(), jobs=len(s.jobs),
+                          small=sum(1 for g in s.groups.values() if g.batch == "small"),
                           done=s.done, gatk_runs=s.gatk_runs, gatk_runs_done=s.gatk_runs_done,
-                          rejected=bool(s.rejected), solo_s=round(s.solo_s))
+                          rejected=bool(s.rejected), solo_s=round(s.solo_s), slow=s.ready and s.solo_s > slow)
                      for i, s in enumerate(self._sessions.values(), 1)]
             return {"kind": "fleet", "queued": len(self._queued), "nodes": nodes, "done": sum(n["done"] for n in nodes),
                     "gatk_runs": sum(n["gatk_runs"] for n in nodes),
@@ -652,7 +657,7 @@ class FleetExecutor:
                     if s.ready and id(s) not in stuck and s.open_groups() < s.workers]
             able = [s for s in free if job.round.round_id in s.rounds_ready]
             if able and job.batch == "small":
-                fast = [s for s in able if s.solo_s <= SLOW_FACTOR * fastest]
+                fast = [s for s in able if s.solo_s <= tune("evaluator.slow_factor") * fastest]
                 s = min(fast or able, key=lambda x: x.solo_s)   # no fast node free: the fastest free slow one
             elif able:
                 s = max(able, key=lambda x: (x.workers - x.open_groups()) / max(1, x.workers))
@@ -683,7 +688,8 @@ class FleetExecutor:
             s.jobs[j.job_id] = j
             s.job_group[j.job_id] = gid
         s.gatk_runs += 1
-        s.send({"type": "jobs", "groups": [[codec.job_to(j) for j in jobs]]})
+        s.send({"type": "jobs", "groups": [[codec.job_to(j) for j in jobs]],
+                "limits": {"small": batch_limit("small"), "big": batch_limit("big")}})   # the node packs as main does
         return gid
 
     def _speculate(self) -> None:
@@ -707,7 +713,7 @@ class FleetExecutor:
                 expected, elapsed, fresh = s.solo_s * g.units, now - g.t0, f.solo_s * g.units
                 remaining = expected - elapsed
                 worthwhile = remaining - fresh >= max(0.2 * f.solo_s, DUPLICATE_GAIN * remaining)
-                if fresh > self._room(f) or not (elapsed > OVERDUE * expected or worthwhile):
+                if fresh > self._room(f) or not (elapsed > tune("evaluator.overdue") * expected or worthwhile):
                     continue
                 jobs = list(g.jobs.values())
                 gid2 = self._send_group(f, jobs, g.units, duplicate=True, twin=(s, gid))
@@ -725,7 +731,7 @@ class FleetExecutor:
 
     def _take_groups(self, s: _Session) -> List[Tuple[List[EvalJob], float]]:
         """The top queued job whose round the node has and that can finish in time there, plus queued jobs that can
-        share its GATK run, up to SMALL_BATCH or BIG_BATCH solo runs of work in total (and the time left); a small
+        share its GATK run, up to batch_limit() solo runs of work in total (and the time left); a small
         job never rides in another job's batch. Times are this node's own (its measured solo time scales every cost).
         Returns [(group, predicted cost in solo runs)]."""
         skipped, too_long, group = [], [], None
@@ -749,7 +755,7 @@ class FleetExecutor:
                 continue
             self._taken(job)
             group, seconds, bk = [job], solo, self._branch(job)
-            limit = (SMALL_BATCH if job.batch == "small" else BIG_BATCH) * solo
+            limit = batch_limit(job.batch) * solo
             if bk is not None:
                 for other in list(self._by_branch.get((job.round.round_id, bk), {}).values()):   # the riders: same traversal
                     if len(group) >= self.max_batch:

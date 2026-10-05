@@ -1,29 +1,32 @@
 """The search engine (v4): a global genetic opening, ParamILS climbs on up to six hills, merges by recombination. Owner: search.
 
   opening     wave 0 = seeds + a Latin hypercube over every setting (4 threshold riders each), sent while the answer
-              set is still being built; then GENERATIONS genetic generations with niching (genetic.py), each launched
-              once GEN_BACK of the previous one is back or workers sit idle (no barrier). Stops early when a
-              generation gains less than GEN_MIN_GAIN
-  founding    the hill registry (hills.py) groups the good configs into hills; one domain per hill, up to N_DOMAINS
+              set is still being built; then opening.generations genetic generations with niching (genetic.py), each
+              launched once opening.launch_back of the previous one is back or workers sit idle (no barrier). Stops
+              early when a generation gains less than opening.min_gain
+  founding    the hill registry (hills.py) groups the good configs into hills; one domain per hill, up to domains.max
   climb       every domain runs iterated local search (climber.py); winning settings are shared between domains
-              every SHARE_EVERY_S; the scout keeps SCOUT_SHARE of the workers on the whole space for the whole round
+              every sharing.every_min; the scout keeps scout.share of the workers on the whole space all round
   merges      one operation everywhere: pairing (every combination of the settings where two centres differ, when
               few) plus a genetic generation of the two (genetic.merge_children); the best of parents and children is
               the merged domain's centre, which inherits both parents' tested configs and steps. Merges happen
                 - on evidence, at any time: two domains on one hill, or a frozen domain on a live one's hill
-                - on schedule: closest pairs first from REDUCE_TO_3[0] so at most 3 domains remain at REDUCE_TO_3[1];
-                  all remaining domains at REDUCE_TO_1[0] (a three-way merge) so one remains for the final
-  final       the last FINAL_S on one point: halving single steps and all pairs, one last pairing with the runner-up,
-              and the plateau-centre pick: among configs within PICK_BAND of the best, the one whose neighbours score
+                - on schedule: closest pairs first from schedule.reduce_to_3_start_min so at most 3 domains remain at
+                  schedule.reduce_to_3_by_min; all remaining domains at schedule.reduce_to_1_start_min (a three-way
+                  merge) so one remains for the final
+  final       the last schedule.final_min on one point: halving single steps and all pairs, one last pairing with the
+              runner-up, and the plateau-centre pick: among configs within pick.band of the best, the one whose neighbours score
               highest (client.pick_key; main submits it)
 
 One controller pass after every batch of results (and at least every TICK_S) decides everything from facts: what is
 in flight, each domain's progress rate (own gain per minute over the last 10 minutes), the registry. Schedule times
-are fractions of the search's time, set for a 72-minute round.
+are fractions of the search's time, set for a 72-minute round. Every tunable number is a setting in common/tuning.py
+(read with tune(), changeable on main while a round runs); the constants below are not tunable.
 """
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import random
 import time
@@ -31,6 +34,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from common.params import ParamRanges
+from common.tuning import tune
 from common.types import FULL, Config
 from search.axes import AxisBook, far_axes, latin_hypercube
 from search.base import Strategy
@@ -39,29 +43,12 @@ from search.families import genotyping_riders
 from search.ranker import Ranker
 from search.space import GENOTYPING_PARAMS, Space, bam_caps
 from search import genetic
-from search.climber import ACCEPT_MIN, Climber, Move
+from search.climber import Climber, Move
 from search.hills import MIN_FAR, Hills
 
 log = logging.getLogger(__name__)
 
 ROUND_S = 72 * 60                    # the schedule below is written for this much search time; it scales with it
-GENERATIONS = 3
-GEN_BACK = 0.6                       # a generation launches once this share of the previous wave is back
-GEN_IDLE = 0.25                      # ... or this share of the workers is idle with half of it back
-GEN_MIN_GAIN = 0.05                  # a generation gaining less than this ends the opening early
-WAVE_BACK = 0.8
-OPENING_MAX_S = 14 * 60
-N_DOMAINS = 6
-WORTH_A_HILL = 0.5                   # no domain is founded this far below the best
-REDUCE_TO_3 = (34 * 60, 40 * 60)     # scheduled merges start / at most 3 domains
-REDUCE_TO_1 = (56 * 60, 62 * 60)     # the three-way merge starts / one domain
-FINAL_S = 10 * 60
-MERGE_BACK = 0.8
-MERGE_CLOSE, MIDPOINT_RETEST_S = 0.02, 10 * 60
-SHARE_EVERY_S, SHARE_AXES = 5 * 60, 3
-SCOUT_SHARE, SCOUT_KAPPA = 0.15, 1.0
-RIDERS_WAVE0, RIDERS_GLOBAL = 4, 2
-PICK_BAND, PICK_NEAR, PICK_MIN, PICK_S = 0.05, 2, 3, 90.0
 TICK_S = 2.0
 SMALL_FLEET = 64
 
@@ -141,7 +128,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         tl = client.time_left()
         scale_t = (tl if tl is not None and tl > 0 else ROUND_S) / ROUND_S     # the schedule follows the round's length
         T = lambda s: s * scale_t
-        n_domains = max(1, min(N_DOMAINS, cap // 8))
+        n_domains = max(1, min(tune("domains.max"), cap // 8))
+        at = lambda step: T(60 * tune(f"schedule.{step}_min"))       # a schedule time, scaled to this round
         virtual = hasattr(client.executor, "now")
         genotyping = [a for a in GENOTYPING_PARAMS if a in space.names]
 
@@ -157,15 +145,29 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         wave_back: List[int] = []
         wave_best: List[float] = []                  # best score seen when each wave launched
         st = {"founded": False, "gens_done": False, "r3": False, "r3_done": False, "r1": False, "final": False,
-              "last_share": 0.0, "last_log": t0, "scouts": 0, "runner_up": None, "picked": False}
+              "last_share": 0.0, "last_log": t0, "last_publish": t0 - TICK_S, "scouts": 0, "runner_up": None, "picked": False}
         midpoint: Dict[str, Tuple[int, int]] = {}
         find_test: Dict[str, Tuple[Config, float, int]] = {}     # midpoint key -> (scout find, its score, nearest domain)
         find_done: Set[str] = set()                              # finds already tested
         tested_pair: Dict[Tuple[int, int], float] = {}
         scout_queue: List[Config] = []
+        origin: Dict[int, str] = {}                              # domain -> why it was born
+        lineage: Dict[int, List[int]] = {}                       # domain -> the domains it was merged from
+        ended: Dict[int, float] = {}                             # domain -> seconds into the search it retired
+        alloc: Dict[int, float] = {}                             # domain -> workers it is allotted
+        events: collections.deque = collections.deque(maxlen=200)
+        picked: Dict[str, object] = {}
         fitting: List[Optional[asyncio.Task]] = [None]
         wake = asyncio.Event()
         client.on_result.append(lambda _o: wake.set())
+
+        def say(msg: str, *args) -> None:
+            """A decision: logged, and kept for the dashboard's event feed."""
+            log.info("engine: " + msg, *args)
+            try:
+                events.append([round(time.time(), 1), msg % args if args else msg])
+            except (TypeError, ValueError):
+                events.append([round(time.time(), 1), msg])
 
         def elapsed() -> float:
             return clock() - t0
@@ -239,7 +241,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             for c in configs:
                 if send_global(c, "wave", riders, 5 if w == 0 else 4, wave=w):
                     wave_heads[w] += 1
-            log.info("engine: wave %d (%s) at t+%.1fm: %d points", w, label, elapsed() / 60, wave_heads[w])
+            say("wave %d (%s) at t+%.1fm: %d points", w, label, elapsed() / 60, wave_heads[w])
 
         def opening_step() -> None:
             if st["founded"]:
@@ -247,32 +249,32 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             w = len(wave_heads) - 1
             back = wave_back[w] / max(1, wave_heads[w])
             idle = client.idle_slots()
-            if elapsed() >= T(OPENING_MAX_S):                  # the opening's limit is hard: found now
+            if elapsed() >= T(60 * tune("opening.max_min")):                  # the opening's limit is hard: found now
                 st["gens_done"] = True
                 found()
                 return
             if not st["gens_done"]:
-                can = back >= GEN_BACK or (back >= 0.5 and idle is not None and idle >= GEN_IDLE * cap)
+                can = back >= tune("opening.launch_back") or (back >= 0.5 and idle is not None and idle >= tune("opening.launch_idle") * cap)
                 if can and len(candidates) >= 4:
-                    if w >= 2 and top() - wave_best[w] < GEN_MIN_GAIN:        # the last generation gained too little
+                    if w >= 2 and top() - wave_best[w] < tune("opening.min_gain"):        # the last generation gained too little
                         st["gens_done"] = True
-                        log.info("engine: generations stop after %d (last gained %.3f) t+%.1fm", w, top() - wave_best[w],
+                        say("generations stop after %d (last gained %.3f) t+%.1fm", w, top() - wave_best[w],
                                  elapsed() / 60)
                     else:
                         children = [c for c in genetic.generation(space, list(candidates.values()), rng, cap, hills, names())
                                     if fresh(c)]
-                        launch_wave(children, RIDERS_GLOBAL, f"generation {w + 1}")
-                        st["gens_done"] = len(wave_heads) - 1 >= GENERATIONS
+                        launch_wave(children, tune("riders.global"), f"generation {w + 1}")
+                        st["gens_done"] = len(wave_heads) - 1 >= tune("opening.generations")
                 return
-            if back >= WAVE_BACK or not pending:
+            if back >= tune("opening.found_back") or not pending:
                 found()
 
         def found() -> None:
             st["founded"] = True
             ranked = sorted(candidates.values(), key=lambda t: -t[1])
-            for c, s in hills.cluster(ranked, n_domains, WORTH_A_HILL):
+            for c, s in hills.cluster(ranked, n_domains, tune("domains.worth_a_hill")):
                 birth(c, s, "the opening")
-            log.info("engine: founding at t+%.1fm: %d domains from %d scored configs (waves %s)", elapsed() / 60,
+            say("founding at t+%.1fm: %d domains from %d scored configs (waves %s)", elapsed() / 60,
                      len(live()), len(candidates), " ".join(f"{b}/{h}" for b, h in zip(wave_back, wave_heads)))
 
         def birth(c: Config, s: float, why: str, parents: Sequence[Climber] = ()) -> Climber:
@@ -283,8 +285,9 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 if p.mode == "fine":
                     d.mode = "fine"
             domains[d.id], status[d.id] = d, "live"
+            origin[d.id], lineage[d.id] = why, [p.id for p in parents]
             was_centre.add(c.key)
-            log.info("engine: domain %d born at %.4f (%s) t+%.1fm", d.id, s, why, elapsed() / 60)
+            say("domain %d born at %.4f (%s) t+%.1fm", d.id, s, why, elapsed() / 60)
             return d
 
         # ---- merges -----------------------------------------------------------------------------------------------
@@ -303,7 +306,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 kids = genetic.merge3_children(space, [p.centre for p in parents], rng, names())
             tried = set().union(*(p.tried for p in parents))
             kids = [c for c in kids if c.key not in tried and fresh(c)]
-            limit = max(24, cap // 4)                       # one wave's worth on a big fleet, a few on a small one
+            limit = max(tune("merges.children_min"), int(cap * tune("merges.children_share")))
             if len(kids) > limit:
                 kids = rng.sample(kids, limit)
             for c in kids:
@@ -311,7 +314,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     continue
                 if propose(Unit("merge", c, merge=mj.id), [], 6):
                     mj.sent += 1
-            log.info("engine: merge %d (%s): domains %s at %s, %d children, t+%.1fm", mj.id, why,
+            say("merge %d (%s): domains %s at %s, %d children, t+%.1fm", mj.id, why,
                      ",".join(str(p.id) for p in parents), " ".join(f"{p.best:.4f}" for p in parents), mj.sent,
                      elapsed() / 60)
             if mj.sent == 0:
@@ -378,11 +381,11 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             c, s, did = item
             d = domains.get(did)
             ref = d.best if d is not None else s
-            if mid_score is None or mid_score < min(s, ref) - ACCEPT_MIN:          # a valley: a hill of its own
-                if elapsed() < T(REDUCE_TO_3[0]) and len(live()) + len(merges) < n_domains:
+            if mid_score is None or mid_score < min(s, ref) - tune("climb.accept_min"):          # a valley: a hill of its own
+                if elapsed() < at("reduce_to_3_start") and len(live()) + len(merges) < n_domains:
                     birth(c, s, f"a scout find, valley at {mid_score if mid_score is not None else 'a failed run'}")
             elif d is not None and status[d.id] == "live" and d.offer(c, s, clock()):
-                log.info("engine: domain %d -> %.4f, a scout find on its hill (midpoint %.4f) t+%.1fm", d.id, s,
+                say("domain %d -> %.4f, a scout find on its hill (midpoint %.4f) t+%.1fm", d.id, s,
                          mid_score, elapsed() / 60)
 
         def judge_midpoint(key: str, score: Optional[float]) -> None:
@@ -392,7 +395,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             a, b = domains.get(pair[0]), domains.get(pair[1])
             if a is None or b is None or status[a.id] != "live" or status[b.id] != "live":
                 return
-            if score is not None and score >= min(a.best, b.best) - ACCEPT_MIN:
+            if score is not None and score >= min(a.best, b.best) - tune("climb.accept_min"):
                 start_merge([a, b], f"one hill by midpoint {score:.4f}")
 
         # ---- the controller ------------------------------------------------------------------------------------------
@@ -400,7 +403,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             now = clock()
             # merges that are back
             for mj in list(merges.values()):
-                if mj.back >= MERGE_BACK * mj.sent:
+                if mj.back >= tune("merges.resolve_back") * mj.sent:
                     resolve(mj)
             # frozen domains: merge into a live domain on the same hill, else retire (their best stays a candidate)
             for d in [x for i, x in domains.items() if status[i] == "live" and x.state == "exhausted"]:
@@ -410,7 +413,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     start_merge([near, d], "a frozen domain on a live one's hill")
                 else:
                     status[d.id] = "retired"
-                    log.info("engine: domain %d retired at %.4f (its climb is exhausted) t+%.1fm", d.id, d.best, elapsed() / 60)
+                    say("domain %d retired at %.4f (its climb is exhausted) t+%.1fm", d.id, d.best, elapsed() / 60)
             # evidence: two domains on one hill
             lv = [d for d in live() if d.state != "final"]
             busy: Set[int] = set()
@@ -420,11 +423,11 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 if dist < MIN_FAR:
                     start_merge([a, b], f"one hill, {dist} settings apart")
                     busy |= {a.id, b.id}
-                elif abs(a.best - b.best) <= MERGE_CLOSE and dist < MIN_FAR + 2 and \
-                        now - tested_pair.get((a.id, b.id), -1e9) > MIDPOINT_RETEST_S:
+                elif abs(a.best - b.best) <= tune("merges.close") and dist < MIN_FAR + 2 and \
+                        now - tested_pair.get((a.id, b.id), -1e9) > 60 * tune("merges.midpoint_retest_min"):
                     test_midpoint(a, b)
-            # schedule: at most 3 from REDUCE_TO_3[1]
-            if elapsed() >= T(REDUCE_TO_3[0]) and not st["r3"]:
+            # schedule: at most 3 from schedule.reduce_to_3_by_min
+            if elapsed() >= at("reduce_to_3_start") and not st["r3"]:
                 st["r3"] = True
                 lv = live()
                 count = len(lv) + len(merges)
@@ -437,7 +440,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     start_merge([a, b], f"scheduled 6 to 3, {dist} settings apart")
                     taken |= {a.id, b.id}
                     count -= 1
-            if elapsed() >= T(REDUCE_TO_3[1]) and not st["r3_done"]:
+            if elapsed() >= at("reduce_to_3_by") and not st["r3_done"]:
                 st["r3_done"] = True
                 for mj in list(merges.values()):
                     resolve(mj)
@@ -447,10 +450,10 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     rest = sorted((d for d in lv if d is not holder), key=lambda d: (-d.progress(now), -d.best))
                     for d in rest[2:]:
                         status[d.id] = "retired"
-                        log.info("engine: domain %d (%.4f, progress %.4f/min) dropped to keep 3 t+%.1fm", d.id, d.best,
+                        say("domain %d (%.4f, progress %.4f/min) dropped to keep 3 t+%.1fm", d.id, d.best,
                                  d.progress(now), elapsed() / 60)
             # schedule: one domain for the final
-            if elapsed() >= T(REDUCE_TO_1[0]) and not st["r1"]:
+            if elapsed() >= at("reduce_to_1_start") and not st["r1"]:
                 st["r1"] = True
                 for mj in list(merges.values()):
                     resolve(mj)
@@ -458,30 +461,30 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 if len(lv) > 1:
                     start_merge(lv, "scheduled 3 to 1")
             # free slots, until the scheduled merges begin: the scout's finds on hills nobody climbs
-            if st["founded"] and elapsed() < T(REDUCE_TO_3[0]) and len(live()) + len(merges) < n_domains:
+            if st["founded"] and elapsed() < at("reduce_to_3_start") and len(live()) + len(merges) < n_domains:
                 ranked = sorted(candidates.values(), key=lambda t: -t[1])
                 cs = centres(standing())
                 weakest = min((d.best for d in live()), default=float("-inf"))
                 for c, s in ranked:
-                    if s < max(top() - WORTH_A_HILL, weakest) or len(find_test) >= 4:
+                    if s < max(top() - tune("domains.worth_a_hill"), weakest) or len(find_test) >= 4:
                         break                                  # a find below every domain is not worth a domain
                     if c.key in was_centre or c.key in find_done or hills.owner(c, cs) is not None:
                         continue
                     test_find(c, s)                            # a new hill only if a valley separates it
             # sharing between domains: their strongest settings, offered as moves
-            if now - st["last_share"] >= SHARE_EVERY_S and len(live()) > 1:
+            if now - st["last_share"] >= 60 * tune("sharing.every_min") and len(live()) > 1:
                 st["last_share"] = now
                 for d in live():
-                    for a in sorted(d.axis_gain, key=lambda x: -d.axis_gain[x])[:SHARE_AXES]:
+                    for a in sorted(d.axis_gain, key=lambda x: -d.axis_gain[x])[:tune("sharing.settings")]:
                         v = d.centre.params.get(a)
                         for e in live():
                             if e is not d and not space._same(space.specs[a], e.centre.params.get(a), v):
                                 e.queue("share", {a: v})
             # the final
             t = left()
-            if not st["final"] and st["founded"] and (t is not None and t < T(FINAL_S) or elapsed() >= T(REDUCE_TO_1[1])):
+            if not st["final"] and st["founded"] and (t is not None and t < at("final") or elapsed() >= at("reduce_to_1_by")):
                 final_round()
-            if st["final"] and not st["picked"] and t is not None and t < PICK_S:
+            if st["final"] and not st["picked"] and t is not None and t < tune("schedule.pick_s"):
                 pick()
 
         def final_round() -> None:
@@ -503,32 +506,34 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if st["runner_up"] is not None:
                 ru = st["runner_up"]
                 diff = genetic.differing(space, names(), win.centre, ru)
-                if 0 < len(diff) <= genetic.EXHAUSTIVE_MAX:
+                if 0 < len(diff) <= tune("merges.exhaustive_max"):
                     for c in genetic.merge_children(space, win.centre, ru, rng, names(), n_mutated=0):
                         win.queue("pairing", {n: c.params.get(n) for n in diff})
-            log.info("engine: final at t+%.1fm on domain %d (%.4f)%s", elapsed() / 60, win.id, win.best,
+            say("final at t+%.1fm on domain %d (%.4f)%s", elapsed() / 60, win.id, win.best,
                      ", with a pairing against the runner-up" if st["runner_up"] is not None else "")
 
         def pick() -> None:
-            """The plateau-centre pick: among configs within PICK_BAND of the best, the one whose neighbours (at most
-            PICK_NEAR settings apart) score highest - the middle of the plateau, least exposed to the answer set's blur."""
+            """The plateau-centre pick: among configs within pick.band of the best, the one whose neighbours (at most
+            pick.near settings apart) score highest - the middle of the plateau, least exposed to the answer set's blur."""
             st["picked"] = True
             ranked = sorted(candidates.values(), key=lambda t: -t[1])
             if not ranked:
                 return
             best = ranked[0][1]
-            near_top = [(c, s) for c, s in ranked if s >= best - PICK_BAND][:60]
+            near_top = [(c, s) for c, s in ranked if s >= best - tune("pick.band")][:60]
             pool = ranked[:600]
             chosen, chosen_v = ranked[0][0], None
             for c, s in near_top:
-                nb = [s2 for c2, s2 in pool if c2.key != c.key and far_axes(space, space.names, c, c2) <= PICK_NEAR]
-                if len(nb) < PICK_MIN:
+                nb = [s2 for c2, s2 in pool if c2.key != c.key and far_axes(space, space.names, c, c2) <= tune("pick.near")]
+                if len(nb) < tune("pick.min"):
                     continue
                 v = sum(nb) / len(nb)
                 if chosen_v is None or v > chosen_v:
                     chosen, chosen_v = c, v
             client.pick_key = chosen.key
-            log.info("engine: plateau-centre pick %s (%.4f; best %.4f; neighbour mean %s) t+%.1fm", chosen.key,
+            picked.update(key=chosen.key, score=candidates.get(chosen.key, (None, None))[1], best=best,
+                          neighbour_mean=chosen_v)
+            say("plateau-centre pick %s (%.4f; best %.4f; neighbour mean %s) t+%.1fm", chosen.key,
                      candidates.get(chosen.key, (None, 0.0))[1], best,
                      f"{chosen_v:.4f}" if chosen_v is not None else "n/a", elapsed() / 60)
 
@@ -548,7 +553,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     pool.append(c)
             if ranker.ready and pool:
                 mean, spread = ranker.predict(pool)
-                order = sorted(range(len(pool)), key=lambda i: -(mean[i] + SCOUT_KAPPA * spread[i]))
+                order = sorted(range(len(pool)), key=lambda i: -(mean[i] + tune("scout.kappa") * spread[i]))
                 pool = [pool[i] for i in order]
             return pool[:n]
 
@@ -557,7 +562,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 scout_queue.extend(scout_pick(max(1, min(64, idle or 64))))
             while scout_queue:
                 c = scout_queue.pop(0)
-                if fresh(c) and send_global(c, "scout", RIDERS_GLOBAL, 1):
+                if fresh(c) and send_global(c, "scout", tune("riders.global"), 1):
                     st["scouts"] += 1
                     return True
             return False
@@ -574,7 +579,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     break
                 if not st["founded"]:
                     break                                      # the opening's waves are queued by opening_step
-                if st["scouts"] < max(1, int(cap * SCOUT_SHARE)) and send_scout(idle):
+                if st["scouts"] < max(1, int(cap * tune("scout.share"))) and send_scout(idle):
                     n += 1
                     continue
                 lv = live()
@@ -582,8 +587,9 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     rates = [max(d.progress(now), 1e-4) for d in lv]
                     floor = 0.25 * sum(rates) / len(rates)
                     w = [max(x, floor) for x in rates]
-                    share = cap * (1 - SCOUT_SHARE)
+                    share = cap * (1 - tune("scout.share"))
                     targets = {d.id: share * x / sum(w) for d, x in zip(lv, w)}
+                    alloc.clear(); alloc.update(targets)
                     for d in lv:
                         if not d.pool and d.inflight < targets[d.id]:
                             d.refill(names(), rng, int(targets[d.id] - d.inflight) + 1)
@@ -627,7 +633,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 if st["founded"] and not failed:
                     i = owner_of(o.config)
                     if i is not None and domains[i].offer(o.config, score, now):
-                        log.info("engine: domain %d -> %.4f, a global point on its hill t+%.1fm", i, score, elapsed() / 60)
+                        say("domain %d -> %.4f, a global point on its hill t+%.1fm", i, score, elapsed() / 60)
                 return
             if unit.role == "midpoint":
                 judge_midpoint(unit.head.key, None if failed else score)
@@ -646,7 +652,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if d is None or unit.move is None or status[d.id] == "retired":
                 return
             if d.consider(unit.move, is_head, o.config, score, failed, now):
-                log.info("engine: domain %d -> %.4f via %s %s t+%.1fm", d.id, d.best, unit.move.kind,
+                say("domain %d -> %.4f via %s %s t+%.1fm", d.id, d.best, unit.move.kind,
                          ",".join(unit.move.axes), elapsed() / 60)
 
         def maybe_fit() -> None:
@@ -660,19 +666,64 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                      " ".join(f"{d.id}:{d.best:.3f}/{d.state[:5]}/{d.mode[:1]}/{d.inflight}{'' if status[d.id] == 'live' else '/m'}"
                               for d in lv), " ".join(f"{m.id}:{m.back}/{m.sent}" for m in merges.values()) or "-",
                      st["scouts"], len(candidates), len(pending))
+
+        def phase() -> str:
+            if not st["founded"]:
+                return "opening"
+            if st["picked"]:
+                return "picked"
+            if st["final"]:
+                return "final"
+            e = elapsed()
+            if e >= at("reduce_to_1_start") or any(len(m.parents) > 2 for m in merges.values()):
+                return "merging to 1"
+            if at("reduce_to_3_start") <= e < at("reduce_to_3_by"):
+                return "merging to 3"
+            return "climbing"
+
+        def publish() -> None:
+            """What the dashboard shows (client.notes["engine"]), every TICK_S at most."""
+            now = clock()
+            st["last_publish"] = now
+            e = elapsed()
+            for i, s_ in status.items():
+                if s_ == "retired" and i not in ended:
+                    ended[i] = round(e, 1)
+            length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4", "domains": [{"id": d.id, "best": round(d.best, 4), "state": d.state, "mode": d.mode,
-                                              "inflight": d.inflight, "status": status[d.id],
-                                              "born_min": round((d.born - t0) / 60, 1)} for d in lv],
-                "merges": len(merges), "scouts": st["scouts"], "candidates": len(candidates), "pending": len(pending),
+                "version": "v4", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
+                             "opening_max_s": round(T(60 * tune("opening.max_min")), 1),
+                             "reduce_to_3_start_s": round(at("reduce_to_3_start"), 1),
+                             "reduce_to_3_by_s": round(at("reduce_to_3_by"), 1),
+                             "reduce_to_1_start_s": round(at("reduce_to_1_start"), 1),
+                             "reduce_to_1_by_s": round(at("reduce_to_1_by"), 1),
+                             "final_by_s": round(min(at("reduce_to_1_by"), length - at("final")), 1),
+                             "pick_s": round(length - tune("schedule.pick_s"), 1)},
+                "capacity": cap, "max_domains": n_domains,
+                "waves": [{"wave": w, "sent": h, "back": b, "best_at_launch": round(x, 4)}
+                          for w, (h, b, x) in enumerate(zip(wave_heads, wave_back, wave_best))],
+                "domains": [{"id": d.id, "status": status[d.id], "state": d.state, "mode": d.mode,
+                             "best": round(d.best, 4), "centre": d.centre.key, "inflight": d.inflight,
+                             "allotted": round(alloc.get(d.id, 0.0), 1), "progress_per_min": round(d.progress(now), 4),
+                             "tried": len(d.tried), "born_s": round(d.born - t0, 1), "ended_s": ended.get(d.id),
+                             "origin": origin.get(d.id, ""), "parents": lineage.get(d.id, [])}
+                            for d in domains.values()],
+                "merges": [{"id": m.id, "parents": list(m.parents), "why": m.why, "sent": m.sent, "back": m.back,
+                            "started_s": round(m.started - t0, 1),
+                            "best": round(m.best[1], 4) if m.best is not None else None} for m in merges.values()],
+                "scout": {"in_flight": st["scouts"], "finds_tested": len(find_done), "finds_testing": len(find_test),
+                          "share": tune("scout.share")},
+                "best": round(top(), 4), "candidates": len(candidates), "pending": len(pending),
+                "pick": dict(picked) or None, "events": list(events),
                 "caps": caps, "dead_axes": sorted(set(book.names) - set(book.live(clock())))}
 
         # ---- the loop ------------------------------------------------------------------------------------------------
         sd = seeds()
         cells = [c for c in latin_hypercube(space, rng, max(0, cap - len(sd))) if all(c.key != x.key for x in sd)]
-        log.info("engine: capacity %d -> up to %d domains; schedule x%.2f (a %d-minute round)", cap, n_domains, scale_t,
+        say("capacity %d -> up to %d domains; schedule x%.2f (a %d-minute round)", cap, n_domains, scale_t,
                  round(ROUND_S * scale_t / 60))
-        launch_wave(sd + cells, RIDERS_WAVE0, "seeds + hypercube")
+        launch_wave(sd + cells, tune("riders.wave0"), "seeds + hypercube")
         while True:
             if pending:
                 done, _ = await asyncio.wait(list(pending), timeout=TICK_S, return_when=asyncio.FIRST_COMPLETED)
@@ -692,6 +743,11 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             n = fill()
             if clock() - st["last_log"] > 120:
                 status_line()
+            if clock() - st["last_publish"] >= TICK_S:
+                try:
+                    publish()
+                except Exception:  # noqa: BLE001 - the dashboard must never end the round
+                    log.exception("engine: publishing the status failed")
             if client.exhausted and not pending:
                 return
             if not pending and n == 0:

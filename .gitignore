@@ -16,5 +16,5 @@ test/
 evaluator/gatk_patch/build/
 .venv/
 fleet.json
-dashboard/.streamlit/secrets.toml
+tuning.json
 dashboard/.certs/

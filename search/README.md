@@ -93,6 +93,18 @@ round (v3.1); scout finds all merged back into one hill - this round has one pla
 waited-for moves packed into big batches ran one after another on one worker (found while building v4, hence
 the small/big batch setting). The v1-v3.2 code is in git history (last at 155b972); this package holds only v4.
 
+## Settings
+
+Every tunable number of the engine (and the evaluator's batch limits and main's resubmission rules) is a setting in
+`common/tuning.py`, read with `tune("group.name")`: the opening, domains, schedule, merges, sharing, scout, riders,
+climb and pick. Defaults are in that file; `tuning.json` on main overrides them, and the dashboard's Settings tab
+edits it. A live setting takes effect at its next use, within about a second; a round setting (`domains.max`,
+`riders.wave0`, main's) waits for the next round. Tests and simulations never read the file. Each run's manifest
+records the settings at its start and every change made during it, so a hand-tuned run can be told apart later.
+
+The engine publishes what the dashboard draws in `client.notes["engine"]` every 2 s: phase, scaled schedule, waves,
+every domain with its origin and parents, merges, scout, pick and the last 200 decisions.
+
 ## How to work on the search
 
 ```bash

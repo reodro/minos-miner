@@ -14,11 +14,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from common.types import Config
 from search.space import (ACTIVITY_PARAMS, ASSEMBLY_PARAMS, FULL_RUN_PARAMS, GENOTYPING_PARAMS, PAIRHMM_PARAMS,
                           Space)
+from common.tuning import tune
 from search.hills import Hills
 
-EXHAUSTIVE_MAX = 8          # parents differing on this many settings or fewer: every combination (2^8 = 256)
-RANDOM_COMBOS = 256         # more: this many random combinations
-MUTATED = 50                # plus this many children with MUTATE_AXES settings redrawn over their whole range
+# Tunable (common/tuning.py): merges.exhaustive_max (parents differing on this many settings or fewer: every
+# combination), merges.random_combos (more: this many random ones), merges.mutated (plus this many children with
+# MUTATE_AXES settings redrawn over their whole range).
 MUTATE_AXES = 2
 MUTATE_FRAC = 0.3           # share of a generation's children that are mutated
 CROSS_NICHE = 0.3           # share of a generation's children whose parents come from two different hills
@@ -67,10 +68,13 @@ def block_child(space: Space, a: Config, b: Config, rng: random.Random, names: S
 
 
 def merge_children(space: Space, a: Config, b: Config, rng: random.Random, names: Sequence[str],
-                   exhaustive_max: int = EXHAUSTIVE_MAX, n_random: int = RANDOM_COMBOS,
-                   n_mutated: int = MUTATED) -> List[Config]:
+                   exhaustive_max: Optional[int] = None, n_random: Optional[int] = None,
+                   n_mutated: Optional[int] = None) -> List[Config]:
     """The children a merge of two domains evaluates: every combination of the differing settings (or `n_random`
     random ones when there are more than `exhaustive_max`), plus `n_mutated` mutated combinations."""
+    exhaustive_max = tune("merges.exhaustive_max") if exhaustive_max is None else exhaustive_max
+    n_random = tune("merges.random_combos") if n_random is None else n_random
+    n_mutated = tune("merges.mutated") if n_mutated is None else n_mutated
     diff = differing(space, names, a, b)
     out: Dict[str, Config] = {}
     if len(diff) <= exhaustive_max:
@@ -96,7 +100,7 @@ def merge3_children(space: Space, parents: Sequence[Config], rng: random.Random,
     lead, rest = parents[0], list(parents[1:])
     out: Dict[str, Config] = {}
     for other in rest:
-        for c in merge_children(space, lead, other, rng, names, n_mutated=MUTATED // 2):
+        for c in merge_children(space, lead, other, rng, names, n_mutated=tune("merges.mutated") // 2):
             out[c.key] = c
     for _ in range(n_generation):
         p = {n: rng.choice(parents).params.get(n, space.specs[n].default) for n in names}

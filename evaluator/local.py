@@ -17,6 +17,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from common.settings import default_workers
 from common.types import CallSet, Config, EvalJob, Round
+from common.tuning import tune
 from evaluator.base import Runner
 from evaluator.equivalence import RoundFacts, canonical, scan
 
@@ -24,10 +25,19 @@ DIVERGED = "minos:diverged"   # same marker as evaluator.gatk.DIVERGED (kept her
 SOLO_S = 132.0                # one full GATK run at production load
 REPAIR_S = 34.0               # a diverged variant's repair run
 WARM_S = SOLO_S * 0.011       # genotyping one variant in a JVM that already walked the family
-SMALL_BATCH = 1.3             # a small batch holds at most this much work, in solo runs: its head and cheap siblings
-BIG_BATCH = 2.3               # a big batch at most this much: packed, yet never a long serial tail on one worker
-MAX_BATCH_S = BIG_BATCH * SOLO_S   # no batch runs longer: a family beyond it is split and the rest stays queued
 MNH = "max_num_haplotypes_in_population"
+
+
+def batch_limit(batch: str) -> float:
+    """Most work in one batch, in solo runs, its head included: evaluator.small_batch for a result the search waits
+    for (its head and cheap siblings), evaluator.big_batch otherwise (packed, yet never a long serial tail on one
+    worker). Settings in common/tuning.py."""
+    return tune("evaluator.small_batch" if batch == "small" else "evaluator.big_batch")
+
+
+def max_batch_s() -> float:
+    """No batch runs longer, in planning seconds: a family beyond it is split and the rest stays queued."""
+    return batch_limit("big") * SOLO_S
 CLOCK_WINDOW = 30             # recent runs the deadline estimate is taken from
 CLOCK_QUANTILE = 0.9          # ... and how pessimistic it is (a run this slow or slower is 1 in 10)
 TIMELINE_S = 60.0             # one executor sample per minute (stats()["timeline"] and the log)
@@ -142,6 +152,7 @@ class LocalExecutor:
         self.gatk_runs = 0                              # GATK runs actually started (solo, batch or repair)
         self.gatk_runs_done = 0                         # ... and finished
         self.done = 0                                   # callsets delivered (dashboard)
+        self.limits: Dict[str, float] = {}              # batch limits sent by main (a node): override the settings
         self._ratios: deque = deque(maxlen=CLOCK_WINDOW)   # real wall / table seconds of recent cold runs
         self._learned_extra: Dict[str, float] = {}     # assembly / activity seconds measured on this machine
         self.warm_runs = 0                              # runs that genotyped on a live JVM (no traversal)
@@ -379,10 +390,13 @@ class LocalExecutor:
         """Table seconds a batch started now may take: the family cap, and the time left before the final
         submission divided by this machine's measured speed (a 250 s walk on a 132 s table is 1.9x).
         Caller holds the lock."""
-        room = MAX_BATCH_S
+        room = self._limit("big") * SOLO_S
         if self._finish_by is not None:
             room = min(room, (self._finish_by - self._now()) / self._scale())
         return room
+
+    def _limit(self, batch: str) -> float:
+        return self.limits.get(batch) or batch_limit(batch)
 
     def _fill(self):
         skipped = []
@@ -401,7 +415,7 @@ class LocalExecutor:
                 continue
             batch, seconds = [job], main_s
             bk = self._branch(job)
-            limit_s = (SMALL_BATCH if job.batch == "small" else BIG_BATCH) * SOLO_S
+            limit_s = self._limit(job.batch) * SOLO_S
             if bk is not None:
                 keep = []
                 while self._queue:
