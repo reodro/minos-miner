@@ -12,7 +12,7 @@ from common.types import FULL, CLASSES, AnswerSet, CallSet, ClassCounts, Config,
 from evaluator import FakeRunner, FakeScorer, LocalExecutor, SimExecutor
 from main import DryRunSubmitter, LoopSettings, run_round
 from search import EvalClient, RandomSampler, random_stream, rf_ucb, tpe
-from tests.helpers import ranges
+from tests.helpers import ranges, together
 
 ROUND_0817 = os.path.join(SETTINGS.rounds_dir, "20260928T081700Z")
 def jobno(job):
@@ -64,13 +64,68 @@ class LoopTest(unittest.TestCase):
         self.r = ranges()
         self.runner = FakeRunner(self.r)
 
-    def run_loop(self, strategies, executor=None, provider=None, max_evals=60, baselines=None, **kw):
+    def run_loop(self, strategies, executor=None, provider=None, max_evals=60, baselines=None, accept=None,
+                 scoring=None, **kw):
         sub = DryRunSubmitter()
         ex = executor or SimExecutor(self.runner, workers=8)
-        out = run_round(ROUND, provider or StubProvider(), ex, FakeScorer(self.runner), strategies, sub, self.r,
+        out = run_round(ROUND, provider or StubProvider(), ex, FakeScorer(self.runner), together(*strategies), sub, self.r,
                         LoopSettings(update_every=10, max_evals=max_evals, **kw),
-                        baselines=baselines if baselines is not None else [self.r.defaults("gatk")])
+                        baselines=baselines if baselines is not None else [self.r.defaults("gatk")], accept=accept,
+                        scoring=scoring)
         return out, sub, ex
+
+    def test_a_scoring_pool_scores_units_in_parallel_and_reports_what_it_cannot_score(self):
+        from evaluator import ScoringPool
+        ex = LocalExecutor(self.runner, workers=4)
+        out, sub, _ = self.run_loop([random_stream(self.r, seed=1)], executor=ex, max_evals=30,
+                                    scoring=ScoringPool(3, scorer=FakeScorer(self.runner)))
+        self.assertEqual(out.evaluated + out.failed, 30)
+        self.assertEqual(out.failed, 0)
+        self.assertEqual(sub.sent[-1][1], out.best.config_key)
+
+        class Down:                                          # hap.py failing: every callset is a failure, never a 0.0
+            def score(self, cs, aset):
+                raise RuntimeError("hap.py down")
+
+        out, sub, _ = self.run_loop([random_stream(self.r, seed=2)], executor=LocalExecutor(self.runner, workers=2),
+                                    max_evals=12, scoring=ScoringPool(2, scorer=Down()))
+        self.assertEqual((out.evaluated, out.failed, sub.sent), (0, 12, []))
+        self.assertEqual(list(out.failures), ["scoring failed: hap.py down"])
+
+    def test_gatk_runs_while_the_answer_set_is_built_and_its_results_wait(self):
+        ex = LocalExecutor(self.runner, workers=4)          # real threads: the executor runs while the truth is built
+        seen = []
+
+        class Late(StubProvider):
+            def build(self, round):
+                time.sleep(0.6)
+                seen.append(ex.done)                         # callsets the executor had delivered by then
+                return AnswerSet(round.round_id, 1, Regime.KG, "S", [], [], 600)
+
+        out, sub, _ = self.run_loop([random_stream(self.r, seed=1)], executor=ex, provider=Late(), max_evals=20)
+        self.assertGreater(seen[0], 0)                       # GATK results existed before the answer set did
+        self.assertEqual(out.evaluated + out.failed, 20)     # ... and every one of them was scored once it arrived
+        self.assertIsNotNone(out.best)
+        self.assertEqual(sub.sent[0][1], self.r.defaults("gatk").key)
+
+    def test_a_build_that_never_finishes_ends_the_round_on_time(self):
+        from main.loop import AnswerSetUnavailable
+
+        class Hung(StubProvider):
+            def build(self, round):
+                time.sleep(4.0)
+                return AnswerSet(round.round_id, 1, Regime.KG, "S", [], [], 600)
+
+        t0 = time.time()
+        with self.assertRaises(AnswerSetUnavailable):
+            self.run_loop([random_stream(self.r, seed=1)], executor=LocalExecutor(self.runner, workers=2),
+                          provider=Hung(), max_evals=20, build_timeout_s=0.5)
+        self.assertLess(time.time() - t0, 3.0)                 # the round ended at the guard, not when the build did
+
+    def test_a_refused_answer_set_ends_the_round(self):
+        from main.loop import AnswerSetUnavailable
+        with self.assertRaises(AnswerSetUnavailable):
+            self.run_loop([random_stream(self.r, seed=1)], accept=lambda a: "no donor identified")
 
     def test_baseline_first_scores_only_improve(self):
         out, sub, _ = self.run_loop([random_stream(self.r, seed=1)])
@@ -90,6 +145,7 @@ class LoopTest(unittest.TestCase):
         ex = SimExecutor(self.runner, workers=8, crashes=lambda job: jobno(job) % 3 == 2)
         out, sub, _ = self.run_loop([random_stream(self.r, seed=1)], executor=ex)
         self.assertGreater(out.failed, 0)
+        self.assertEqual(sum(out.failures.values()), out.failed)        # every failure has a counted reason
         self.assertTrue(sub.sent)
 
     def test_invalid_and_crashing_baselines_fall_through(self):
@@ -139,7 +195,7 @@ class LoopTest(unittest.TestCase):
 class DeadlineTest(unittest.TestCase):
     def test_virtual_deadline(self):
         r = ranges(); runner = FakeRunner(r); ex = SimExecutor(runner, 8)
-        out = run_round(ROUND, StubProvider(), ex, FakeScorer(runner), [random_stream(r, seed=1)], DryRunSubmitter(),
+        out = run_round(ROUND, StubProvider(), ex, FakeScorer(runner), random_stream(r, seed=1), DryRunSubmitter(),
                         r, LoopSettings(stop_before_deadline_s=120), baselines=[], deadline_ts=72 * 60)
         self.assertLessEqual(ex.now, 72 * 60 - 120 + 60)
         self.assertGreater(out.evaluated, 8 * 50)
@@ -378,7 +434,7 @@ class RfUcbTest(unittest.TestCase):
         for seed in range(3):
             for name, strat in (("random", random_stream(r, in_flight=8, seed=seed)), ("rf", rf_ucb(r, seed=seed))):
                 runner = FakeRunner(r, seed=seed)
-                out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [strat],
+                out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), strat,
                                 DryRunSubmitter(), r, LoopSettings(max_evals=200), baselines=[])
                 self.assertLessEqual(out.evaluated + out.failed, 200 + 8)     # in-flight ones may finish after
                 best[name].append(out.best.score)
@@ -389,7 +445,7 @@ class ResubmitIntervalTest(unittest.TestCase):
     def test_interval_limits_submissions_and_the_best_still_goes_out_last(self):
         r = ranges(); runner = FakeRunner(r)
         sub = DryRunSubmitter()
-        out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [random_stream(r, seed=1)],
+        out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), random_stream(r, seed=1),
                         sub, r, LoopSettings(max_evals=120, resubmit_interval_s=600.0), baselines=[r.defaults("gatk")])
         times = [t for t, _, _ in out.submissions]
         self.assertTrue(all(b - a >= 600.0 for a, b in zip(times[:-2], times[1:-1])))    # the final one may be forced
@@ -402,7 +458,7 @@ class FallbackChainTest(unittest.TestCase):
     def parts(self, provider):
         from main import Parts
         r = ranges(); runner = FakeRunner(r)
-        return Parts(provider, SimExecutor(runner, 8), FakeScorer(runner), [random_stream(r, seed=1)],
+        return Parts(provider, SimExecutor(runner, 8), FakeScorer(runner), random_stream(r, seed=1),
                      DryRunSubmitter(), r, [Config("gatk", {"min_pruning": 99}), r.defaults("gatk")],
                      LoopSettings(max_evals=40))
 
@@ -442,15 +498,24 @@ class SpaceTest(unittest.TestCase):
         import random as _r
         from search.space import Space
         sp, rng = Space(ranges()), _r.Random(0)
-        cs = [sp.random(rng) for _ in range(200)] + RandomSampler(ranges(), seed=0).sample(200)
-        cs += [sp.neighbour(c, rng, n_params=4) for c in cs[:100]]
-        cs += sp.initial_design(rng, 32)
+        own = [sp.random(rng) for _ in range(200)]
+        own += [sp.neighbour(c, rng, n_params=4) for c in own[:100]] + sp.initial_design(rng, 32)
+        cs = own + RandomSampler(ranges(), seed=0).sample(200)
         self.assertEqual({c.params["emit_ref_confidence"] for c in cs if c}, {"NONE"})
         self.assertNotIn("emit_ref_confidence", sp.names)
         self.assertEqual({c.params["adaptive_pruning_initial_error_rate"] for c in cs if c}, {0.001})
         self.assertEqual({c.params["pruning_lod_threshold"] for c in cs if c}, {2.302585})
         self.assertNotIn("adaptive_pruning_initial_error_rate", sp.names)
         self.assertNotIn("pruning_lod_threshold", sp.names)
+        self.assertGreaterEqual(min(c.params["assembly_region_padding"] for c in own if c), 5)   # the space's floor
+        self.assertEqual(sp._assemble({"assembly_region_padding": 0}).params["assembly_region_padding"], 5)
+        capped = Space(ranges(), caps={"min_base_quality_score": 30})          # the round's BAM tops out at 30
+        rng = _r.Random(1)
+        got = [capped.random(rng) for _ in range(100)] + capped.initial_design(rng, 16)
+        self.assertLessEqual(max(c.params["min_base_quality_score"] for c in got if c), 30)
+        self.assertEqual(capped._assemble({"min_base_quality_score": 45}).params["min_base_quality_score"], 30)
+        from search.space import bam_caps
+        self.assertEqual(bam_caps("/nonexistent.bam", "chr20", 1, 10), {})
 
     def test_tiers_partition_the_free_parameters(self):
         from search.space import Space
@@ -492,16 +557,9 @@ class SpaceTest(unittest.TestCase):
 
 
 class LineupTest(unittest.TestCase):
-    def test_default_name_runs_the_forest_and_tpe_together(self):
-        from search import STRATEGY_NAMES, strategies
-        r = ranges()
-        self.assertEqual(STRATEGY_NAMES[0], "rf_ucb")
-        self.assertEqual(len(strategies("rf_ucb", r, 8)), 2)
-        self.assertEqual(len(strategies("tpe", r, 8)), 1)
-        self.assertEqual(len(strategies("regions", r, 8)), 1)
-        self.assertEqual(len(strategies("random", r, 8)), 1)
-        with self.assertRaises(ValueError):
-            strategies("nope", r, 8)
+    def test_search_hands_main_one_searcher(self):
+        from search import searcher
+        self.assertTrue(callable(searcher(ranges(), 8)))       # the basin race; main chooses nothing
 
 
 class GradientRegionTest(unittest.TestCase):
@@ -515,7 +573,7 @@ class GradientRegionTest(unittest.TestCase):
             for name, strat in (("random", random_stream(r, in_flight=8, seed=seed)),
                                 ("regions", gradient_regions(r, in_flight=8, seed=seed))):
                 runner = FakeRunner(r, seed=seed)
-                out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [strat],
+                out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), strat,
                                 DryRunSubmitter(), r, LoopSettings(max_evals=800), baselines=[])
                 self.assertLessEqual(out.evaluated + out.failed, 800 + 8)
                 best[name].append(out.best.score)
@@ -554,7 +612,7 @@ class GradientRegionTest(unittest.TestCase):
 
         def once(strat, evals):
             runner = TwoBasin(r)
-            out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [strat],
+            out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), strat,
                             DryRunSubmitter(), r, LoopSettings(max_evals=evals), baselines=[])
             return out.best.score
 
@@ -568,7 +626,7 @@ class LateWindowTest(unittest.TestCase):
         r = ranges()
         runner = FakeRunner(r)
         out = run_round(ROUND, StubProvider(), SimExecutor(runner, 4), FakeScorer(runner),
-                        [rf_ucb(r, late_s=1e9, seed=0)], DryRunSubmitter(), r,
+                        rf_ucb(r, late_s=1e9, seed=0), DryRunSubmitter(), r,
                         LoopSettings(max_evals=40), baselines=[], deadline_ts=10_000)
         self.assertEqual(out.evaluated, 0)
 
@@ -578,24 +636,29 @@ class TpeTest(unittest.TestCase):
         r = ranges()
         runner = FakeRunner(r)
         out = run_round(ROUND, StubProvider(), SimExecutor(runner, 4), FakeScorer(runner),
-                        [tpe(r, seed=0, in_flight=4)], DryRunSubmitter(), r,
+                        tpe(r, seed=0, in_flight=4), DryRunSubmitter(), r,
                         LoopSettings(max_evals=40), baselines=[])
         self.assertGreater(out.evaluated, 10)
         self.assertLessEqual(out.evaluated + out.failed, 40 + 8)
 
 
 class PortfolioTest(unittest.TestCase):
-    def test_other_rounds_configs_are_readable_and_this_file_is_not(self):
+    def test_only_earlier_rounds_configs_are_reused(self):
         import os
         import tempfile
         from common.scoring import finalize
         d = tempfile.mkdtemp()
-        past = ResultStore(os.path.join(d, "past.sqlite"))
-        current = ResultStore(os.path.join(d, "current.sqlite"))
+        past = ResultStore(os.path.join(d, "20261001T000000Z.sqlite"))
+        current = ResultStore(os.path.join(d, "20261002T000000Z.sqlite"))
+        later = ResultStore(os.path.join(d, "20261003T000000Z.sqlite"))
         cfg = ranges().defaults("gatk")
-        past.add(finalize(ScoreResult("old", cfg.key, 1, {k: ClassCounts(1, 0, 0) for k in CLASSES}, 0, 600)), cfg)
-        self.assertEqual([c.key for c in current.portfolio()], [cfg.key])
+        future = Config("gatk", {**cfg.params, "min_pruning": 4})
+        res = lambda c: finalize(ScoreResult("r", c.key, 1, {k: ClassCounts(1, 0, 0) for k in CLASSES}, 0, 600))
+        past.add(res(cfg), cfg)
+        later.add(res(future), future)
+        self.assertEqual([c.key for c in current.portfolio()], [cfg.key])   # the later round never leaks back
         self.assertEqual(past.portfolio(), [])
+        self.assertEqual(ResultStore(os.path.join(d, "scratch.sqlite")).portfolio(), [])
 
 
 class RoundSafetyTest(unittest.TestCase):
@@ -614,7 +677,7 @@ class RoundSafetyTest(unittest.TestCase):
 
         sub = DryRunSubmitter()
         base = r.defaults("gatk")
-        parts = Parts(Known(), SimExecutor(runner, 8), FakeScorer(runner), [explode_later], sub, r, [base],
+        parts = Parts(Known(), SimExecutor(runner, 8), FakeScorer(runner), explode_later, sub, r, [base],
                       LoopSettings(max_evals=40))
         m = mine_round(ROUND, parts, deadline_ts=None)
         self.assertEqual(m.mode, "searched")
@@ -636,6 +699,52 @@ class RoundSafetyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrashRetryTest(unittest.TestCase):
+    def test_a_batch_that_died_in_gatk_reruns_its_head_alone(self):
+        r = ranges(); d = r.defaults("gatk").params
+        calls = []
+
+        class BatchCrashes(FakeRunner):                    # the batch path dies; a config on its own passes
+            def run_batch(self, round, configs, fidelity=FULL):
+                calls.append(("batch", len(configs)))
+                return [CallSet(round.round_id, c.key, "", "", 0.1, ok=False, fidelity=fidelity,
+                                error="rc=3 java.lang.IllegalStateException: Graph must have ref source and sink vertices")
+                        for c in configs]
+
+            def run(self, round, config, fidelity=FULL):
+                calls.append(("solo", 1))
+                return super().run(round, config, fidelity)
+
+        ex = LocalExecutor(BatchCrashes(r, batching=True), workers=1)
+        conf = "standard_min_confidence_threshold_for_calling"
+        jobs = [EvalJob(f"j{i}", ROUND, Config("gatk", {**d, conf: c})) for i, c in enumerate((30.0, 40.0, 50.0))]
+        ex.submit(jobs)                                    # one family: one batch
+        got = {}
+        for _ in range(30):
+            for cs in ex.poll(0.2):
+                got[cs.job_id] = cs
+            if len(got) == 3:
+                break
+        self.assertEqual(calls, [("batch", 3), ("solo", 1)])
+        self.assertTrue(got["j0"].ok)                                        # the head, rerun alone
+        self.assertEqual([got[j].ok for j in ("j1", "j2")], [False, False])  # the riders fail with the batch
+        self.assertIn("batch crashed; its head runs alone", got["j1"].error)
+        self.assertEqual(ex.stats()["retries"], 1)
+
+        class Always(FakeRunner):                          # a config that crashes on its own is a failure
+            def run(self, round, config, fidelity=FULL):
+                return CallSet(round.round_id, config.key, "", "", 0.1, ok=False, error="rc=3 boom", fidelity=fidelity)
+
+        ex = LocalExecutor(Always(r), workers=1)
+        ex.submit([EvalJob("k", ROUND, Config("gatk", {**d, "min_pruning": 5}))])
+        got = []
+        for _ in range(30):
+            got += ex.poll(0.2)
+            if got:
+                break
+        self.assertEqual([(cs.ok, cs.error) for cs in got], [(False, "rc=3 boom")])
 
 
 class EndRoundTest(unittest.TestCase):
@@ -661,3 +770,26 @@ class EndRoundTest(unittest.TestCase):
             got += ex.poll(0.4)
         self.assertEqual(got, [])                          # neither the running job nor the queued ones report
         self.assertEqual(ex.idle_slots(), 1)
+
+    def test_cancel_running_kills_the_batch_and_delivers_nothing_for_it(self):
+        r = ranges(); d = r.defaults("gatk").params
+        killed = []
+
+        class Slow(FakeRunner):
+            def run(self, round, config, fidelity=FULL):
+                time.sleep(0.5)
+                return super().run(round, config, fidelity)
+
+            def kill_configs(self, round_id, keys):
+                killed.append((round_id, sorted(keys)))
+
+        ex = LocalExecutor(Slow(r), workers=1)
+        jobs = [EvalJob(f"j{i}", ROUND, Config("gatk", {**d, "min_pruning": p})) for i, p in enumerate((3, 4))]
+        ex.submit(jobs)
+        time.sleep(0.1)                                   # j0 is running, j1 is queued
+        ex.cancel_running(["j0"])                         # its result came from elsewhere first
+        self.assertEqual(killed, [(ROUND.round_id, [jobs[0].config.key])])
+        got = []
+        for _ in range(4):
+            got += ex.poll(0.4)
+        self.assertEqual([cs.job_id for cs in got], ["j1"])   # j0 never reports; j1 runs as usual

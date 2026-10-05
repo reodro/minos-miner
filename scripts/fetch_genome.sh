@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # GRCh38 reference per chromosome, exactly as the validator uses it: FASTA + .fai + .dict + RTG SDF (for hap.py).
 # Source: the platform's reference endpoint (302 -> storage; needs an explicit User-Agent).
-#   bash scripts/fetch_genome.sh                    # chr1-chr22 (~3.5 GB)
+#   bash scripts/fetch_genome.sh                    # chr14-chr22: every round so far (176/176) was on one of them
 #   CHROMS="chr20 chr21" bash scripts/fetch_genome.sh
+# A node fetches any other chromosome on demand when a round needs it (evaluator/fleet/node.py).
 set -euo pipefail
 DATA_DIR="${DATA_DIR:-/minos/data}"
 BASE="https://api.theminos.ai/reference"
 UA="minos-installer/0.1 (+https://github.com/minos-protocol/minos_subnet)"
-CHROMS="${CHROMS:-$(echo chr{1..22})}"
+CHROMS="${CHROMS:-$(echo chr{14..22})}"
 SDF_FILES="done mainIndex nameIndex0 namedata0 namepointer0 progress seqdata0 seqpointer0 sequenceIndex0 summary.txt"
 
 get() {   # url dest

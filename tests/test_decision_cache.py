@@ -2,6 +2,7 @@ import gzip
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 from common.settings import SETTINGS
@@ -139,3 +140,19 @@ class DecisionCacheExactnessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContentIdTest(unittest.TestCase):
+    def test_same_path_different_content_gives_a_different_cache_key(self):
+        import tempfile
+        from evaluator.decision_cache import _content_id
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "truth.vcf.gz")
+        with open(p, "wb") as f:
+            f.write(b"one")
+        a = _content_id(p)
+        time.sleep(0.01)
+        with open(p, "wb") as f:
+            f.write(b"two")
+        self.assertNotEqual(a, _content_id(p))
+        self.assertEqual(_content_id(os.path.join(d, "missing")), "missing")

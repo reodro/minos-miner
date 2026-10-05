@@ -9,9 +9,14 @@ DATA_DIR="${DATA_DIR:-/minos/data}"
 
 PY="${PY_VERSION:-3.10}"          # main's Python: every node runs the same interpreter and pinned libraries
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q
-apt-get install -y -q docker.io curl git rsync ca-certificates
-apt-get install -y -q openjdk-17-jdk-headless || apt-get install -y -q default-jdk-headless   # javac --release 17
+# a fresh VPS often runs unattended-upgrades for minutes after boot: wait for its apt lock instead of failing
+APT="apt-get -o DPkg::Lock::Timeout=900"
+$APT update -q
+$APT install -y -q curl git rsync ca-certificates
+# Docker: Ubuntu's docker.io, unless the image already ships one (e.g. vast.ai VMs come with Docker CE, whose
+# containerd.io conflicts with docker.io's containerd)
+command -v docker >/dev/null || $APT install -y -q docker.io
+$APT install -y -q openjdk-17-jdk-headless || $APT install -y -q default-jdk-headless   # javac --release 17
 systemctl enable --now docker
 
 # upstream repo (scoring formula, the validator's templates): `control provision/sync` copies main's exact version;
@@ -39,8 +44,8 @@ if [ ! -f /opt/gatk/gatk-package-4.5.0.0-local.jar ]; then
 fi
 bash evaluator/gatk_patch/build.sh
 
-# reference genomes (+ SDF for hap.py): `control provision` pushes main's copies first; this only downloads what is
-# still missing (fetch_genome.sh skips files already present)
+# reference genomes (+ SDF for hap.py) from the platform's endpoint: chr14-22 (every round so far); a node fetches
+# any other chromosome on demand. Only what is still missing is downloaded (`control genomes` can push main's copies)
 DATA_DIR="$DATA_DIR" bash scripts/fetch_genome.sh
 
 echo "node ready. workers: $(.venv/bin/python -c 'from common.settings import default_workers; print(default_workers())')"

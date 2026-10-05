@@ -18,7 +18,7 @@ class PatternTest(unittest.TestCase):
     def run_one(self, strat, seed, max_evals=200):
         r = ranges()
         runner = FakeRunner(r, seed=seed)
-        out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), [strat], DryRunSubmitter(),
+        out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner), strat, DryRunSubmitter(),
                         r, LoopSettings(max_evals=max_evals), baselines=[])
         return out, runner
 
@@ -172,7 +172,7 @@ class PatternTest(unittest.TestCase):
         strat = pattern_regions(r, in_flight=8, seed=0, max_bq=None, n_regions=2, separation=0.2,
                                 scout_min=8, band=50.0)
         out = run_round(ROUND, StubProvider(), SimExecutor(runner, 8), FakeScorer(runner),
-                        [strat], DryRunSubmitter(), r, LoopSettings(max_evals=160), baselines=[], store=store)
+                        strat, DryRunSubmitter(), r, LoopSettings(max_evals=160), baselines=[], store=store)
         self.assertIsNotNone(out.best)
         space = Space(r)
         centers = strat.centers

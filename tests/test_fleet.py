@@ -1,5 +1,6 @@
 """FleetExecutor over the real node agent (subprocesses in --fake mode, no ssh, no GATK): results come back scored,
-a family is one group, a node that dies mid-work has its jobs re-queued, bad nodes are rejected."""
+a family is one group, GATK runs before the answer set exists, a late latency run is duplicated on a faster node,
+a node that dies mid-work has its jobs re-queued, bad nodes are rejected."""
 import json
 import os
 import shutil
@@ -18,14 +19,20 @@ from tests.helpers import ranges
 GT = "standard_min_confidence_threshold_for_calling"
 
 
+PCR = "pcr_indel_model"
+
+
 class Planner:
-    """Families = same config except the genotyping threshold (like GatkRunner.branch_key for that tier)."""
+    """Families = same config except the genotyping threshold (cheap rider, 0.01 of a run) or the PCR model (a
+    PairHMM rider, 0.12) - like GatkRunner.branch_key/variant_cost for those tiers."""
 
     def branch_key(self, config, fidelity):
-        return Config("gatk", {k: v for k, v in config.params.items() if k != GT}).key + fidelity
+        return Config("gatk", {k: v for k, v in config.params.items() if k not in (GT, PCR)}).key + fidelity
 
     def variant_cost(self, main, variant, fidelity):
-        return 0.01 if self.branch_key(main, fidelity) == self.branch_key(variant, fidelity) else None
+        if self.branch_key(main, fidelity) != self.branch_key(variant, fidelity):
+            return None
+        return 0.12 if main.params.get(PCR) != variant.params.get(PCR) else 0.01
 
 
 SELFTEST_SOURCE = Path(SETTINGS.rounds_dir) / selftest.spec()["tag"] / "input.bam"
@@ -54,7 +61,7 @@ class FleetTest(unittest.TestCase):
         if self.ex:
             self.ex.close()
 
-    def fleet(self, *nodes, reference=True):
+    def fleet(self, *nodes, reference=True, answer_set=True):
         """nodes: (name, workers, env) -> local hosts running the real agent in --fake mode."""
         inv = []
         for name, workers, env in nodes:
@@ -67,7 +74,9 @@ class FleetTest(unittest.TestCase):
         path = self.tmp / "fleet.json"
         path.write_text(json.dumps(inv))
         self.ex = FleetExecutor(Planner(), inventory=path, reconnect_s=3600).start()
-        self.ex.publish_round(self.round, self.aset)
+        self.ex.publish_round(self.round)
+        if answer_set:
+            self.ex.publish_answer_set(self.round.round_id, self.aset)
         return self.ex
 
     def wait(self, n, timeout=60):
@@ -101,6 +110,44 @@ class FleetTest(unittest.TestCase):
         time.sleep(0.5)
         self.assertEqual(len(self.wait(3)), 3)
 
+    def test_latency_lane_runs_on_the_fastest_node_with_cheap_riders_only(self):
+        ex = self.fleet(("slow", 2, {"MINOS_FAKE_DELAY": "1.2"}), ("fast", 2, {"MINOS_FAKE_DELAY": "0.15"}))
+        self.wait_ready(2)
+        d = ranges().defaults("gatk").params
+        warm = [Config("gatk", {**d, "min_pruning": p, GT: 30.0 + i}) for i, p in enumerate((3, 4, 5, 6, 7, 8))]
+        ex.submit([EvalJob(f"w{i}", self.round, c) for i, c in enumerate(warm)])
+        self.wait(len(warm), timeout=30)                        # both nodes ran solo jobs: their speeds are measured
+        speeds = {n["host"].split("/")[-1] if "/" in n["host"] else n["host"]: n["solo_s"] for n in ex.nodes()}
+        fast = min(speeds, key=speeds.get)
+        self.assertLess(min(speeds.values()) * 2, max(speeds.values()))
+        # a latency head with a genotyping family + a PCR variant: the family rides, the PCR variant does not; the
+        # whole group lands on the fast node although the slow one is free too
+        head = Config("gatk", {**d, "min_pruning": 9})
+        kids = [Config("gatk", {**d, "min_pruning": 9, GT: v}) for v in (40.0, 50.0)]
+        pcr = Config("gatk", {**d, "min_pruning": 9, PCR: "NONE"})
+        ex.submit([EvalJob("L", self.round, head, lane="latency")]
+                  + [EvalJob(f"k{i}", self.round, c) for i, c in enumerate(kids)] + [EvalJob("P", self.round, pcr)])
+        with ex._lock:                                          # submit dispatched synchronously: inspect at once
+            fast_s = next(s for n, s in ex._sessions.items() if n == fast)
+            gid = fast_s.job_group.get("L")
+            self.assertIsNotNone(gid, "the latency job was not sent to the fastest node")
+            with_head = {j for j, g in fast_s.job_group.items() if g == gid}
+        self.assertEqual(with_head, {"L", "k0", "k1"})         # cheap riders packed, the PairHMM variant left out
+        self.assertEqual(len(self.wait(4, timeout=30)), 4)
+
+    def test_gatk_runs_before_the_answer_set_and_results_wait_for_it(self):
+        ex = self.fleet(("a", 2, {}), answer_set=False)
+        self.wait_ready(1)                                        # the round (BAM, reference) is enough to run GATK
+        jobs = [EvalJob(f"j{i}", self.round, c) for i, c in enumerate(self.others)]
+        ex.submit(jobs)
+        self.assertEqual(self.wait(1, timeout=3), {})             # computed, but nothing can be scored yet
+        node = next(iter(ex._sessions.values()))
+        self.assertEqual((len(node.jobs), ex.idle_slots()), (2, 0))   # both slots busy until their results come back
+        ex.publish_answer_set(self.round.round_id, self.aset)
+        got = self.wait(len(jobs), timeout=20)                    # the held results are scored the moment it lands
+        self.assertEqual(sorted(got), sorted(j.job_id for j in jobs))
+        self.assertTrue(all(cs.ok and cs.score is not None for cs in got.values()))
+
     def test_dead_node_jobs_are_requeued_to_the_other(self):
         ex = self.fleet(("slow", 3, {"MINOS_FAKE_DELAY": "30"}), ("fast", 1, {"MINOS_FAKE_DELAY": "0.2"}))
         self.wait_ready(2)
@@ -126,7 +173,9 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(self.wait(1, timeout=3), {})                      # nothing of the ended round arrives
 
     def test_a_round_no_node_can_prepare_fails_its_jobs(self):
-        ex = self.fleet(("noref", 2, {}), reference=False)          # the node lacks the round's reference genome
+        from dataclasses import replace
+        self.round = replace(self.round, chrom="chr0")              # no such reference anywhere: a node lacking it
+        ex = self.fleet(("noref", 2, {}), reference=False)          # cannot fetch it either
         t0 = time.time()
         while time.time() - t0 < 20 and not any(x["ready"] for x in ex.nodes()):
             time.sleep(0.2)
@@ -150,12 +199,66 @@ class GroupingTest(unittest.TestCase):
         d = ranges().defaults("gatk").params
         fam = [Config("gatk", {**d, GT: c}) for c in (30.0, 40.0)] + [Config("gatk", {**d, "min_pruning": 4})]
         ex.submit([EvalJob(f"j{i}", r, c) for i, c in enumerate(fam)])
+        from evaluator.fleet.coordinator import _Session
+        node = _Session(host=None, workers=4, rounds_ready={r.round_id})
+        other = _Session(host=None, workers=4, rounds_ready={"other-round"})
         with ex._lock:
-            g1 = ex._take_groups({r.round_id})
-            g2 = ex._take_groups({r.round_id})
-            none = ex._take_groups({"other-round"})
-        self.assertEqual(sorted(len(g[0]) for g in (g1, g2)), [1, 2])
+            g1 = ex._take_groups(node)
+            g2 = ex._take_groups(node)
+            none = ex._take_groups(other)
+        self.assertEqual(sorted(len(g[0][0]) for g in (g1, g2)), [1, 2])
+        self.assertAlmostEqual(max(g[0][1] for g in (g1, g2)), 1.01)   # the family: one run + one cheap rider
         self.assertEqual(none, [])
+
+
+class SpeculationTest(unittest.TestCase):
+    def test_an_overdue_latency_run_is_duplicated_on_a_free_fast_node_and_the_first_result_wins(self):
+        from dataclasses import replace
+        from common.types import CallSet
+        from evaluator.fleet.coordinator import _Session
+        ex = FleetExecutor(Planner(), inventory=Path("/nonexistent"))
+        ex._now = lambda: 1000.0
+        r = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
+        d = ranges().defaults("gatk").params
+        a = _Session(host=None, workers=2, ready=True, rounds_ready={r.round_id}, solo_s=150.0)
+        b = _Session(host=None, workers=2, ready=True, rounds_ready={r.round_id}, solo_s=140.0)
+        ex._sessions = {"a": a, "b": b}
+        ex.submit([EvalJob("L", r, Config("gatk", {**d, "min_pruning": 3}), lane="latency")])
+        self.assertIn("L", b.jobs)                                 # the fastest free node
+        ex._speculate()
+        self.assertEqual(ex.speculated, 0)                         # fresh start: 150 s there is no worthwhile gain
+        ex._now = lambda: 1000.0 + 1.6 * 140.0                    # overdue (> 1.5x its expected time)
+        ex._speculate()
+        self.assertEqual(ex.speculated, 1)
+        self.assertIn("L", a.jobs)                                 # the duplicate runs on the other node
+        g_b, g_a = next(iter(b.groups.values())), next(iter(a.groups.values()))
+        self.assertTrue(g_a.duplicate and g_b.twin is not None)
+        cs = CallSet(r.round_id, Config("gatk", {**d, "min_pruning": 3}).key, "/x.vcf.gz", "d", 1.0, job_id="L")
+        ex._result(a, cs)                                          # the duplicate delivers first
+        self.assertEqual(ex.speculation_won, 1)
+        self.assertEqual((a.open_groups(), b.open_groups(), list(b.jobs)), (0, 0, []))   # the loser was told to abort
+        self.assertEqual([c.job_id for c in ex.poll(0)], ["L"])
+
+
+class LatencyLaneTest(unittest.TestCase):
+    def test_a_latency_job_waits_for_a_fast_node_while_slow_nodes_take_width(self):
+        from evaluator.fleet.coordinator import _Session
+        ex = FleetExecutor(Planner(), inventory=Path("/nonexistent"))
+        r = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
+        d = ranges().defaults("gatk").params
+        fast = _Session(host=None, workers=1, ready=True, rounds_ready={r.round_id}, solo_s=100.0)
+        slow = _Session(host=None, workers=4, ready=True, rounds_ready={r.round_id}, solo_s=300.0)
+        ex._sessions = {"fast": fast, "slow": slow}
+        fast.groups[0] = None                                     # the fast node is busy
+        fast.groups.__setitem__(0, type("G", (), {"jobs": {"x": None}})())
+        ex.submit([EvalJob("L", r, Config("gatk", {**d, "min_pruning": 3}), lane="latency", priority=3),
+                   EvalJob("T", r, Config("gatk", {**d, "min_pruning": 4}))])
+        self.assertIn("T", slow.jobs)                              # the throughput job ran on the slow node
+        self.assertNotIn("L", slow.jobs)                           # the move did not: it waits for the fast node
+        self.assertEqual([it[2].job_id for it in ex._queue], ["L"])
+        del fast.groups[0]
+        ex._pump()
+        self.assertIn("L", fast.jobs)
 
 
 class CodecTest(unittest.TestCase):
@@ -205,15 +308,21 @@ class FleetScheduleTest(unittest.TestCase):
         ex = FleetExecutor(Planner(), inventory=Path("/tmp/does-not-exist-fleet.json"))
         ex.runner.variant_cost = lambda main, variant, fidelity: 0.6
         ex.submit([EvalJob(f"c{i}", rnd, c) for i, c in enumerate(conf)])
-        first = ex._take_groups({rnd.round_id})
-        second = ex._take_groups({rnd.round_id})
-        self.assertEqual([len(first[0]), len(second[0])], [2, 2])
+        from evaluator.fleet.coordinator import _Session
+        node = _Session(host=None, workers=4, rounds_ready={rnd.round_id})
+        first = ex._take_groups(node)
+        second = ex._take_groups(node)
+        self.assertEqual([len(first[0][0]), len(second[0][0])], [2, 2])
+        slow = _Session(host=None, workers=4, rounds_ready={rnd.round_id}, solo_s=200.0)   # a slower node packs the
+        more = [Config("gatk", {**d, GT: c}) for c in (70.0, 80.0, 90.0, 95.0)]              # same shapes: its cap and
+        ex.submit([EvalJob(f"d{i}", rnd, c) for i, c in enumerate(more)])                 # rider costs both scale
+        self.assertEqual([len(g[0][0]) for g in (ex._take_groups(slow), ex._take_groups(slow))], [2, 2])
 
         held = FleetExecutor(Planner(), inventory=Path("/tmp/does-not-exist-fleet.json"))
         held._now = lambda: 0.0
         held.set_finish_by(10.0)                              # a solo run is 132 s
         held.submit([EvalJob("a", rnd, conf[0])])
-        self.assertEqual(held._take_groups({rnd.round_id}), [])
+        self.assertEqual(held._take_groups(node), [])
         self.assertEqual(len(held._queue), 1)
 
 

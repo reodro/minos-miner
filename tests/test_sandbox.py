@@ -155,3 +155,20 @@ class ScoreLimitTest(unittest.TestCase):
         self.assertEqual(with_score_limit(list(bcf)), bcf)
         own = ["docker", "run", "--cpus=3", "genonet/hap-py@sha256:abc"]
         self.assertEqual(with_score_limit(list(own)), own)
+
+
+class ScoreThreadsTest(unittest.TestCase):
+    def test_happy_runs_with_one_thread_by_default_and_the_cpu_limit(self):
+        import os
+        from evaluator.sandbox import with_score_limit
+        args = ["docker", "run", "--rm", "hap-py:latest", "truth.vcf", "query.vcf", "--threads", "4", "-o", "x"]
+        os.environ.pop("MINOS_SCORE_THREADS", None); os.environ.pop("MINOS_SCORE_CPUS", None)
+        out = with_score_limit(args)
+        self.assertEqual(out[out.index("--threads") + 1], "1")
+        self.assertIn("--cpus=1", out)
+        os.environ["MINOS_SCORE_THREADS"] = "0"                       # 0: upstream's thread count stays
+        kept = with_score_limit(args)
+        self.assertEqual(kept[kept.index("--threads") + 1], "4")
+        os.environ.pop("MINOS_SCORE_THREADS", None)
+        gatk = ["docker", "run", "gatk:4", "HaplotypeCaller", "--threads", "4"]
+        self.assertEqual(with_score_limit(gatk), gatk)                 # not hap.py: untouched
