@@ -85,7 +85,7 @@ released truth; one run's noise is 0.04-0.08 TRUE.
 | v3 | 2026-10-05 | isolated domains, ParamILS-style climb, funnel 6-3-1, shakes streamed | 32K | 88.661 | 89.612 | 34 |
 | v3.1 | 1602b81 | fine mode, freezes, merges with inheritance, siblings | 59K | 88.778 | 89.714 | 25 |
 | v3.2 | 155b972 | hypercube waves, model-guided scout, rolling domains | 116K | 88.771 | 89.770 | 23 |
-| v4 | 2026-10-05 | hill registry, controller, genetic opening, merges by recombination, ParamILS perturbation loop, plateau-centre pick | | | | |
+| v4 | 2026-10-05 | hill registry, controller, genetic opening, merges by recombination, ParamILS perturbation loop, plateau-centre pick (hand-tuned during the run: opening.max_min, climb.decisive) | 47K | 88.699 | 89.711 | 25 |
 
 What each step taught: riders inflate counts without information (v1); best-of-sweep beats first accept and stale
 centres (v2); random shakes on spare workers win nothing after the first 20 minutes (v3); fine steps pay late in the

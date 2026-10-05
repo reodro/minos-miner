@@ -105,7 +105,7 @@ The GIAB NIST VCFs + BEDs (`$DATA_DIR/giab/`) are not scripted yet. Fleet nodes 
 ## Everyday commands
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -t .              # unit tests (~30 s); RUN_SLOW=1 adds GATK tests
+.venv/bin/python -m unittest discover -s tests -t .              # unit tests (~75 s); RUN_SLOW=1 adds GATK tests
 .venv/bin/python -m main replay 20260928T092900Z --minutes 20     # whole miner on a stored round, dry-run
 .venv/bin/python -m main live --wallet W --hotkey H --demo        # live miner (untested; demo mode first)
 ```
@@ -117,3 +117,49 @@ of the final, baseline and top configs, and the rank among the real submissions.
 Reference points (20-minute replays): round 092900Z - one 16-core machine 296 configs, true 87.22, rank 44/60;
 fleet of two 16-core sub-VPSs 587 configs, true 87.53, rank 36/60. Round 20261001T044100Z (GIAB HG007, chr18) -
 fleet of a 32-core and a 180-core sub-VPS: true 78.47, rank 52/68 (field best 79.77).
+
+## Running a fleet test (runbook)
+
+The steps, in order, as run for the engine v4 test on 2026-10-05 (6 nodes, 823 workers). Long steps run in the
+background; nothing here edits `fleet.json`, which is the user's file.
+
+1. **Nodes.** The user rents them and lists them in `fleet.json` in the repo folder (git-ignored): host, port,
+   user, key, `key_passphrase`.
+2. **Clear stale host keys.** Providers reuse addresses, and an old key makes ssh refuse the new machine:
+   ```bash
+   ssh-keygen -R <ip>                    # port 22
+   ssh-keygen -R "[<ip>]:<port>"         # a host on another port
+   ```
+3. **Provision** new nodes, in parallel, about 3-6 minutes each. It installs Docker, the GATK image and the
+   genomes, copies the repo and builds the GATK patch jar there.
+   ```bash
+   .venv/bin/python -m evaluator.fleet.control provision <host> ...    # no host: every host in fleet.json
+   .venv/bin/python -m evaluator.fleet.control status                  # cores, workers, image, jar, genomes, code
+   ```
+   A node gets min(0.9 x cores, available RAM / 1.3 GB) workers. A node with little RAM per core gets few workers
+   (98 GB -> 73) and still runs out of memory under load (5x slower in the v4 test): rent at least 4 GB per core.
+4. **On main, before the run:** rebuild the patch after a patch change (`bash evaluator/gatk_patch/build.sh`), run
+   the unit tests, and set the dashboard password once (`.venv/bin/python -m dashboard passwd`).
+5. **Run it** in the background; a 72-minute search plus the truth review takes about 80 minutes:
+   ```bash
+   scripts/fleet_replay.sh 20261002T092900Z 72     # sync the code, wipe the round's node caches, replay, review
+   ```
+   To check that everything runs without the fleet (not the score): `.venv/bin/python -m main replay <tag>
+   --minutes 15` on main's own workers.
+6. **Watch** on the dashboard, `https://<main's IP>:8443`. The Settings tab writes `tuning.json`: live settings
+   apply within a second, round settings at the next round, and the run's manifest records every change. The
+   run's log is `test/runs/replay_<tag>_<HHMM>.log`; `grep "engine: "` shows the engine's decisions.
+7. **Result.** The end of the log and the dashboard's Result panel show the submitted config's true score, the
+   pick gap, the local-vs-true rank correlation and the rank. To check more configs against the released truth:
+   ```bash
+   .venv/bin/python scripts/true_scores.py <run_id> --top 7     # the top 7 distinct local results
+   ```
+8. **Pull the history, then release the nodes.** The VCFs exist only on the nodes:
+   ```bash
+   .venv/bin/python scripts/pull_history.py <tag> <tag>_<label> test/runs/replay_<tag>_<HHMM>.log
+   ```
+   It lands in `$DATA_DIR/history/<label>/` (about 30-40 GB, 5-7 minutes). Then the user turns the nodes off.
+9. **Record it:** add the run to the engine versions table in [search/README.md](search/README.md).
+
+If main was killed mid-run, node agents can outlive it: the wipe step prints `AGENT-RUNNING` for such a node, and
+`.venv/bin/python -m evaluator.fleet.control reap` stops their GATK containers once no agent is running.
