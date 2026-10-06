@@ -17,8 +17,14 @@ public final class MinosRecordingRandom extends Random {
 
     public MinosRecordingRandom(final long seed) { super(seed); }
 
+    // minos activity cache: every raw draw is counted, so the read pass can prove it drew nothing
+    private transient long rawDraws = 0;
+
+    public long minosRawDraws() { return rawDraws; }
+
     @Override
     protected int next(final int bits) {
+        rawDraws++;
         final int v = super.next(bits);
         if (recording) {
             draws.add(new int[]{bits, v});
@@ -34,6 +40,7 @@ public final class MinosRecordingRandom extends Random {
         recording = false;
         draws = new ArrayList<>();
         gaussians = 0;
+        rawDraws = 0;
     }
 
     // minos repair: QD jitter is the only Random use in genotyping, and it goes through nextGaussian. Counting those

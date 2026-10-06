@@ -113,5 +113,33 @@ class GatkServerTest(unittest.TestCase):
         self.assertTrue((d / "stop").exists())
 
 
+class ActivityCacheTest(unittest.TestCase):
+    """GatkRunner names one activity-cache directory per skeleton (what a batch shares) for every patched run."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        (self.tmp / "minos-patch.jar").write_text("")
+        self.runner = G.GatkRunner(work_dir=str(self.tmp), patch_jar=str(self.tmp / "minos-patch.jar"), runtime="docker")
+        self.addCleanup(self.runner.stop_servers)
+
+    def test_one_directory_per_skeleton_and_never_for_repairs_or_unbatchable_configs(self):
+        from tests.helpers import ranges
+        d = ranges().defaults("gatk").params
+        dir_of = lambda c, props=None: self.runner._activity_cache(c, "full", props).get("minos.activity.dir")  # noqa: E731
+        a = Config("gatk", {**d, "min_pruning": 2})
+        late = Config("gatk", {**d, "min_pruning": 3, "standard_min_confidence_threshold_for_calling": 50.0,
+                               "pcr_indel_model": "NONE", "active_probability_threshold": 0.005})
+        early = Config("gatk", {**d, "min_pruning": 2, "min_mapping_quality_score": d["min_mapping_quality_score"] + 5})
+        self.assertTrue(dir_of(a).startswith("/data/output/activity/"))
+        self.assertEqual(dir_of(a), dir_of(late))                  # late stages only: the same skeleton
+        self.assertNotEqual(dir_of(a), dir_of(early))              # a read setting: another skeleton
+        self.assertIsNone(dir_of(a, {"minos.repair.log": "/data/output/r"}))
+        self.assertIsNone(dir_of(Config("gatk", {**d, "emit_ref_confidence": "GVCF"})))
+        self.addCleanup(setattr, G, "ACTIVITY_CACHE", G.ACTIVITY_CACHE)
+        G.ACTIVITY_CACHE = False
+        self.assertIsNone(dir_of(a))
+
+
 if __name__ == "__main__":
     unittest.main()

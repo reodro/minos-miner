@@ -102,6 +102,7 @@ MAX_WARM = 2                     # JVMs kept after a run so a later genotyping v
 MAX_SERVER_JOBS = 200            # a GATK server (MinosServer) is replaced after this many jobs
 SERVER_IDLE_S = 600              # ... and leaves by itself after this long without a job
 SERVER_VERIFY_EVERY = int(os.environ.get("MINOS_SERVER_VERIFY", "40"))   # every Nth solo server run is re-run cold
+ACTIVITY_CACHE = os.environ.get("MINOS_ACTIVITY_CACHE", "1") != "0"     # per-skeleton activity states (AssemblyRegionIterator)
 SERVER_MOUNTS = ("/srv/data", "/srv/cache", "/srv/work")                   # data_dir, cache_dir, the runner's work_dir
 
 SAFE_ANNOTATION_EXCLUSIONS = (
@@ -358,7 +359,8 @@ class GatkRunner:
         if self.patch_jar is None:
             cmd += [GATK_IMAGE, "gatk", "--java-options", heap, "HaplotypeCaller"]
         else:
-            props = [f"-D{k}={v}" for k, v in (jvm_props or {}).items()]
+            jvm_props = {**self._activity_cache(config, fidelity, jvm_props), **(jvm_props or {})}
+            props = [f"-D{k}={v}" for k, v in jvm_props.items()]
             cmd += ["-v", f"{self.patch_jar.parent}:/patch:ro", GATK_IMAGE, "java", *WRAPPER_JVM, heap, *props,
                     "-cp", f"/patch/{self.patch_jar.name}:{GATK_JAR_IN_IMAGE}", "org.broadinstitute.hellbender.Main",
                     "HaplotypeCaller"]
@@ -370,6 +372,18 @@ class GatkRunner:
         for a in SAFE_ANNOTATION_EXCLUSIONS:
             cmd += ["-AX", a]
         return cmd
+
+    def _activity_cache(self, config: Config, fidelity: str, jvm_props: Optional[dict]) -> dict:
+        """The activity cache of config's skeleton: the patch saves each shard's per-locus activity states there, or
+        reads them instead of building pileups and calling isActive when an earlier run of the skeleton saved them
+        (~28% of a warm run). One directory per skeleton (branch_key: what a batch shares), next to the round's
+        callsets, so it goes with them. Repair runs keep their own path."""
+        if not ACTIVITY_CACHE or "minos.repair.log" in (jvm_props or {}):
+            return {}
+        key = self.branch_key(config, fidelity)
+        if key is None:
+            return {}
+        return {"minos.activity.dir": f"/data/output/activity/{hashlib.sha1(key.encode()).hexdigest()[:16]}"}
 
     def kill_round(self, round_id: str) -> int:
         """Kill this runner's running containers of one round (the round is over: their results are useless)."""
