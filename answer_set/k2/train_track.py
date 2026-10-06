@@ -41,6 +41,8 @@ POINT_ALPHA = 1.0
 # kg track with Minos's exact rule for the person's part (kg.gatk_person_own, meta kg_own_rule): that part is copied
 # and the person's other GATK calls are never written, so the model learns and is judged only on the rest
 KG_OWN_RULE = False
+# kg track with the round-level measurements (tracks.ROUND_FEATS, meta round_feats)
+ROUND_FEATS = False
 THR_GRID = [round(0.1 + 0.05 * i, 2) for i in range(17)]
 
 
@@ -131,9 +133,11 @@ def predict(pair, r, cols):
 def evaluate(track, name, rs):
     """{round: (precision, recall, f1)} and per-class counts for a track version on rounds."""
     m, h, meta, _ = tracks.load(track, name)
-    cols = [FEATURES.index(f) for f in meta["features"]]
+    cols = [tracks.col_index(f) for f in meta["features"]]
     per, agg = {}, defaultdict(Counter)
     for r in rs:
+        if meta.get("round_feats") and r["X"].shape[1] == len(FEATURES):
+            r = dict(r, X=tracks.with_round_feats(r["X"]))
         pa, ph = predict((m, h), r, cols)
         keys_ = list(zip(r["pos"].tolist(), r["ref"].tolist(), r["alt"].tolist()))
         pa = tracks.apply_source_thr(meta, r["X"], tracks.apply_class_thr(meta, keys_, pa), pa)
@@ -157,7 +161,13 @@ def train(track, rs, name):
                                   for r in rs)
     kg_hg = kg_rd and all(r["info"].get("kg_hapgeno") for r in rs)
     feats = tracks.features_for(track, kg_rd, kg_hg)
-    cols = [FEATURES.index(f) for f in feats]
+    if track == "kg" and ROUND_FEATS:
+        if not kg_rd:
+            sys.exit("--round-feats needs every round prepared with the read comparison")
+        feats = feats + tracks.ROUND_FEATS
+        for r in rs:
+            r["X"] = tracks.with_round_feats(r["X"])
+    cols = [tracks.col_index(f) for f in feats]
     if track == "kg" and KG_OWN_RULE:                # the person's part of each round's truth, by the rule
         from answer_set.k2 import kg
         from answer_set.k2.util import parse_region
@@ -239,6 +249,8 @@ def train(track, rs, name):
                 "thr_only_rd": thr_rd, "thr_class": thr_class, "point_alpha": POINT_ALPHA if cost else None}
         if track == "kg" and KG_OWN_RULE:
             meta["kg_own_rule"] = 1
+        if track == "kg" and ROUND_FEATS:
+            meta["round_feats"] = 1
         if kg_hg:
             meta["kg_hapgeno"] = min(int(r["info"]["kg_hapgeno"]) for r in rs)
         if track == "giab":
@@ -251,7 +263,7 @@ def train(track, rs, name):
 
 
 def main():
-    global POINT_ALPHA, KG_OWN_RULE
+    global POINT_ALPHA, KG_OWN_RULE, ROUND_FEATS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--track", required=True, choices=tracks.TRACKS)
     ap.add_argument("--same-rounds-as", help="train on the rounds (of this track) that a track version used")
@@ -261,9 +273,12 @@ def main():
                     help="weight rows by class error cost ** alpha (0: unweighted)")
     ap.add_argument("--kg-own-rule", action="store_true",
                     help="kg: the person's part is copied by Minos's exact rule; learn only the rest")
+    ap.add_argument("--round-feats", action="store_true",
+                    help="kg: add the round-level measurements (tracks.ROUND_FEATS: which insertion pattern the round has)")
     args = ap.parse_args()
     POINT_ALPHA = args.point_alpha
     KG_OWN_RULE = args.kg_own_rule
+    ROUND_FEATS = args.round_feats
     want = None
     if args.same_rounds_as:
         n = args.same_rounds_as

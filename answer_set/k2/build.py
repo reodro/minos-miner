@@ -126,9 +126,11 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     m_any, m_hom, meta, used = tracks.load(track, (track_versions or {}).get(track), exclude_round)
     thr = meta["threshold"]
     meta = dict(meta, giab_bed_rule=meta.get("bed_rule", False))
+    if meta.get("round_feats") and len(keys):                   # round-level measurements (tracks.ROUND_FEATS)
+        X = tracks.with_round_feats(X)
     X_full = X
     if meta.get("features") and meta["features"] != FEATURES:      # use exactly its own columns
-        X = X[:, [FEATURES.index(n) for n in meta["features"]]] if len(keys) else X
+        X = X[:, [tracks.col_index(n) for n in meta["features"]]] if len(keys) else X
     p_any = m_any.predict_proba(X)[:, 1] if len(keys) else np.array([])
     p_hom = m_hom.predict_proba(X)[:, 1] if len(keys) else np.array([])
     p_raw = p_any

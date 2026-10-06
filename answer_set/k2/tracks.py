@@ -75,7 +75,7 @@ def apply_gt_rule(meta, X, p_hom):
     (100% of 576,785 background variants in 43 rounds, incl. all 1,385 GATK/DRAGEN disagreements)."""
     import numpy as np
     from answer_set.k2.features import FEATURES
-    if not meta.get("gt_from_gatk") or "gatk_person_hom" not in FEATURES or X.shape[1] != len(FEATURES):
+    if not meta.get("gt_from_gatk") or "gatk_person_hom" not in FEATURES or X.shape[1] < len(FEATURES):
         return p_hom
     v = X[:, FEATURES.index("gatk_person_hom")]
     return np.where(np.isnan(v), p_hom, v)
@@ -88,7 +88,7 @@ def apply_source_thr(meta, X, p_any, p_raw=None):
     import numpy as np
     from answer_set.k2.features import FEATURES
     t2 = meta.get("thr_only_rd")
-    if t2 is None or "only_rd" not in FEATURES or X.shape[1] != len(FEATURES):
+    if t2 is None or "only_rd" not in FEATURES or X.shape[1] < len(FEATURES):
         return p_any
     thr = meta["threshold"]
     o = X[:, FEATURES.index("only_rd")] == 1
@@ -104,6 +104,38 @@ RD_FEATS = ["rd_support", "rd_cover", "rd_frac", "only_rd", "rd_orig", "rd_orig_
 
 
 HG_SET = [f for f in GIAB_ONLY if f.startswith("hg_") or f == "only_hg"]   # the genotyper's measurements
+
+# Round-level measurements (kg versions with meta round_feats), computed from the candidate table itself, appended after
+# FEATURES. From the 2026-10-05 05:53 round Minos inserts 1000G indels at lower read fractions (inserted hom indels
+# below 0.8 of the reads: 1-7% per round before, 30-39% after; SNPs unchanged). Among indel candidates the read
+# comparison shows as Minos's edits (rd_support >= 3), (share at 0.6-0.85) / (share >= 0.85) was 0.15-0.49 in all 46
+# earlier rounds and 0.87-1.01 after, the het mode's median 0.44-0.46 before and 0.37-0.39 after: the round tells which
+# pattern it has, so the model need not guess from a date.
+ROUND_FEATS = ["rnd_ind_ratio", "rnd_ind_hetmed", "alt_frac_rel"]
+ROUND_MIN_INDELS = 100
+
+
+def with_round_feats(X):
+    """X (FEATURES columns first) with ROUND_FEATS appended; NaN where the round has too few edited indels."""
+    import numpy as np
+    n = len(X)
+    out = np.full((n, len(ROUND_FEATS)), np.nan)
+    if n:
+        af = X[:, FEATURES.index("alt_frac")]
+        m = (X[:, FEATURES.index("is_indel")] == 1) & (np.nan_to_num(X[:, FEATURES.index("rd_support")]) >= 3)
+        a = af[m & ~np.isnan(af)]
+        het = a[(a > 0.15) & (a < 0.6)]
+        if len(a) >= ROUND_MIN_INDELS and len(het):
+            hi = np.mean(a >= 0.85)
+            out[:, 0] = np.mean((a >= 0.6) & (a < 0.85)) / max(hi, 0.01)
+            out[:, 1] = np.median(het)
+            out[:, 2] = af / (2 * out[0, 1])
+    return np.hstack([X[:, :len(FEATURES)], out])
+
+
+def col_index(name):
+    """Column of a measurement in a table with ROUND_FEATS appended (with_round_feats)."""
+    return FEATURES.index(name) if name in FEATURES else len(FEATURES) + ROUND_FEATS.index(name)
 
 
 def features_for(track, kg_readdiff=False, kg_hapgeno=False):

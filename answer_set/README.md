@@ -33,7 +33,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k020_20261005T1359) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k022_20261005T2149) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -146,6 +146,16 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   1000G round including the new-pattern ones (1000G data only). Leave-one-out on the 3 new-pattern rounds (each scored
   by a model that never saw it): +0.70 / +0.38 / +0.65 over k012 (1-bp errors 23/19 -> 7/4, 16/11 -> 2/0, 25/14 ->
   11/4). The 46 old-pattern rounds (fold models): +0.017 per round (t 2.95, better 30 / worse 15, worst -0.061).
+- k022 (1000G, released 2026-10-06) = k020's setup + three round-level columns (`tracks.ROUND_FEATS`, meta
+  `round_feats`, `train_track --round-feats`), computed from the round's own candidate table: among indel candidates
+  the read comparison shows as Minos's edits, (share at 0.6-0.85 of the reads) / (share >= 0.85), the het mode's
+  median, and each candidate's read fraction relative to it. Since 2026-10-05 05:53 Minos inserts 1000G indels at
+  lower read fractions (hom below 0.8: 1-7% of inserted hom indels per round before, 30-39% after; SNPs unchanged), so
+  k020 called many hom indels het; the ratio was 0.15-0.49 in all 46 earlier rounds and 0.87-1.01 after, so the round
+  itself says which pattern it has (no date switch). Trained on 52 rounds (7 new-pattern). Against k020 on the 10
+  new-pattern rounds (6 by fold models, 4 no version had seen): +0.139 per round (t 2.9, better 8/10, worst -0.109);
+  vs the same training without the columns (k021) +0.046 on the fold rounds (6/6). 8 old-pattern rounds: -0.012
+  (t -0.95).
 
 ## Open work
 
