@@ -24,6 +24,7 @@ public final class MinosKBest {
         key = null;
         unattributed = false;
         STATS.clear();
+        capture = null;
     }
 
     /** The assembly whose searches follow ("<stream>|<assembly settings>"); null after it. */
@@ -31,7 +32,23 @@ public final class MinosKBest {
         key = k;
     }
 
+    // minos assembly cache: the searches of one assembly, saved with it and reported again when it is reused
+    private static java.util.List<int[]> capture = null;
+
+    public static void startCapture() {
+        capture = new java.util.ArrayList<>();
+    }
+
+    public static java.util.List<int[]> stopCapture() {
+        final java.util.List<int[]> out = capture == null ? java.util.Collections.emptyList() : capture;
+        capture = null;
+        return out;
+    }
+
     public static void record(final int needed, final boolean stopped) {
+        if (capture != null) {
+            capture.add(new int[]{needed, stopped ? 1 : 0});
+        }
         if (key == null) {
             unattributed = true;
             return;

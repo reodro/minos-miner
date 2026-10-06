@@ -103,6 +103,7 @@ MAX_SERVER_JOBS = 200            # a GATK server (MinosServer) is replaced after
 SERVER_IDLE_S = 600              # ... and leaves by itself after this long without a job
 SERVER_VERIFY_EVERY = int(os.environ.get("MINOS_SERVER_VERIFY", "40"))   # every Nth solo server run is re-run cold
 ACTIVITY_CACHE = os.environ.get("MINOS_ACTIVITY_CACHE", "1") != "0"     # per-skeleton activity states (AssemblyRegionIterator)
+ASSEMBLY_CACHE = os.environ.get("MINOS_ASSEMBLY_CACHE", "1") != "0"     # per-region assemblies (MinosAssemblyCache)
 SERVER_MOUNTS = ("/srv/data", "/srv/cache", "/srv/work")                   # data_dir, cache_dir, the runner's work_dir
 
 SAFE_ANNOTATION_EXCLUSIONS = (
@@ -359,7 +360,8 @@ class GatkRunner:
         if self.patch_jar is None:
             cmd += [GATK_IMAGE, "gatk", "--java-options", heap, "HaplotypeCaller"]
         else:
-            jvm_props = {**self._activity_cache(config, fidelity, jvm_props), **(jvm_props or {})}
+            jvm_props = {**self._activity_cache(config, fidelity, jvm_props), **self._assembly_cache(config, fidelity, jvm_props),
+                         **(jvm_props or {})}
             props = [f"-D{k}={v}" for k, v in jvm_props.items()]
             cmd += ["-v", f"{self.patch_jar.parent}:/patch:ro", GATK_IMAGE, "java", *WRAPPER_JVM, heap, *props,
                     "-cp", f"/patch/{self.patch_jar.name}:{GATK_JAR_IN_IMAGE}", "org.broadinstitute.hellbender.Main",
@@ -384,6 +386,18 @@ class GatkRunner:
         if key is None:
             return {}
         return {"minos.activity.dir": f"/data/output/activity/{hashlib.sha1(key.encode()).hexdigest()[:16]}"}
+
+    def _assembly_cache(self, config: Config, fidelity: str, jvm_props: Optional[dict]) -> dict:
+        """The round's assembly cache: the patch saves each region's assembled haplotypes there, keyed by the skeleton,
+        the assembly settings, the region and its reads, and a later run reads them instead of assembling (configs that
+        differ only in PairHMM / genotyping settings, or whose regions come out the same). Repair runs keep their path."""
+        if not ASSEMBLY_CACHE or "minos.repair.log" in (jvm_props or {}):
+            return {}
+        key = self.branch_key(config, fidelity)
+        if key is None:
+            return {}
+        return {"minos.assembly.dir": "/data/output/assembly",
+                "minos.assembly.skeleton": hashlib.sha1(key.encode()).hexdigest()[:16]}
 
     def kill_round(self, round_id: str) -> int:
         """Kill this runner's running containers of one round (the round is over: their results are useless)."""

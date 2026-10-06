@@ -825,7 +825,10 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         final AssemblyResultSet untrimmedAssemblyResult;
         org.broadinstitute.hellbender.utils.MinosKBest.setKey("-1|" + minosAssemblyKey(hcArgs));   // minos: cap report
         try {
-            untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader, samplesList, logger, referenceReader, assemblyEngine, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities, hcArgs.fbargs, false);
+            // minos: the region's assembly from the assembly cache when an earlier run of the round made it
+            untrimmedAssemblyResult = MinosAssemblyCache.assemble(minosAssemblyKey(hcArgs), region, readsHeader,
+                    () -> AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader, samplesList, logger, referenceReader, assemblyEngine, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities, hcArgs.fbargs, true),
+                    () -> AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader, samplesList, logger, referenceReader, assemblyEngine, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities, hcArgs.fbargs, false));
         } finally {
             org.broadinstitute.hellbender.utils.MinosKBest.setKey(null);
         }
@@ -1712,9 +1715,13 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         final AssemblyResultSet untrimmedAssemblyResult;
         org.broadinstitute.hellbender.utils.MinosKBest.setKey(minosKBestKey(members.get(0)));   // minos: cap report
         try {
-            untrimmedAssemblyResult = AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader,
-                    samplesList, logger, referenceReader, groupAssembler, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities,
-                    hcArgs.fbargs, false);
+            untrimmedAssemblyResult = MinosAssemblyCache.assemble(members.get(0).assemblyKey, region, readsHeader,   // minos
+                    () -> AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader,
+                            samplesList, logger, referenceReader, groupAssembler, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities,
+                            hcArgs.fbargs, true),
+                    () -> AssemblyBasedCallerUtils.assembleReads(region, hcArgs, readsHeader,
+                            samplesList, logger, referenceReader, groupAssembler, aligner, !hcArgs.doNotCorrectOverlappingBaseQualities,
+                            hcArgs.fbargs, false));
         } finally {
             org.broadinstitute.hellbender.utils.MinosKBest.setKey(null);
         }

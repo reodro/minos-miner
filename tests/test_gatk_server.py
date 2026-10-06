@@ -140,6 +140,22 @@ class ActivityCacheTest(unittest.TestCase):
         G.ACTIVITY_CACHE = False
         self.assertIsNone(dir_of(a))
 
+    def test_the_assembly_cache_is_the_rounds_and_carries_the_skeleton(self):
+        from tests.helpers import ranges
+        d = ranges().defaults("gatk").params
+        props = lambda c, p=None: self.runner._assembly_cache(c, "full", p)                                        # noqa: E731
+        a = Config("gatk", {**d, "min_pruning": 2})
+        late = Config("gatk", {**d, "min_pruning": 3, "pcr_indel_model": "NONE", "active_probability_threshold": 0.005})
+        early = Config("gatk", {**d, "min_pruning": 2, "min_base_quality_score": d["min_base_quality_score"] + 3})
+        self.assertEqual(props(a)["minos.assembly.dir"], "/data/output/assembly")                # one directory per round
+        self.assertEqual(props(a)["minos.assembly.skeleton"], props(late)["minos.assembly.skeleton"])
+        self.assertNotEqual(props(a)["minos.assembly.skeleton"], props(early)["minos.assembly.skeleton"])
+        self.assertEqual(props(a, {"minos.repair.log": "/data/output/r"}), {})
+        self.assertEqual(props(Config("gatk", {**d, "emit_ref_confidence": "GVCF"})), {})
+        self.addCleanup(setattr, G, "ASSEMBLY_CACHE", G.ASSEMBLY_CACHE)
+        G.ASSEMBLY_CACHE = False
+        self.assertEqual(props(a), {})
+
 
 if __name__ == "__main__":
     unittest.main()
