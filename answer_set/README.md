@@ -23,7 +23,7 @@ the released truth.
 | Module | Role |
 |---|---|
 | `k2/provider.py` | `K2Provider`: build into `<cache_dir>/answer_set/k2/<tag>/v1/`, read it into an `AnswerSet` |
-| `k2/build.py` | candidates -> features -> track model -> `truth.vcf.gz`, `mutations.vcf.gz` (N=580), `scores.tsv.gz`, `report.json` |
+| `k2/build.py` | candidates -> features -> track model -> `truth.vcf.gz`, `mutations.vcf.gz` (N=548: the best single guess, see `build.N_TARGETS`), `scores.tsv.gz`, `report.json` |
 | `k2/features.py` | read scan, format detection (GIAB / 1000G), every measurement |
 | `k2/kg.py`, `k2/masks.py` | 1000G person, DRAGEN / GATK lookups, panel index; region masks |
 | `k2/kg_origin.py` | 1000G original reads: the person's public 1000 Genomes CRAM (EBI), round region only |

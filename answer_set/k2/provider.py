@@ -5,7 +5,7 @@
   models      the track's ACTIVE version (<data_dir>/answer_set/models/<track>/ACTIVE): gradient-boosted trees
               decide P(in truth) and P(hom) per candidate; GIAB rounds copy the donor's NIST list and add model
               calls inside its BED
-  output      truth.vcf.gz, mutations.vcf.gz (N=580 entries), scores.tsv.gz (P per candidate), report.json,
+  output      truth.vcf.gz, mutations.vcf.gz (N=548 entries), scores.tsv.gz (P per candidate), report.json,
               in <cache_dir>/answer_set/k2/<round tag>/v1/
 
 Scoring reads notes['truth_vcf'] / notes['mutations_vcf'], i.e. exactly the files the builder wrote. germline /

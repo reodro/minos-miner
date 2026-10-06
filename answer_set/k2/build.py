@@ -46,6 +46,7 @@ def write_scores(path, keys, p_any, donor, allowed):
 # 1000G: write the person's own records as the raw GATK callset writes them (kg.gatk_person_raw), multi-allelic sites
 # with every ALT of the site, like Minos's truth; off = each carried allele trimmed (before 2026-10-06)
 KG_RAW_RECORDS = os.environ.get("MINOS_KG_RAW", "1") == "1"
+N_TARGETS = 548                    # mutations.vcf entries written (see build); before 2026-10-06: the median guess 580
 
 
 def write_vcf(path, chrom, records, donor_raw=None):
@@ -198,10 +199,11 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     write_scores(out / "scores.tsv.gz", keys, p_any, donor, allowed)
 
     # mutations file: only its entry count N matters to the v2 score (false-call divisor).
-    # Minos picks N at random each round (369-791 seen); the median is the best guess
-    # (typical error ~12%), better than any estimate from the round itself.
+    # Minos picks N at random each round (282-791 in 252 rounds to 2026-10-06, median 564) and does not send it live;
+    # nothing in the round predicts it (corr <= 0.17). N_TARGETS is the N whose false-call term equals that term's
+    # mean over those rounds (546-549 for 500-1,300 false calls), i.e. the best single value for ranking configs.
     injected = sorted((r for r in recs if r[4]), key=lambda r: -r[5])
-    n = int(meta.get("n_targets_median", 580))
+    n = N_TARGETS
     pool = injected if injected else sorted(recs, key=lambda r: -r[5])
     step = max(1, len(pool) // max(1, n))
     muts = pool[::step][:n]
