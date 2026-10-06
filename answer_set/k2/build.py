@@ -14,6 +14,7 @@ How it works:
   3. The format's model track decides which remaining candidates are real, and whether each is het or hom.
 """
 import json
+import os
 from collections import Counter
 import time
 from pathlib import Path
@@ -40,6 +41,11 @@ def write_scores(path, keys, p_any, donor, allowed):
             elif allowed is not None and not allowed(k):
                 p = 0.0
             fh.write(f"{k[0]}\t{k[1]}\t{k[2]}\t{p:.4f}\n")
+
+
+# 1000G: write the person's own records as the raw GATK callset writes them (kg.gatk_person_raw), multi-allelic sites
+# with every ALT of the site, like Minos's truth; off = each carried allele trimmed (before 2026-10-06)
+KG_RAW_RECORDS = os.environ.get("MINOS_KG_RAW", "1") == "1"
 
 
 def write_vcf(path, chrom, records, donor_raw=None):
@@ -180,6 +186,12 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     if info["mode_giab"]:
         from answer_set.k2.util import donor_records
         donor_raw = donor_records(info["mode_donor"], chrom, a, b)
+    elif KG_RAW_RECORDS and isinstance(kg_own, int):   # 1000G: the person's records as the callset (and Minos) writes them
+        from answer_set.k2 import kg
+        try:
+            donor_raw = kg.gatk_person_raw(chrom, a, b, kgi["person"])
+        except Exception:  # noqa: BLE001  (never stuck: the person's alleles are written one by one, as before)
+            donor_raw = None
     write_vcf(out / "truth.vcf.gz", chrom, [r[:5] for r in recs], donor_raw)
     write_scores(out / "scores.tsv.gz", keys, p_any, donor, allowed)
 

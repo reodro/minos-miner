@@ -295,6 +295,43 @@ def gatk_person_own(chrom, a, b, sample):
 OWN_MIN_DP, OWN_MIN_GQ = 10, 20
 
 
+def gatk_person_raw(chrom, a, b, sample):
+    """The person's passing GATK records (gatk_person_own's rule) as the raw callset writes them, which is how Minos's
+    truth writes them: {pos: (REF, [ALTs], GT)} with every ALT of the callset site (other people's alleles too) and
+    the GT's allele numbers (0/2, 1/2, ...). Rebuilt from the split cache through bcftools' OLD tag
+    (CHR|POS|REF|ALT|index); for build.write_vcf's donor_raw, like GIAB's NIST records (util.donor_records).
+    2026-10-06, round 20261006T010500Z: 2,807 of the 15,293 own records are multi-allelic sites written this way."""
+    import pysam
+    gatk_person_region(chrom, a, b, sample)
+    recs = {}
+    for rec in pysam.VariantFile(str(_person_path(chrom, a, b, sample))):
+        old = rec.info.get("OLD")
+        s = rec.samples[0]
+        gt = s.get("GT")
+        if not old or not gt or any(g is None for g in gt):
+            continue
+        if not (list(rec.filter.keys()) in (["PASS"], []) and (s.get("DP") or 0) >= OWN_MIN_DP
+                and (s.get("GQ") or 0) >= OWN_MIN_GQ):
+            continue
+        f = (old if isinstance(old, str) else ",".join(old)).split("|")   # pysam splits the ALT list at its commas;
+        # a record only left-aligned has no index
+        p, R0, alts, idx = int(f[1]), f[2], f[3], int(f[4]) if len(f) > 4 else 1
+        if not a <= p <= b:
+            continue
+        r = recs.setdefault(p, [R0, alts.split(","), []])
+        if r[0] != R0:                                   # two different source records at one position: leave it
+            r[2] = None
+        elif r[2] is not None:
+            r[2] += [idx] * sum(1 for g in gt if g)
+    out = {}
+    for p, (R0, alts, carried) in recs.items():
+        if not carried or len(carried) > 2 or any(not 1 <= i <= len(alts) for i in carried):
+            continue
+        g = sorted(carried) if len(carried) == 2 else [0, carried[0]]
+        out[p] = (R0, alts, f"{g[0]}/{g[1]}")
+    return out
+
+
 def gatk_person_region(chrom, a, b, sample, chunks=8, attempts=10):
     """The person's GATK calls for the WHOLE region (all SNPs and indels), fetched as `chunks`
     parallel pieces of the indexed remote callset; cached. Returns {key: 'het'|'hom'}."""
