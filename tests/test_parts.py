@@ -568,6 +568,98 @@ class SpaceTest(unittest.TestCase):
         from search.space import bam_caps
         self.assertEqual(bam_caps("/nonexistent.bam", "chr20", 1, 10), {})
 
+    def test_a_round_bam_replaces_three_ranges_with_the_groups_it_can_tell_apart(self):
+        import random as _r
+        from search.bamgroups import BQST, MBQ, MRPAS, BamFacts, bam_bounds, bounds_from
+        from search.space import Space
+        # 20261006T010500Z: eight base qualities, 74 reads at the busiest start.
+        facts = BamFacts(frozenset({2, 3, 4, 5, 6, 10, 20, 30}), frozenset(range(61)), 74)
+        bounds = bounds_from(facts, ranges())
+        self.assertEqual(bounds.groups[MBQ], (10, 11, 20, 21, 30))
+        self.assertEqual(bounds.count[BQST], 26)          # finest list, at mapping quality 0
+        self.assertEqual(bounds.count[MRPAS], 50)         # 25..74; everything above 74 is 74
+        self.assertIn("1/78", bounds.report)
+        sp = Space(ranges(), bounds=bounds)
+        rng = _r.Random(0)
+        got = [c for c in (sp.random(rng) for _ in range(80)) if c]
+        self.assertTrue(got)
+        self.assertLessEqual(set(c.params[MBQ] for c in got), set(bounds.groups[MBQ]))
+        self.assertLessEqual(set(c.params[BQST] for c in got), set(bounds.groups[BQST]))
+        self.assertLessEqual(max(c.params[MRPAS] for c in got), 74)
+        snapped = sp._assemble({MBQ: 16, BQST: 13, "min_mapping_quality_score": 59, MRPAS: 200})
+        self.assertEqual(snapped.params[MBQ], 11)
+        self.assertEqual(snapped.params[BQST], 11)        # at mapping quality 59 the 26 collapse toward 5
+        self.assertEqual(snapped.params[MRPAS], 74)
+        self.assertEqual(sp._assemble({MBQ: 45}).params[MBQ], 30)
+        nothing = bounds_from(BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13), ranges())
+        fixed = Space(ranges(), bounds=nothing)
+        self.assertNotIn(MRPAS, fixed.names)              # no start has 25 reads, so the axis is one value
+        self.assertEqual(fixed._assemble({MRPAS: 116}).params[MRPAS], 25)
+        self.assertIsNone(bam_bounds("/nonexistent.bam", ranges()))
+
+    def test_snapping_keeps_every_class_the_bam_can_tell_apart(self):
+        """A representative has to be the same GATK run as the value it replaces, and every coarser class has to
+        stay reachable from the finest list. Checked against the executor's own canonical() on four BAM shapes."""
+        from evaluator.equivalence import RoundFacts, canonical
+        from search.bamgroups import BQST, MBQ, MMQ, MRPAS, BamFacts, bounds_from, bqst_groups, bqst_values, snap
+        shapes = (
+            BamFacts(frozenset({2, 3, 4, 5, 6, 10, 20, 30}), frozenset(range(61)), 74),
+            BamFacts(frozenset(range(1, 41)), frozenset({0, 10, 20, 60}), 13),
+            BamFacts(frozenset({4, 8, 15}), frozenset(range(61)), 33),
+            BamFacts(frozenset(range(0, 50)), frozenset(range(61)), 400),
+        )
+        specs = ranges().tools["gatk"]
+        mbq_lo, mbq_hi = int(specs[MBQ].min), int(specs[MBQ].max)
+        bq_lo, bq_hi = int(specs[BQST].min), int(specs[BQST].max)
+        mr_lo, mr_hi = int(specs[MRPAS].min), int(specs[MRPAS].max)
+        mmq_lo, mmq_hi = int(specs[MMQ].min), int(specs[MMQ].max)
+
+        def same_closed(a, b, values):
+            if a == b:
+                return True
+            lo, hi = (a, b) if a < b else (b, a)
+            return not any(lo <= q <= hi for q in values)
+
+        def same_half(a, b, values):
+            if a == b:
+                return True
+            lo, hi = (a, b) if a < b else (b, a)
+            return not any(lo <= q < hi for q in values)
+
+        for facts in shapes:
+            bounds = bounds_from(facts, ranges())
+            cap = bounds.caps.get(MBQ, mbq_hi)
+            self.assertFalse(any(q > cap for q in facts.quals))
+            compared = facts.compared_quals
+            for v in range(mbq_lo, cap + 1):
+                got = snap(facts, MBQ, v, mmq=0, lo=mbq_lo, hi=cap)
+                self.assertTrue(same_closed(got, v, compared), (v, got))
+                self.assertIn(got, bounds.groups.get(MBQ, (got,)))
+            fine = bounds.groups.get(BQST) or bqst_groups(facts, mmq_lo, bq_lo, bq_hi)
+            for mmq in range(mmq_lo, mmq_hi + 1):
+                capped = bqst_values(facts, mmq)
+                coarse = bqst_groups(facts, mmq, bq_lo, bq_hi)
+                reached = set()
+                for v in range(6, bq_hi + 1):
+                    got = snap(facts, BQST, v, mmq=mmq, lo=bq_lo, hi=bq_hi)
+                    self.assertTrue(same_half(got, v, capped), (mmq, v, got))
+                    reached.add(got)
+                for rep in coarse:
+                    self.assertTrue(any(same_half(rep, g, capped) for g in reached), (mmq, rep))
+                for rep in fine:
+                    got = snap(facts, BQST, rep, mmq=mmq, lo=bq_lo, hi=bq_hi)
+                    self.assertIn(got, fine)
+                    ask = {MBQ: bounds.groups.get(MBQ, (mbq_lo,))[0], BQST: rep, MMQ: mmq, MRPAS: mr_lo}
+                    out = canonical(Config("gatk", ask), RoundFacts(facts.quals, facts.mapqs, facts.max_reads_per_start))
+                    self.assertTrue(same_half(out.params[BQST], got, capped), (mmq, rep, got, out.params[BQST]))
+                    self.assertTrue(same_closed(out.params[MBQ], ask[MBQ], compared))
+            start_cap = facts.max_reads_per_start
+            for v in range(mr_lo, mr_hi + 1):
+                got = snap(facts, MRPAS, v, mmq=0, lo=mr_lo, hi=mr_hi)
+                same = (got >= start_cap and v >= start_cap) or got == min(max(v, mr_lo), mr_hi)
+                self.assertTrue(same, (v, got, start_cap))
+
+
 class LineupTest(unittest.TestCase):
     def test_search_hands_main_one_searcher(self):
         from search import searcher

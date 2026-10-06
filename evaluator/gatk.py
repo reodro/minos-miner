@@ -546,7 +546,7 @@ class GatkRunner:
             return CallSet(round.round_id, config.key, "", "", dt, ok=False,
                            error=f"rc={p.returncode} {gatk_error(p.stderr)}", fidelity=fidelity)
         self._adopt_kbest(round.round_id, config, fidelity, out)
-        return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
+        return self._success(round.round_id, config, out, dt, fidelity)
 
     # ---- batching: configs differing only in branchable parameters (BRANCH_PARAMS) share one run (needs patch_jar) ----
     def branch_key(self, config: Config, fidelity: str = FULL) -> Optional[str]:
@@ -613,7 +613,7 @@ class GatkRunner:
             err = f"rc={p.returncode} {gatk_error(p.stderr)}"
             return [CallSet(round.round_id, c.key, "", "", dt, ok=False, error=err, fidelity=fidelity) for c in configs]
         self._adopt_kbest(round.round_id, configs[0], fidelity, main)
-        out = [CallSet(round.round_id, configs[0].key, str(main), records_digest(main), dt, fidelity=fidelity)]
+        out = [self._success(round.round_id, configs[0], main, dt, fidelity)]
         for c, o in zip(configs[1:], outs):
             out.append(self._adopt_variant(round.round_id, c, o, dt, fidelity))
         return out
@@ -630,7 +630,7 @@ class GatkRunner:
         status.unlink(missing_ok=True)
         if state == "exact" and out.exists():
             self._adopt_kbest(round_id, config, fidelity, out)
-            return CallSet(round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
+            return self._success(round_id, config, out, dt, fidelity)
         Path(str(out) + ".minos.kbest").unlink(missing_ok=True)
         if state == "diverged" and out.exists() and Path(str(out) + ".minos.regions").exists():
             kept = out.with_name(out.name.replace(".vcf.gz", ".batch.vcf.gz"))
@@ -924,8 +924,12 @@ class GatkRunner:
             f.unlink(missing_ok=True)
         if not spliced:                           # still exact: a plain solo run
             return self.run(round, config, fidelity)
-        return CallSet(round.round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity)
+        return self._success(round.round_id, config, out, dt, fidelity)
 
+    def _success(self, round_id: str, config: Config, out: Path, dt: float, fidelity: str) -> CallSet:
+        """A finished VCF, plus the haplotype cap the assembly actually needed (None when a search hit its cap)."""
+        return CallSet(round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity,
+                       haplotype_cap=self.kbest_needed(round_id, config.key, fidelity))
 
 class HappyScorer:
     """Exact: upstream HappyScorer.score_vcf + parse_happy_vcf, counts through common.scoring.finalize.

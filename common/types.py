@@ -145,6 +145,7 @@ class CallSet:
     fidelity: str = FULL
     score: Optional["ScoreResult"] = None   # set when the machine that ran it also scored it (fleet nodes); then
                                             # nobody else needs the VCF, which stays on that machine
+    haplotype_cap: Optional[int] = None     # smallest max_num_haplotypes_in_population that reproduces this assembly
 
 
 @dataclass

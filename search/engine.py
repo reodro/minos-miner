@@ -7,7 +7,8 @@ every setting (domains.importance_share 0); domains merge only on the schedule, 
 its settings over as transplant moves (merges.on_evidence 0, merges.retire); a scout find is recombined with the
 nearest domain (merges.find_children) while that domain keeps climbing; a sweep's winners are re-applied alone,
 added up and in pairs (climb.reapply_full); up to climb.max_chains chains per domain, the main line always refilled
-first; with few domains the first coarse sweep carries the wide round (climb.eager_wide_domains). The sections
+first; with few domains the first coarse sweep carries the wide round (climb.eager_wide_domains). Before any of
+that, three settings are reduced to the values this round's BAM can tell apart (search/bamgroups.py). The sections
 below describe the v4.1 behaviour the switches return to.
 
   opening     wave 0 = the defaults, the official seed, up to opening.portfolio_share of the workers from the portfolio
@@ -51,7 +52,9 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -65,6 +68,8 @@ from search.base import Strategy
 from search.client import EvalClient, Outcome
 from search.families import genotyping_riders
 from search.ranker import Ranker
+from search.reductions import Reductions
+from search.bamgroups import bam_bounds
 from search.space import GENOTYPING_PARAMS, Space, bam_caps
 from search import genetic, portfolio
 from search.climber import Climber, Move
@@ -146,9 +151,14 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
 
     async def run(client: EvalClient) -> None:
         r = client.round
-        caps = bam_caps(r.bam, r.chrom, r.start, r.end) if r.bam else {}
+        bounds = bam_bounds(r.bam, ranges, tool) if r.bam else None
+        caps = {} if bounds is not None else (bam_caps(r.bam, r.chrom, r.start, r.end) if r.bam else {})
         profile = portfolio.bam_profile(r.bam, r.chrom, r.start, r.end) if r.bam else None
-        space = Space(ranges, tool, caps=caps)
+        space = Space(ranges, tool, caps=caps, bounds=bounds)
+        reductions = Reductions()
+        space.reductions = reductions
+        if bounds is not None:
+            log.info("bam groups: %s", bounds.report)
         book = AxisBook(space)
         ranker = Ranker(space, seed=seed)
         clock = client.clock
@@ -161,6 +171,16 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         at = lambda step: T(60 * tune(f"schedule.{step}_min"))       # a schedule time, scaled to this round
         virtual = hasattr(client.executor, "now")
         genotyping = [a for a in GENOTYPING_PARAMS if a in space.names]
+        # MINOS_FOCUS_AXES=a,b and MINOS_FOCUS_CENTRE=params.json: one hour on those axes, from that config.
+        # Unset, this is the normal search. The centre is the finished run's best; every other setting stays put.
+        focus_axes = [a.strip() for a in os.environ.get("MINOS_FOCUS_AXES", "").split(",") if a.strip()]
+        focus_axes = [a for a in focus_axes if a in space.names]
+        focus_centre: Optional[dict] = None
+        centre_path = os.environ.get("MINOS_FOCUS_CENTRE", "")
+        if focus_axes and centre_path:
+            with open(centre_path) as fh:
+                loaded = json.load(fh)
+            focus_centre = loaded.get("params", loaded) if isinstance(loaded, dict) else None
 
         pending: Dict[asyncio.Future, Tuple[Unit, bool]] = {}
         proposed: Set[str] = set()
@@ -212,7 +232,10 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             return c is not None and c.key not in proposed and (c.key, FULL) not in client.latest
 
         def names() -> List[str]:
-            return book.live(clock()) + genotyping
+            live = book.live(clock()) + genotyping
+            if not focus_axes:
+                return live
+            return [a for a in focus_axes if a in live or a in space.names]
 
         important: Dict[str, object] = {"at": -1, "names": set()}
 
@@ -285,7 +308,13 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         # ---- opening --------------------------------------------------------------------------------------------
         def seeds() -> List[Config]:
             """The defaults, the official seed and up to opening.portfolio_share of wave 0 from the portfolio
-            (search/portfolio.py: the round's read-length profile first)."""
+            (search/portfolio.py: the round's read-length profile first). A focused run sends only its centre."""
+            if focus_axes and focus_centre:
+                c = space._assemble(dict(focus_centre))
+                if c is not None:
+                    say("focus centre %s on %s", c.key, ",".join(focus_axes))
+                    return [c]
+                say("focus centre did not assemble; opening as usual")
             out: List[Config] = []
             for p in ({}, OFFICIAL_SEED):
                 c = space._assemble(dict(p))
@@ -309,6 +338,10 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
 
         def opening_step() -> None:
             if st["founded"]:
+                return
+            if focus_axes and wave_heads and wave_back[0] >= wave_heads[0] and candidates:
+                st["gens_done"] = True
+                found()
                 return
             w = len(wave_heads) - 1
             back = wave_back[w] / max(1, wave_heads[w])
@@ -833,8 +866,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     break
                 if not st["founded"]:
                     break                                      # the opening's waves are queued by opening_step
-                share_now = tune("scout.share") if window() else tune("scout.late_share")
-                if st["scouts"] < max(1, int(cap * share_now)) and explore(idle):
+                share_now = 0.0 if focus_axes else (tune("scout.share") if window() else tune("scout.late_share"))
+                if not focus_axes and st["scouts"] < max(1, int(cap * share_now)) and explore(idle):
                     n += 1
                     continue
                 lv = live()
@@ -859,7 +892,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                         else:
                             d.dropped(move)
                         continue
-                if explore(idle):                             # idle capacity never waits: the scout takes it
+                if not focus_axes and explore(idle):          # idle capacity never waits: the scout takes it
                     n += 1
                     continue
                 break
@@ -870,6 +903,13 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             now = clock()
             score = o.score if o.ok else None
             failed = (not o.ok) or score is None or score <= 0
+            fid = o.result.fidelity if o.result is not None else None
+            cs = client.callsets.get((o.config.key, fid)) if fid else None
+            learned = reductions.note(
+                o.config, None if failed else score,
+                None if cs is None else cs.haplotype_cap)
+            if learned:
+                say("reductions: %s t+%.1fm", learned, elapsed() / 60)
             rr = o.result
             ranker.add(o.config, rr.core if (rr and not failed) else None,
                        (rr.region_fp / rr.n_targets) if (rr and not failed and rr.n_targets) else None, failed)
@@ -994,10 +1034,11 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
 
         # ---- the loop ------------------------------------------------------------------------------------------------
         sd = seeds()
-        cells = [c for c in latin_hypercube(space, rng, max(0, cap - len(sd))) if all(c.key != x.key for x in sd)]
+        cells = [] if focus_axes else [c for c in latin_hypercube(space, rng, max(0, cap - len(sd))) if all(c.key != x.key for x in sd)]
         say("capacity %d -> up to %d domains; schedule x%.2f (a %d-minute round)", cap, n_domains, scale_t,
                  round(ROUND_S * scale_t / 60))
-        launch_wave(sd + cells, tune("riders.wave0"), "seeds + hypercube")
+        launch_wave(sd + cells, 0 if focus_axes else tune("riders.wave0"),
+                    "focus centre" if focus_axes else "seeds + hypercube")
         while True:
             if pending:
                 done, _ = await asyncio.wait(list(pending), timeout=TICK_S, return_when=asyncio.FIRST_COMPLETED)

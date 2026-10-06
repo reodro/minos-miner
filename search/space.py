@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 
 from common.params import ParamRanges, ParamSpec
 from common.types import Config
+from search.bamgroups import BQST, MBQ, MMQ, MRPAS, snap
 
 
 # emit_ref_confidence: GVCF / BP_RESOLUTION make GATK write reference blocks; hap.py rejects that output on the
@@ -80,21 +81,35 @@ CONTAMINATION_GRID = (0.0, 0.01, 0.02, 0.04)
 
 class Space:
     def __init__(self, ranges: ParamRanges, tool: str = "gatk", pinned: Optional[Dict[str, object]] = None,
-                 caps: Optional[Dict[str, object]] = None):
+                 caps: Optional[Dict[str, object]] = None, bounds=None):
         """`caps`: upper bounds the round's data sets (bam_caps), on top of FLOORS; values beyond them are never
-        proposed and are clamped when a config comes from outside (a seed, a portfolio member)."""
+        proposed and are clamped when a config comes from outside (a seed, a portfolio member).
+        `bounds`: a BamBounds from this round's BAM. The three settings it groups are proposed only at their
+        representatives, and a config from outside is snapped onto those representatives."""
         self.ranges, self.tool = ranges, tool
+        self.bounds = bounds
         specs = ranges.tools[tool]
         self.floors = {n: f for n, f in FLOORS.get(tool, {}).items() if n in specs}
-        self.caps = {n: c for n, c in (caps or {}).items() if n in specs and specs[n].max is not None and c < specs[n].max}
+        merged = dict(bounds.caps) if bounds is not None else {}
+        merged.update(caps or {})
+        self.caps = {n: c for n, c in merged.items() if n in specs and specs[n].max is not None and c < specs[n].max}
+        self.groups: Dict[str, tuple] = dict(bounds.groups) if bounds is not None else {}
+        mmq = specs.get(MMQ)
+        self._mmq_floor = int(mmq.min) if mmq is not None and mmq.min is not None else 0
         self.specs: Dict[str, ParamSpec] = {}
         for n, sp in specs.items():
             if n in self.floors:
                 sp = dataclasses.replace(sp, min=max(sp.min, self.floors[n]))
             if n in self.caps:
                 sp = dataclasses.replace(sp, max=max(sp.min, self.caps[n]))
+            reps = self.groups.get(n)
+            if reps:
+                sp = dataclasses.replace(sp, allowed=tuple(reps))
+                if len(reps) == 1:
+                    sp = dataclasses.replace(sp, default=reps[0], min=reps[0], max=reps[0])
             self.specs[n] = sp
         self.pinned = dict(PINNED.get(tool, {}) if pinned is None else pinned)
+        self.reductions = None                       # set by the engine: caps and flat thresholds learned from runs
         self.names: List[str] = [n for n, s in sorted(self.specs.items()) if not self._fixed(s) and n not in self.pinned]
 
     @staticmethod
@@ -108,8 +123,18 @@ class Space:
     def encode(self, config: Config) -> List[float]:
         return [self._to_unit(self.specs[n], config.params.get(n, self.specs[n].default)) for n in self.names]
 
+    def _snap(self, name: str, value, mmq: int):
+        if self.bounds is None or name not in self.specs:
+            return value
+        spec = self.specs[name]
+        if spec.min is None or spec.max is None:
+            return value
+        return snap(self.bounds.facts, name, value, mmq=mmq, lo=int(spec.min), hi=int(spec.max))
+
     def _to_unit(self, s: ParamSpec, v) -> float:
         if s.allowed:
+            if v not in s.allowed and s.name in self.groups:
+                v = self._snap(s.name, v, self._mmq_floor)
             return s.allowed.index(v) / max(len(s.allowed) - 1, 1) if v in s.allowed else 0.0
         if s.type == "bool":
             return 1.0 if v else 0.0
@@ -150,9 +175,17 @@ class Space:
                 full["max_assembly_region_size"] = int(lo)
             else:
                 full["min_assembly_region_size"] = int(hi)
-        bq = full.get("base_quality_score_threshold")
-        if isinstance(bq, (int, float)) and bq < 6:
-            full["base_quality_score_threshold"] = 6
+        bq = full.get(BQST)
+        if isinstance(bq, (int, float)) and not isinstance(bq, bool) and bq < 6:
+            full[BQST] = 6
+        if self.bounds is not None:
+            mmq = full.get(MMQ, self._mmq_floor)
+            mmq = int(mmq) if isinstance(mmq, (int, float)) and not isinstance(mmq, bool) else self._mmq_floor
+            for n in (MBQ, BQST, MRPAS):
+                if n in full and n in self.specs:
+                    full[n] = self._snap(n, full[n], mmq)
+        if self.reductions is not None:
+            full = self.reductions.adjust(full)
         config = Config(self.tool, full)
         return None if self.ranges.errors(config) else config
 

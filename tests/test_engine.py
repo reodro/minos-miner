@@ -2,7 +2,7 @@ import collections
 import random
 import unittest
 
-from common.types import AnswerSet, Regime, Round, Variant
+from common.types import AnswerSet, Config, Regime, Round, Variant
 from evaluator import FakeRunner, FakeScorer, SimExecutor
 from main import DryRunSubmitter, LoopSettings, run_round
 from search.axes import AxisBook, latin_hypercube
@@ -10,6 +10,7 @@ from search.space import GENOTYPING_PARAMS, Space
 from search import genetic
 from common.tuning import tune
 from search.climber import Climber
+from search.reductions import MNH, Reductions
 from search.hills import Hills
 import search.engine as engine
 from tests.helpers import ranges
@@ -360,6 +361,40 @@ class V42Test(unittest.TestCase):
                 out, ex = virtual_round(200, minutes=40, hills=2)
                 self.assertGreater(out.best.score, 90.0, kv)
 
+
+class ReductionsTest(unittest.TestCase):
+    def test_a_finished_run_closes_higher_caps_and_a_flat_calling_threshold(self):
+        space = Space(ranges())
+        red = Reductions()
+        space.reductions = red
+        base = space._assemble({}).params
+        ran = space._assemble({**base, MNH: 128})
+        red.note(ran, 80.0, haplotype_cap=40)
+        self.assertEqual(space._assemble({**base, MNH: 100}).params[MNH], 128)
+        self.assertEqual(space._assemble({**base, MNH: 40}).params[MNH], 40)
+        self.assertEqual(space._assemble({**base, MNH: 16}).params[MNH], 16)
+        red.note(space._assemble({**base, MNH: 30}), 80.0, haplotype_cap=10)
+        self.assertEqual(space._assemble({**base, MNH: 35}).params[MNH], 35)
+        # A needed-0 report names a small cap. An in-flight higher cap can still report a real floor afterwards;
+        # that report is the config that was submitted, and it must not keep rewriting down to the small cap.
+        red2 = Reductions()
+        space.reductions = red2
+        low = space._assemble({**base, MNH: 16})
+        red2.note(low, 0.0, haplotype_cap=0)
+        self.assertEqual(space._assemble({**base, MNH: 100}).params[MNH], 16)
+        high = Config(low.tool, {**low.params, MNH: 128})
+        red2.note(high, 80.0, haplotype_cap=40)
+        self.assertEqual(space._assemble({**base, MNH: 100}).params[MNH], 128)
+        self.assertEqual(space._assemble({**base, MNH: 40}).params[MNH], 40)
+        self.assertEqual(space._assemble({**base, MNH: 16}).params[MNH], 16)
+        alt = "max_alternate_alleles"
+        self.assertEqual(space._assemble({**base, alt: 2}).params[alt], 2)
+        self.assertEqual(space._assemble({**base, alt: 12}).params[alt], 12)
+        # Equal scores at 70 and 90 do not close 80: the maximum can sit between two equal ends.
+        calling = "standard_min_confidence_threshold_for_calling"
+        red.note(space._assemble({**base, calling: 70.0}), 83.0)
+        red.note(space._assemble({**base, calling: 90.0}), 83.0)
+        self.assertEqual(space._assemble({**base, calling: 80.0}).params[calling], 80.0)
 
 if __name__ == "__main__":
     unittest.main()

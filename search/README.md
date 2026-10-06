@@ -76,6 +76,8 @@ genotyping, one PairHMM step); merges carry none.
 
 ## Engine versions
 
+How the engine got here, version by version, is [DEVELOPMENT.md](DEVELOPMENT.md). The table below is the measured record.
+
 All on round 2026-10-02 09:29 (field best 89.912, 66 rows), 72-minute fleet runs unless noted. TRUE = scored on the
 released truth; one run's noise is 0.04-0.08 TRUE.
 
