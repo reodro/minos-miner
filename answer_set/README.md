@@ -33,7 +33,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k022_20261005T2149) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k023_20261006T1148) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -156,6 +156,12 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   new-pattern rounds (6 by fold models, 4 no version had seen): +0.139 per round (t 2.9, better 8/10, worst -0.109);
   vs the same training without the columns (k021) +0.046 on the fold rounds (6/6). 8 old-pattern rounds: -0.012
   (t -0.95).
+- k023 (1000G, released 2026-10-06) = k022's recipe trained on 59 1000G rounds (14 new-pattern instead of 7). Scored
+  like the validator against k022 (fold models where a version trained on the round): new-pattern rounds +0.072 per
+  round (t 4.67, better 14/16, worst -0.025) and on the 4 newest rounds neither had seen +0.12 (4/4); points lost per
+  round fall in every indel class (>= 8 bp 0.089 -> 0.070, 1 bp 0.069 -> 0.059, 2-3 bp 0.069 -> 0.057); old-pattern
+  rounds +0.008 (t 2.10, better 26 / equal 5 / worse 15, worst -0.080). Ranking 18 near-top GATK configs on 4 rounds:
+  0/411 close pairs misordered, as k022.
 
 ## Open work
 
