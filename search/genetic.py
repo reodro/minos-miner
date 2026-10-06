@@ -152,3 +152,54 @@ def generation(space: Space, pool: Sequence[Tuple[Config, float]], rng: random.R
         if c is not None:
             out.setdefault(c.key, c)
     return list(out.values())
+
+
+def island_generation(space: Space, pool: Sequence[Tuple[Config, float]], island_of: Dict[str, int], islands: int,
+                      rng: random.Random, n: int, hills: Hills, names: Sequence[str], min_far: int,
+                      per_island: int = 15) -> List[Tuple[Config, int]]:
+    """One generation on separate islands: `n` children as (config, island). The first call founds the islands (the
+    best configs at least `min_far` settings apart); a config of no island joins the one whose best is nearest.
+    Parents always come from one island, every island gets the same number of children, and a child that lands on
+    another island's best (the hill rule) is redrawn, so the islands never grow into each other. `island_of` (config
+    key -> island) is updated in place."""
+    ranked = sorted(pool, key=lambda t: -t[1])[:400]
+    if len(ranked) < 2 or n <= 0:
+        return []
+    if not island_of:
+        for i, (c, _) in enumerate(hills.cluster(ranked, islands, band=float("inf"), min_far=min_far)):
+            island_of[c.key] = i
+    best: Dict[int, Config] = {}
+    for c, _ in ranked:
+        i = island_of.get(c.key)
+        if i is not None and i not in best:
+            best[i] = c
+    if not best:
+        return []
+    members: Dict[int, List[Config]] = {i: [] for i in best}
+    for c, _ in ranked:
+        i = island_of.get(c.key)
+        if i is None:
+            i = min(best, key=lambda j: hills.distance(c, best[j]))
+            island_of[c.key] = i
+        if i in members and len(members[i]) < per_island:
+            members[i].append(c)
+    out: Dict[str, Tuple[Config, int]] = {}
+    quota = max(1, n // len(members))
+    for i, ms in members.items():
+        made, tries = 0, 0
+        while made < quota and tries < 6 * quota:
+            tries += 1
+            if len(ms) >= 2:
+                a, b = rng.sample(ms, 2)
+                c = (uniform_child if rng.random() < 0.5 else block_child)(space, a, b, rng, names)
+                if c is not None and rng.random() < MUTATE_FRAC:
+                    c = mutate(space, c, rng, names) or c
+            else:
+                c = mutate(space, ms[0], rng, names)
+            if c is None or c.key in out:
+                continue
+            if any(j != i and hills.same(c, best[j]) for j in best):
+                continue                                         # on another island's hill: redraw
+            out[c.key] = (c, i)
+            made += 1
+    return list(out.values())

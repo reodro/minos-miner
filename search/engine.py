@@ -1,5 +1,14 @@
-"""The search engine (v4.1): a global genetic opening, ParamILS climbs on up to six hills, merges by recombination.
+"""The search engine (v4.2): a global genetic opening, ParamILS climbs on up to six hills, merges by recombination.
 Owner: search.
+
+v4.2 defaults (common/tuning.py; each one a switch back to v4.1): the opening breeds on islands into idle workers
+(opening.islands, opening.steady), domains are founded domains.found_min_far settings apart and the hill rule counts
+every setting (domains.importance_share 0); domains merge only on the schedule, by retiring the weaker and handing
+its settings over as transplant moves (merges.on_evidence 0, merges.retire); a scout find is recombined with the
+nearest domain (merges.find_children) while that domain keeps climbing; a sweep's winners are re-applied alone,
+added up and in pairs (climb.reapply_full); up to climb.max_chains chains per domain, the main line always refilled
+first; with few domains the first coarse sweep carries the wide round (climb.eager_wide_domains). The sections
+below describe the v4.1 behaviour the switches return to.
 
   opening     wave 0 = the defaults, the official seed, up to opening.portfolio_share of the workers from the portfolio
               (search/portfolio.py: the legacy pipeline's 749 configs plus our reviewed runs, the round's read-length
@@ -81,7 +90,7 @@ OFFICIAL_SEED = {
 
 @dataclass
 class Unit:
-    role: str                        # wave | scout | move | merge | midpoint
+    role: str                        # wave | scout | move | merge | findmerge | midpoint
     head: Config
     domain: Optional[int] = None
     move: Optional[Move] = None
@@ -99,6 +108,17 @@ class MergeJob:
     best: Optional[Tuple[Config, float]] = None
     started: float = 0.0
     guest: Optional[Tuple[Config, float]] = None      # a scout find merged into its parent (not a domain)
+
+
+@dataclass
+class FindMerge:
+    """A scout find recombined with the nearest domain's centre while that domain keeps climbing (merges.on_evidence 0
+    era): a child better than the domain moves its centre; nothing waits for the job."""
+    id: int
+    domain: int
+    find: Tuple[Config, float]
+    sent: int = 0
+    back: int = 0
 
 
 async def settled_capacity(client: EvalClient, workers: int, wait_s: float = 60.0, settle_s: float = 20.0) -> int:
@@ -147,8 +167,10 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         domains: Dict[int, Climber] = {}
         status: Dict[int, str] = {}                  # live | merging | retired
         merges: Dict[int, MergeJob] = {}
+        find_merges: Dict[int, FindMerge] = {}
         ids = [0, 0]                                 # next domain id, next merge id
         candidates: Dict[str, Tuple[Config, float]] = {}
+        island_of: Dict[str, int] = {}               # opening.islands: config key -> island
         was_centre: Set[str] = set()
         wave_heads: List[int] = []                   # heads sent per wave (0 = hypercube, 1.. = generations)
         wave_back: List[int] = []
@@ -295,6 +317,9 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 st["gens_done"] = True
                 found()
                 return
+            if not st["gens_done"] and tune("opening.steady"):
+                breed_steady(idle)
+                return
             if not st["gens_done"]:
                 can = back >= tune("opening.launch_back") or (back >= 0.5 and idle is not None and idle >= tune("opening.launch_idle") * cap)
                 if can and len(candidates) >= 4:
@@ -303,18 +328,70 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                         say("generations stop after %d (last gained %.3f) t+%.1fm", w, top() - wave_best[w],
                                  elapsed() / 60)
                     else:
-                        children = [c for c in genetic.generation(space, list(candidates.values()), rng, cap, hills, names())
-                                    if fresh(c)]
+                        children = [c for c in breed(cap) if fresh(c)]
                         launch_wave(children, tune("riders.global"), f"generation {w + 1}")
                         st["gens_done"] = len(wave_heads) - 1 >= tune("opening.generations")
                 return
             if back >= tune("opening.found_back") or not pending:
                 found()
 
+        def breed(n: int) -> List[Config]:
+            """`n` children of the scored configs: on islands (opening.islands) or with soft niching."""
+            if tune("opening.islands"):
+                kids = genetic.island_generation(space, list(candidates.values()), island_of, n_domains, rng, n, hills,
+                                                 names(), tune("domains.found_min_far"))
+                for c, i in kids:
+                    island_of[c.key] = i
+                return [c for c, _ in kids]
+            return genetic.generation(space, list(candidates.values()), rng, n, hills, names())
+
+        def breed_steady(idle: Optional[int]) -> None:
+            """opening.steady: children go to idle workers as they free up, opening.generations x the workers in all;
+            stops early when a workers' worth of children gains less than opening.min_gain."""
+            if len(wave_heads) < 2:
+                if wave_back[0] < 0.5 * max(1, wave_heads[0]) or len(candidates) < 4:
+                    return
+                launch_wave([], 0, "bred into idle workers")
+                st["bred"], st["mark"], st["marks"] = 0, top(), 0
+            if st["bred"] >= tune("opening.generations") * cap:
+                st["gens_done"] = True
+                say("breeding done: %d children t+%.1fm", st["bred"], elapsed() / 60)
+                return
+            if st["bred"] >= cap * (st["marks"] + 1):
+                st["marks"] += 1
+                if st["marks"] >= 2 and top() - st["mark"] < tune("opening.min_gain"):
+                    st["gens_done"] = True
+                    say("breeding stops after %d children (the last %d gained %.3f) t+%.1fm", st["bred"], cap,
+                        top() - st["mark"], elapsed() / 60)
+                    return
+                st["mark"] = top()
+            if idle is None or idle < max(8, int(0.02 * cap)):
+                return
+            for c in breed(idle):
+                if fresh(c) and send_global(c, "wave", tune("riders.global"), 4, wave=1):
+                    wave_heads[1] += 1
+                    st["bred"] += 1
+
         def found() -> None:
             st["founded"] = True
             ranked = sorted(candidates.values(), key=lambda t: -t[1])
-            for c, s in hills.cluster(ranked, n_domains, tune("domains.worth_a_hill")):
+            band, min_far = tune("domains.worth_a_hill"), tune("domains.found_min_far")
+            if tune("opening.islands") and island_of:
+                firsts: Dict[int, Tuple[Config, float]] = {}       # each island's best, then everything else
+                for c, s in ranked:
+                    i = island_of.get(c.key)
+                    if i is not None and i not in firsts:
+                        firsts[i] = (c, s)
+                order = sorted(firsts.values(), key=lambda t: -t[1]) + ranked
+                picked: List[Tuple[Config, float]] = []
+                for c, s in order:
+                    if len(picked) >= n_domains or s < ranked[0][1] - band:
+                        continue
+                    if all(c.key != o.key and hills.distance(c, o) >= min_far for o, _ in picked):
+                        picked.append((c, s))
+            else:
+                picked = hills.cluster(ranked, n_domains, band, min_far)
+            for c, s in picked:
                 birth(c, s, "the opening")
             say("founding at t+%.1fm: %d domains from %d scored configs (waves %s)", elapsed() / 60,
                      len(live()), len(candidates), " ".join(f"{b}/{h}" for b, h in zip(wave_back, wave_heads)))
@@ -337,6 +414,9 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         # ---- merges -----------------------------------------------------------------------------------------------
         def start_merge(parents: List[Climber], why: str, guest: Optional[Tuple[Config, float]] = None) -> None:
             parents = sorted(parents, key=lambda d: -d.best)
+            if tune("merges.retire"):
+                retire_merge(parents, why, guest)
+                return
             for p in parents:
                 status[p.id] = "merging"
                 p.pool = []
@@ -367,6 +447,28 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                      elapsed() / 60)
             if mj.sent == 0:
                 resolve(mj)
+
+        def retire_merge(parents: List[Climber], why: str, guest: Optional[Tuple[Config, float]]) -> None:
+            """v3.2's merge: the strongest domain stays, the others retire and hand it their differing settings as
+            moves (a find merged in: the domain moves to it when it is better, and the other point's settings
+            become moves). No children are run."""
+            keep, rest = parents[0], parents[1:]
+            n = 0
+            if guest is not None:
+                old = keep.centre
+                if keep.offer(guest[0], guest[1], clock()):
+                    n += keep.transplant(old, names())
+                else:
+                    n += keep.transplant(guest[0], names())
+            for p in rest:
+                status[p.id] = "retired"
+                keep.inherit(p.tried, p.steps, p.axis_gain)
+                n += keep.transplant(p.centre, names())
+            if rest:
+                st["runner_up"] = rest[0].centre
+            say("merge (%s): domain %d keeps %.4f, %s; %d transplant moves t+%.1fm", why, keep.id, keep.best,
+                ", ".join(f"domain {p.id} ({p.best:.4f}) retired" for p in rest) or "a find handed over", n,
+                elapsed() / 60)
 
         def resolve(mj: MergeJob) -> Climber:
             merges.pop(mj.id, None)
@@ -402,8 +504,29 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             find_done.add(c.key)
             if s < d.best - tune("merges.close"):
                 return False
-            start_merge([d], f"a scout find at {s:.4f} merged in", guest=(c, s))
+            if tune("merges.on_evidence"):
+                start_merge([d], f"a scout find at {s:.4f} merged in", guest=(c, s))
+                return True
+            find_merge(d, c, s)
             return True
+
+        def find_merge(d: Climber, c: Config, s: float) -> None:
+            """The find and the domain's centre recombined (pairing plus mutated children, at most
+            merges.find_children) while the domain keeps climbing; a better find moves the centre at once."""
+            if d.offer(c, s, clock()):
+                say("domain %d -> %.4f, a scout find merged in t+%.1fm", d.id, s, elapsed() / 60)
+            fm = FindMerge(ids[1], d.id, (c, s))
+            ids[1] += 1
+            kids = [k for k in genetic.merge_children(space, d.centre, c, rng, names()) if k.key not in d.tried and fresh(k)]
+            if len(kids) > tune("merges.find_children"):
+                kids = rng.sample(kids, tune("merges.find_children"))
+            for k in kids:
+                if propose(Unit("findmerge", k, domain=d.id, merge=fm.id), [], 6):
+                    fm.sent += 1
+            if fm.sent:
+                find_merges[fm.id] = fm
+            say("find merge %d: a scout find at %.4f into domain %d (%.4f), %d children, the domain keeps climbing "
+                "t+%.1fm", fm.id, s, d.id, d.best, fm.sent, elapsed() / 60)
 
         def same_hill_pairs(which: Sequence[Climber]) -> List[Tuple[int, Climber, Climber]]:
             out = []
@@ -491,7 +614,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             for d in [x for i, x in domains.items() if status[i] == "live" and x.state == "exhausted"]:
                 others = [x for x in live() if x is not d]
                 near = min(others, key=lambda x: hills.distance(x.centre, d.centre), default=None)
-                if near is not None and hills.same(near.centre, d.centre):
+                if tune("merges.on_evidence") and near is not None and hills.same(near.centre, d.centre):
                     start_merge([near, d], "a frozen domain on a live one's hill")
                 else:
                     status[d.id] = "retired"
@@ -499,7 +622,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             # evidence: two domains on one hill
             lv = [d for d in live() if d.state != "final"]
             busy: Set[int] = set()
-            for dist, a, b in same_hill_pairs(lv):
+            for dist, a, b in same_hill_pairs(lv) if tune("merges.on_evidence") else ():
                 if a.id in busy or b.id in busy:
                     continue
                 if dist < MIN_FAR:
@@ -723,8 +846,9 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     targets = {d.id: share * x / sum(w) for d, x in zip(lv, w)}
                     alloc.clear(); alloc.update(targets)
                     for d in lv:
-                        if not d.pool and d.inflight < targets[d.id]:
-                            d.refill(names(), rng, int(targets[d.id] - d.inflight) + 1)
+                        d.eager_wide = len(lv) <= tune("climb.eager_wide_domains")
+                        if not d.main_pending:                 # the main line refills whenever it is ready; the
+                            d.refill(names(), rng, max(0, int(targets[d.id] - d.inflight) + 1))   # share caps chains
                     ready = [d for d in lv if d.pool]
                     if ready:
                         d = max(ready, key=lambda x: targets[x.id] - x.inflight)
@@ -778,6 +902,16 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if unit.role == "findtest":
                 judge_find(unit.head.key, None if failed else score)
                 return
+            if unit.role == "findmerge":
+                fm = find_merges.get(unit.merge)
+                if fm is not None:
+                    fm.back += 1
+                    if fm.back >= fm.sent:
+                        find_merges.pop(fm.id, None)
+                d = domains.get(unit.domain) if unit.domain is not None else None
+                if not failed and d is not None and status[d.id] == "live" and d.offer(o.config, score, now):
+                    say("domain %d -> %.4f, a child of find merge %s t+%.1fm", d.id, score, unit.merge, elapsed() / 60)
+                return
             if unit.role == "merge":
                 mj = merges.get(unit.merge)
                 if mj is not None:
@@ -799,9 +933,11 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         def status_line() -> None:
             st["last_log"] = clock()
             lv = [d for i, d in domains.items() if status[i] != "retired"]
-            log.info("engine: t+%.1fm domains %s | merges %s | scouts %d | candidates %d | pending %d", elapsed() / 60,
+            log.info("engine: t+%.1fm domains %s | merges %s | find merges %s | scouts %d | candidates %d | pending %d",
+                     elapsed() / 60,
                      " ".join(f"{d.id}:{d.best:.3f}/{d.state[:5]}/{d.mode[:1]}/{d.inflight}{'' if status[d.id] == 'live' else '/m'}"
                               for d in lv), " ".join(f"{m.id}:{m.back}/{m.sent}" for m in merges.values()) or "-",
+                     " ".join(f"{m.id}>{m.domain}:{m.back}/{m.sent}" for m in find_merges.values()) or "-",
                      st["scouts"], len(candidates), len(pending))
 
         def phase() -> str:

@@ -39,9 +39,10 @@ class Hills:
         i, d = self.nearest(c, centres)
         return i if i is not None and d < MIN_FAR else None
 
-    def cluster(self, ranked: Sequence[Tuple[Config, float]], k: int, band: float) -> List[Tuple[Config, float]]:
+    def cluster(self, ranked: Sequence[Tuple[Config, float]], k: int, band: float,
+                min_far: int = MIN_FAR) -> List[Tuple[Config, float]]:
         """The best config of up to `k` distinct hills among `ranked` (best first), none more than `band` below the top:
-        a config starts a hill when it is on none of the hills already chosen."""
+        a config starts a hill when it is at least `min_far` settings from every hill already chosen."""
         out: List[Tuple[Config, float]] = []
         if not ranked:
             return out
@@ -49,6 +50,6 @@ class Hills:
         for c, s in ranked:
             if len(out) >= k or s < top - band:
                 break
-            if all(not self.same(c, o) for o, _ in out):
+            if all(self.distance(c, o) >= min_far for o, _ in out):
                 out.append((c, s))
         return out

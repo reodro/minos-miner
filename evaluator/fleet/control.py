@@ -94,7 +94,9 @@ def provision(h: Host) -> dict:
     p = sh(h, f"cd {shlex.quote(h.repo)} && DATA_DIR={shlex.quote(h.data_dir)} bash scripts/setup_node.sh", timeout=7200)
     s = sync(h)
     ok = p.returncode == 0 and s["ok"]
-    return {"host": h.name, "ok": ok, "tail": (p.stdout + p.stderr).strip()[-300:] if p.returncode else s["tail"]}
+    if p.returncode:
+        return {"host": h.name, "ok": False, "tail": (p.stdout + p.stderr).strip()[-300:]}
+    return {**s, "ok": ok}                                   # sync's report: the self-test result or the build's tail
 
 
 def sync(h: Host) -> dict:

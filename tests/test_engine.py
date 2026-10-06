@@ -1,3 +1,4 @@
+import collections
 import random
 import unittest
 
@@ -225,10 +226,12 @@ class EngineRoundTest(unittest.TestCase):
         with self.assertLogs("search.engine", level="INFO") as logs:
             out, ex = virtual_round(950, minutes=72, hills=2)
         text = "\n".join(logs.output)
-        for i in range(4):
-            self.assertIn(f"wave {i} ", text)                                   # wave 0 + three generations
+        self.assertIn("wave 0 ", text)
+        self.assertIn("bred into idle workers", text)                         # opening.steady: no generations
         self.assertIn("founding at", text)
-        self.assertIn("merge 0", text)
+        self.assertIn("merge (scheduled 6 to 3", text)                        # merges.retire: no children
+        self.assertIn("merge (scheduled 3 to 1)", text)
+        self.assertNotIn("one hill", text)                                     # merges.on_evidence 0
         self.assertIn("final at", text)
         self.assertIn("plateau-centre pick", text)
         self.assertGreater(ex.utilization(), 0.9)
@@ -263,6 +266,99 @@ class EngineRoundTest(unittest.TestCase):
         self.assertGreater(out.failed, 0)
         self.assertEqual(sum(out.failures.values()), out.failed)
         self.assertGreater(out.best.score, 90.5)
+
+
+class knobs:
+    """Settings in force inside a `with` block (tests otherwise run on defaults)."""
+    def __init__(self, **kv):
+        self.kv = {k.replace("__", "."): v for k, v in kv.items()}
+
+    def __enter__(self):
+        from common.tuning import TUNING
+        self.saved = TUNING.values
+        TUNING.values = {**TUNING.values, **self.kv}
+
+    def __exit__(self, *exc):
+        from common.tuning import TUNING
+        TUNING.values = self.saved
+
+
+class V41PathTest(unittest.TestCase):
+    def test_generations_and_recombination_merges_still_run_with_the_switches_off(self):
+        with knobs(opening__steady=0, opening__islands=0, merges__retire=0, merges__on_evidence=1):
+            with self.assertLogs("search.engine", level="INFO") as logs:
+                out, ex = virtual_round(950, minutes=72, hills=2)
+        text = "\n".join(logs.output)
+        for i in range(4):
+            self.assertIn(f"wave {i} ", text)                                   # wave 0 + three generations
+        self.assertIn("merge 0", text)
+        self.assertGreater(out.best.score, 94.5)
+
+
+class V42Test(unittest.TestCase):
+    def test_islands_never_mate_across_and_keep_off_each_others_hills(self):
+        space, book, names = setup()
+        rng = random.Random(3)
+        hills = Hills(space, lambda: names)
+        pool = [(c, 90.0 - 0.01 * i) for i, c in enumerate(latin_hypercube(space, rng, 200))]
+        island_of = {}
+        kids = genetic.island_generation(space, pool, island_of, 6, rng, 300, hills, names, min_far=6)
+        heads = {i: next(c for c, _ in pool if island_of.get(c.key) == i) for i in set(island_of.values())}
+        self.assertEqual(len(heads), 6)
+        per = collections.Counter(i for _, i in kids)
+        self.assertLessEqual(max(per.values()) - min(per.values()), 5)                 # equal shares
+        for c, i in kids:
+            self.assertFalse(any(j != i and hills.same(c, h) for j, h in heads.items()))
+
+    def test_spaced_founding_keeps_hills_apart(self):
+        space, book, names = setup()
+        hills = Hills(space, lambda: names)
+        a = space._assemble({})
+        five = space._assemble({"min_pruning": 6, "assembly_region_padding": 300, "min_mapping_quality_score": 50,
+                                "pcr_indel_model": "NONE", "max_assembly_region_size": 650})
+        picked = hills.cluster([(a, 90.0), (five, 89.9)], 6, band=0.5, min_far=hills.distance(a, five) + 1)
+        self.assertEqual([c.key for c, _ in picked], [a.key])
+
+    def test_full_reapply_adds_running_sums_and_pairs(self):
+        with knobs(climb__reapply_full=1):
+            space, d, live = ClimberTest().make()
+            moves = d.refill(live, random.Random(0), 500)
+            for m in moves:
+                d.take()
+            singles = [m for m in moves if m.kind == "n1" and len(m.axes) == 1]
+            axes, wins = set(), []
+            for m in singles:
+                if m.axes[0] not in axes and len(wins) < 4:
+                    axes.add(m.axes[0]); wins.append(m)
+            for k, m in enumerate(wins):
+                d.consider(m, True, m.config, 88.0 + (k + 2) * ACCEPT_MIN, False, 1.0)
+            for m in moves:
+                if m not in wins:
+                    d.consider(m, True, m.config, 87.0, False, 1.0)
+            kinds = [ch for kind, ch in d.queued if kind == "reapply"]
+            self.assertEqual(len(kinds), 3 + 2 + 3)                    # 3 alone, 2 running sums, 3 pairs
+
+    def test_few_domains_send_the_wide_round_with_the_first_coarse_sweep(self):
+        space, d, live = ClimberTest().make()
+        d.eager_wide = True
+        moves = d.refill(live, random.Random(0), 2000)
+        kinds = collections.Counter(m.kind for m in moves)
+        self.assertGreater(kinds["wide"], 0)
+        self.assertGreater(kinds["n1"], 0)
+
+    def test_retire_merge_hands_over_settings_as_transplants(self):
+        space, d, live = ClimberTest().make()
+        other = space._assemble({"min_pruning": 6, "assembly_region_padding": 300, "min_mapping_quality_score": 50})
+        n = d.transplant(other, live)
+        self.assertEqual(n, 3 + 3)
+        self.assertEqual(sum(1 for kind, _ in d.queued if kind == "transplant"), 6)
+
+    def test_every_variant_finishes_a_virtual_round(self):
+        for kv in ({"opening.islands": 1, "domains.found_min_far": 6}, {"opening.steady": 1},
+                   {"merges.retire": 1, "climb.reapply_full": 1}):
+            with knobs(**{k.replace(".", "__"): v for k, v in kv.items()}):
+                out, ex = virtual_round(200, minutes=40, hills=2)
+                self.assertGreater(out.best.score, 90.0, kv)
 
 
 if __name__ == "__main__":

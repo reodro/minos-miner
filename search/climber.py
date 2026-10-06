@@ -56,13 +56,13 @@ FINAL_CHAIN_KS, FINAL_CHAIN_SCALE = (1, 2), 0.06
 STEP_MAX = 0.5
 PROGRESS_WINDOW_S = 600.0
 CHEAP = tuple(GENOTYPING_PARAMS) + tuple(PAIRHMM_PARAMS)
-SWEEP_KINDS = ("scan", "n1", "n2", "n3", "wide", "reapply", "share", "final", "pairing")
+SWEEP_KINDS = ("scan", "n1", "n2", "n3", "wide", "reapply", "share", "transplant", "final", "pairing")
 CHAIN_KINDS = ("chain", "chainl")
 
 
 @dataclass
 class Move:
-    kind: str                # scan | n1 | n2 | n3 | wide | reapply | share | shake | local | final | pairing | chain | chainl
+    kind: str                # scan | n1 | n2 | n3 | wide | reapply | share | transplant | shake | local | final | pairing | chain | chainl
     config: Config
     axes: Tuple[str, ...]
     centre_key: str
@@ -108,6 +108,7 @@ class Climber:
         self.fresh = True                                  # the centre's sweep is not sent yet
         self.scan_next = scan                              # the first sweep is a full-range scan
         self.wide_next = self.wide_done = False            # the wide round of this centre: queued / done
+        self.eager_wide = False                            # set by the engine: few domains, so wide with the first sweep
         self.sweep_sent = self.sweep_back = 0
         self.winners: List[Tuple[Move, Config, float]] = []
         self.flat: Set[str] = set()
@@ -341,6 +342,11 @@ class Climber:
             for sc in COARSE_SCALES:
                 out += self.singles(self.centre, self.best, live, "n1", sc)
             out += self.pairs(live, rng, 1.0)
+            if self.eager_wide and not self.wide_done:     # few domains: the workers are there, do not wait for it
+                self.wide_done = True
+                wide = self.wide_pairs(live, rng)
+                out += wide
+                self.note(f"wide round of {len(wide)} pairs with the first coarse sweep (few domains)")
         else:
             out += self.singles(self.centre, self.best, live, "n1", self.scale, skip=self.flat)
             out += self.singles(self.centre, self.best, live, "n1", self.scale * 0.5, skip=self.flat)
@@ -538,11 +544,18 @@ class Climber:
         if move.kind in CHAIN_KINDS:
             self._chain_result(move, move.config, None)
 
+    @property
+    def main_pending(self) -> bool:
+        """Main-line moves (sweeps, perturbation, the final) waiting in the pool; chain moves do not count, so many
+        chains never starve the main line of a refill."""
+        return any(m.kind not in CHAIN_KINDS for m in self.pool)
+
     def take(self) -> Optional[Move]:
         if not self.pool:
             return None
         self.inflight += 1
-        return self.pool.pop(0)
+        i = next((j for j, m in enumerate(self.pool) if m.kind not in CHAIN_KINDS), 0)   # the main line first
+        return self.pool.pop(i)
 
     # ---- inputs from the controller ------------------------------------------------------------------------------------
     def queue(self, kind: str, changes: Dict[str, object]) -> None:
@@ -563,6 +576,17 @@ class Climber:
         self.scan_next = self.wide_next = False
         for ch in self.chains.values():                    # the final is about this one point
             ch.base, ch.base_score = self.centre, self.best
+
+    def transplant(self, other: Config, live: Sequence[str]) -> int:
+        """Another centre's values where it differs from this one become moves on this centre: each alone and pairs
+        of the first four (v3.2's merge)."""
+        diff = [(a, other.params.get(a)) for a in live if a in self.space.specs
+                and not self.space._same(self.space.specs[a], self.centre.params.get(a), other.params.get(a))]
+        for a, v in diff:
+            self.queued.append(("transplant", {a: v}))
+        for (a, va), (b, vb) in itertools.combinations(diff[:4], 2):
+            self.queued.append(("transplant", {a: va, b: vb}))
+        return len(diff) + len(list(itertools.combinations(diff[:4], 2)))
 
     def inherit(self, tried: Set[str], steps: Dict[str, float], axis_gain: Dict[str, float]) -> None:
         """At a merge: the parents' tested configs, finer steps and per-setting gains carry over."""
@@ -619,11 +643,21 @@ class Climber:
         move, config, score = max(self.winners, key=lambda t: t[2])
         others = [(m, c, s) for m, c, s in self.winners if c.key != config.key and m.centre_key == move.centre_key]
         self._recentre(config, score, now, move.axes if move.centre_key == self.centre.key else (), own=True)
+        changes: List[Dict[str, object]] = []
         for m, c, s in sorted(others, key=lambda t: -t[2])[:8]:        # re-apply the sweep's other winners
             ch = {a: c.params.get(a) for a in m.axes
                   if not self.space._same(self.space.specs[a], self.centre.params.get(a), c.params.get(a))}
             if ch:
+                changes.append(ch)
                 self.queued.append(("reapply", ch))
+        if tune("climb.reapply_full"):                                  # v3.2: added one by one, pairs of the top 4
+            acc: Dict[str, object] = dict(changes[0]) if changes else {}
+            for ch in changes[1:]:
+                acc.update(ch)
+                self.queued.append(("reapply", dict(acc)))
+            for a, b in itertools.combinations(changes[:4], 2):
+                if len(changes) > 2:                                    # with two, the pair is the running sum
+                    self.queued.append(("reapply", {**a, **b}))
         return True
 
     def _learn(self, axis: str, config: Config, move: Move, score: Optional[float], bad: bool, now: float) -> None:
