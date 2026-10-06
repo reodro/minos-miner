@@ -142,6 +142,8 @@ class ActivityCacheTest(unittest.TestCase):
 
     def test_the_assembly_cache_is_the_rounds_and_carries_the_skeleton(self):
         from tests.helpers import ranges
+        self.addCleanup(setattr, G, "ASSEMBLY_CACHE", G.ASSEMBLY_CACHE)
+        G.ASSEMBLY_CACHE = True                                                   # off by default (MINOS_ASSEMBLY_CACHE=1)
         d = ranges().defaults("gatk").params
         props = lambda c, p=None: self.runner._assembly_cache(c, "full", p)                                        # noqa: E731
         a = Config("gatk", {**d, "min_pruning": 2})
@@ -152,7 +154,6 @@ class ActivityCacheTest(unittest.TestCase):
         self.assertNotEqual(props(a)["minos.assembly.skeleton"], props(early)["minos.assembly.skeleton"])
         self.assertEqual(props(a, {"minos.repair.log": "/data/output/r"}), {})
         self.assertEqual(props(Config("gatk", {**d, "emit_ref_confidence": "GVCF"})), {})
-        self.addCleanup(setattr, G, "ASSEMBLY_CACHE", G.ASSEMBLY_CACHE)
         G.ASSEMBLY_CACHE = False
         self.assertEqual(props(a), {})
 

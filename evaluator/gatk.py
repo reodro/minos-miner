@@ -103,7 +103,9 @@ MAX_SERVER_JOBS = 200            # a GATK server (MinosServer) is replaced after
 SERVER_IDLE_S = 600              # ... and leaves by itself after this long without a job
 SERVER_VERIFY_EVERY = int(os.environ.get("MINOS_SERVER_VERIFY", "40"))   # every Nth solo server run is re-run cold
 ACTIVITY_CACHE = os.environ.get("MINOS_ACTIVITY_CACHE", "1") != "0"     # per-skeleton activity states (AssemblyRegionIterator)
-ASSEMBLY_CACHE = os.environ.get("MINOS_ASSEMBLY_CACHE", "1") != "0"     # per-region assemblies (MinosAssemblyCache)
+# per-region assemblies (MinosAssemblyCache): off unless MINOS_ASSEMBLY_CACHE=1 - one file per region (1.6 M files, 6.5 GB
+# for one 60-min round) until the files are packed and deleted with the round
+ASSEMBLY_CACHE = os.environ.get("MINOS_ASSEMBLY_CACHE", "0") == "1"
 SERVER_MOUNTS = ("/srv/data", "/srv/cache", "/srv/work")                   # data_dir, cache_dir, the runner's work_dir
 
 SAFE_ANNOTATION_EXCLUSIONS = (
