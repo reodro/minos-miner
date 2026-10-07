@@ -1,16 +1,12 @@
-"""The search engine (v4.10): the last five minutes of the climb start no new basin.
+"""The search engine (v4.9): the changes made while v4.8 was running.
 Owner: search.
 
-v4.10 keeps v4.9's resolved-gain rule. For the five minutes before the final (schedule.no_new_before_final_min),
-a stalled basin retires and its workers join the basins already climbing. A new centre is not founded: its scan
-would not finish before the merge.
-
-The search engine (v4.9): a gain the answer set can resolve moves the centre.
-Owner: search.
-
-v4.9 keeps v4.8's six climbing basins, six held candidates, and the ten-minute stall. The answer set separates
-neighbours at climb.accept_min (0.005), so a scan or a chain that gains that much becomes the centre and the
-neighbourhood climb continues. A gain of climb.decisive (0.05) is the one that restarts the full-range scan.
+v4.9 keeps v4.8's six climbing basins, six held candidates, and the ten-minute stall. Two changes landed while
+that replay was still going, and both are this version. The answer set separates neighbours at climb.accept_min
+(0.005), so a scan or a chain that gains that much becomes the centre and the neighbourhood climb continues. A
+gain of climb.decisive (0.05) is the one that restarts the full-range scan. For the five minutes before the
+final (schedule.no_new_before_final_min), a stalled basin retires and its workers join the basins already
+climbing. A new centre is not founded: its scan would not finish before the merge.
 
 The search engine (v4.8): a basin that stops moving for ten minutes gives its workers to a new centre.
 Owner: search.
@@ -1151,7 +1147,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.10", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.9", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),
