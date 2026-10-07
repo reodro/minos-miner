@@ -232,6 +232,9 @@ class StatusBoard:
         failed = dict(getattr(out, "failed_configs", None) or {})
         manifest = {k: row[k] for k in ("run_id", "kind", "round_id", "tag", "region", "mode", "started", "ended")}
         manifest.update(final_config=final, baseline_config=self._baseline, configs=configs, failed=failed)
+        basins = ((getattr(client, "notes", None) or {}).get("engine") or {}).get("basins")
+        if basins:
+            manifest["basins"] = basins
         manifest["tuning"] = {"at_start": self._tuning0,
                               "changes": [c for c in TUNING.snapshot()["changes"] if c["t"] >= (row.get("started") or 0)]}
         (d / "manifest.json").write_text(json.dumps(manifest))

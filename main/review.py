@@ -109,13 +109,14 @@ def answer_set_as_scored(result) -> dict:
             "classes": classes}
 
 
-def pick_configs(configs: Dict[str, dict], final: Optional[str], baseline: Optional[str], top_k: int) -> List[str]:
-    """final, baseline, then the best `top_k` by local score (no duplicates, only configs we have; configs that scored
-    0 - no usable calls - say nothing about the answer set and would only tie in the Spearman)."""
+def pick_configs(configs: Dict[str, dict], final: Optional[str], baseline: Optional[str], top_k: int,
+                 extra: Optional[List[str]] = None) -> List[str]:
+    """final, baseline, the basin ledger, then the best `top_k` by local score (no duplicates, only configs we have;
+    configs that scored 0 - no usable calls - say nothing about the answer set and would only tie in the Spearman)."""
     ranked = sorted((k for k, c in configs.items() if c.get("local")),
                     key=lambda k: configs[k]["local"], reverse=True)
     out = []
-    for k in [final, baseline] + ranked[:top_k]:
+    for k in [final, baseline] + list(extra or []) + ranked[:top_k]:
         if k and k in configs and k not in out:
             out.append(k)
     return out
@@ -242,12 +243,15 @@ class Reviewer:
             except Exception as e:  # noqa: BLE001 - the strict numbers above still stand
                 log.warning("review %s: scoring our answer set failed: %s", run_id, e)
         configs = m.get("configs") or {}
-        keys = pick_configs(configs, m.get("final_config"), m.get("baseline_config"), self.top_k)
+        basin_keys = [b.get(field) for b in (m.get("basins") or []) for field in ("first_key", "best_key")]
+        keys = pick_configs(configs, m.get("final_config"), m.get("baseline_config"), self.top_k, basin_keys)
         true, gate, rerun = self._true_scores(rnd, oracle, keys, configs, m)
         local = {k: configs[k].get("local") for k in keys}
+        basin_set = {k for k in basin_keys if k}
         row["configs"] = [{"config": k, "local": local.get(k), "true": true.get(k), "gate_passed": gate.get(k),
                            "role": "final" if k == m.get("final_config") else
-                           "baseline" if k == m.get("baseline_config") else "top"} for k in keys]
+                           "baseline" if k == m.get("baseline_config") else
+                           "basin" if k in basin_set else "top"} for k in keys]
         row["search"] = summarize(local, true, m.get("final_config"), m.get("baseline_config"))
         row["rerun"] = rerun
         self._append(row)

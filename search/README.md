@@ -41,14 +41,14 @@ search. `emit_ref_confidence` is `NONE` because GVCF / BP_RESOLUTION output is r
 too. `adaptive_pruning_initial_error_rate` and `pruning_lod_threshold` stay at the GATK defaults because
 HaplotypeCaller does not read them unless `--adaptive-pruning` is on, and that switch is not a search parameter.
 
-## The engine (v4.1)
+## The engine (v4.8)
 
 | module | what it does |
 |---|---|
 | `hills.py` | the one rule for which hill a config is on (4+ settings more than 10% of range apart = another hill; once the ranker is fitted, only the settings it finds important count); ownership, adoption, the scout's exclusion zone, merging and founding all ask it |
 | `genetic.py` | recombination: niched genetic generations, and the merge operator - every combination of the settings where two centres differ (when 8 or fewer, else 256 random ones) plus mutated children |
-| `climber.py` | a domain's climb, iterated local search (ParamILS): a full-range scan of every setting first, coarse sweeps, a wide all-pairs round when a coarse sweep finds nothing, fine sweeps, best of each sweep with the other winners re-applied, the perturb-and-climb loop (shake 2/3/5/8 settings, a local round, keep better OR equal) round after round, and parallel ParamILS chains on the workers the main line leaves idle; it reports facts and notes and never decides its own lifecycle |
-| `engine.py` | the opening and the controller: everything about domains and finds is decided in one pass from facts |
+| `climber.py` | a domain's climb: a full-range scan of every setting first. A gain under 0.05 does not interrupt it. A gain of 0.05 moves the centre and the scan runs again. A scan that comes back under 0.05 holds the peak (no coarser sweep, no chains). It reports facts and never decides its own lifecycle |
+| `engine.py` | the opening and the controller. The opening identifies up to 12 centres and starts six. A basin whose first scan gains under 0.05 is retired, and the next held candidate takes its seat, one at a time. The basins stay separate until one merge at the final. The submission is the highest local score |
 | `axes.py` | per-setting steps, learned cliffs, parked settings, the distance between configs, the Latin hypercube |
 | `families.py` | genotyping riders for global points |
 | `portfolio.py` | the opening's seeds: the legacy pipeline's portfolio (`portfolio/legacy.json`, 749 configs from 79 rounds) and what our reviewed runs add (`$DATA_DIR/portfolio/ours.jsonl`), the round's read-length profile first, spaced apart, up to `opening.portfolio_share` of wave 0 |
@@ -61,18 +61,14 @@ The round (times for a 72-minute search, from its start; they scale with the rou
 | minutes | stage |
 |---|---|
 | 0-15 | wave 0 (the defaults, the official seed, up to 40% portfolio seeds, the rest a Latin hypercube over every setting; 4 threshold riders) while the answer set is built, then 3 genetic generations, each launched once 60% of the previous is back or workers idle; stops early when a generation gains < 0.05; hard limit 15 |
-| ~15 | founding: one domain per hill (registry), up to 6; each scans every setting over its range first |
-| 15-62 | ParamILS in every domain with parallel chains on idle workers; winning settings shared between domains every 5 min; the scout keeps 15% of the workers until minute 34 and 5% after |
-| any time | finds: an off-hill config at least as good as the weakest domain - a valley test may found a domain (a free slot, or fewer than 4 domains before minute 34 / 2 before minute 50), may replace the weakest domain when it is 0.05 better and every slot is full; anything else close to the nearest domain is merged into it |
-| any time | merge on evidence: two domains on one hill |
-| 34-40 | scheduled merges, closest pairs first: at most 3 domains from minute 40 |
-| 50-62 | a three-way merge: one domain |
-| 62-72 | the final on one point (halving single steps, all pairs, a last pairing with the runner-up, chains with small shakes, the scout's share scoring the neighbours of the pick candidates), then the plateau-centre pick: among configs within 0.05 of the best, the one whose neighbours score highest |
+| ~15 | founding: up to 12 centres, at least 6 settings apart. Seats within 0.5 of the best are filled first; further seats may be up to 5 below it. Six of them start and scan every setting. The other six are held. Workers stay split evenly across the basins that are actually climbing |
+| 15-62 | a gain of 0.05 moves the centre and the scan runs again. A scan that comes back under 0.05 holds that peak. Once every first scan is back (or by minute 34), a basin with no such gain is retired and the next held candidate takes its seat. The one after that waits until the new scan is back. A basin whose best has not moved for 10 minutes is retired and its workers go to the next candidate. Winning settings are shared between domains every 5 min. The scout sampler is off. There is no merge in this stretch |
+| any time | an off-hill find is recombined with the nearest domain, one find at a time, and those children wait behind that domain's scan |
+| 62-72 | one merge: the strongest basin keeps the seat, the others retire, and it takes their differing settings plus one capped set of recombination children. Those children go out before the halved single steps and pairs. Then the pick: the highest local score |
 
-Every merge evaluates its children in parallel (small batches: one config per worker, only cheap siblings riding) and
-takes the best of parents and children as the new centre, which inherits both parents' tested configs and steps.
-Riders: 4 on wave 0, 2 on generations and scout points; a climbing move or chain move carries 2 siblings (one
-genotyping, one PairHMM step); merges carry none.
+A scheduled merge retires the weaker domain. The survivor takes the differing settings as moves, plus one capped set
+of recombination children sent after its scan (small batches: one config per worker). Riders: 4 on wave 0, 2 on
+generation points; a climbing move carries 2 siblings (one genotyping, one PairHMM step).
 
 ## Engine versions
 
@@ -90,6 +86,14 @@ released truth; one run's noise is 0.04-0.08 TRUE.
 | v3.1 | 1602b81 | fine mode, freezes, merges with inheritance, siblings | 59K | 88.778 | 89.714 | 25 |
 | v3.2 | 155b972 | hypercube waves, model-guided scout, rolling domains | 116K | 88.771 | 89.770 | 23 |
 | v4 | 2026-10-05 | hill registry, controller, genetic opening, merges by recombination, ParamILS perturbation loop, plateau-centre pick (hand-tuned during the run: opening.max_min, climb.decisive) | 47K | 88.699 | 89.711 | 25 |
+| v4.1 | e2e0df4, round 20261006T010500Z | scan first, valley-tested finds, evidence merges. Field best 83.876 of 67 | 25K | 84.138 | 83.554 | 37 |
+| v4.2 | efb9a05, same round | steady opening, no evidence merges, find-merge ahead of the scan, plateau pick. Best reviewed TRUE 83.625 | 34K | 83.846 | 83.583 | 34 |
+| v4.3 | (this tree) | raw-best pick, scan held until it finishes, one find-merge behind the scan, no new domain after the opening, scout sampler off. Local only: 14 workers, one domain, TRUE 84.832 on 20261007T044100Z, rank 56 of 70 | 633 | 83.636 | 84.832 | 56 |
+| v4.4 | (this tree) | the v4.3 search, plus a ledger of each basin's opening score, first scan, and score at the 50-minute merge. Fleet replay of 20261007T055300Z is in progress on this code | | | | |
+| v4.5 | (this tree) | the opening founds up to 12 basins. A basin whose first scan gains under 0.05 is retired once and replaced. Workers are split evenly until those first scans are back. Not fleet-tested | | | | |
+| v4.6 | (this tree) | no merge at minute 34 or 50. All 12 opening centres climb at once. Fleet replay of 20261007T070500Z is in progress on this code | | | | |
+| v4.7 | (this tree) | six of the twelve centres climb. The other six are held and swapped in, one at a time, for a basin whose first scan gained under 0.05. Not on the fleet | | | | |
+| v4.8 | (this tree) | a basin whose best has not moved for 10 minutes is retired and the next candidate takes its workers. Not on the fleet | | | | |
 
 What each step taught: riders inflate counts without information (v1); best-of-sweep beats first accept and stale
 centres (v2); random shakes on spare workers win nothing after the first 20 minutes (v3); fine steps pay late in the

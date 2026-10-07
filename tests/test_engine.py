@@ -209,10 +209,39 @@ class ClimberTest(unittest.TestCase):
         other = space._assemble({"min_pruning": 3})
         self.assertFalse(d.offer(other, 88.0 + ACCEPT_MIN / 2, 1.0))
         self.assertTrue(d.offer(other, 88.1, 1.0))
+        self.assertTrue(d.scan_next)                                             # a gain of 0.05 arms the scan again
         self.assertEqual(d.progress(2.0), 0.0)                                  # a taken point is not own progress
         d.refill(live, rng, 500)
         m = d.take()
-        self.assertTrue(d.consider(m, True, m.config, 88.1 + 2 * DECISIVE, False, 2.0))
+        self.assertEqual(m.kind, "scan")
+        jumped = 88.1 + 2 * DECISIVE
+        self.assertTrue(d.consider(m, True, m.config, jumped, False, 2.0))
+        self.assertEqual(d.first_scan_score, jumped)                             # the first scan moved the centre
+        self.assertFalse(d.first_scan_held)
+
+    def test_a_flat_scan_holds_the_peak(self):
+        space, book, names = setup()
+        geno = [a for a in GENOTYPING_PARAMS if a in space.names]
+        live = book.live(0.0) + geno
+        d = Climber(0, space, book, space._assemble({}), 88.0, 0.0, extra_axes=geno, scan=True)
+        centre = d.centre.key
+        moves = d.refill(live, random.Random(0), 500)
+        self.assertTrue(moves and all(m.kind == "scan" for m in moves))
+        head = d.take()
+        self.assertFalse(d.consider(head, True, head.config, 88.0 + 2 * ACCEPT_MIN, False, 1.0))
+        self.assertEqual(d.centre.key, centre)                                  # under 0.05 does not abort the scan
+        self.assertFalse(d.offer(space._assemble({"min_pruning": 3}), 88.02, 1.0))
+        for m in moves:
+            if m is head:
+                continue
+            d.take()
+            d.consider(m, True, m.config, 88.01, False, 1.0)
+        self.assertTrue(d.scan_flat)
+        self.assertEqual(d.centre.key, centre)
+        self.assertAlmostEqual(d.first_scan_score, 88.0 + 2 * ACCEPT_MIN)        # the scan's best point, centre held
+        self.assertTrue(d.first_scan_held)
+        self.assertEqual(d.birth_score, 88.0)
+        self.assertEqual(d.refill(live, random.Random(1), 50), [])               # no coarse climb and no chains
 
     def test_siblings_are_one_genotyping_and_one_pairhmm_step(self):
         space, d, live = self.make()
@@ -230,21 +259,26 @@ class EngineRoundTest(unittest.TestCase):
         self.assertIn("wave 0 ", text)
         self.assertIn("bred into idle workers", text)                         # opening.steady: no generations
         self.assertIn("founding at", text)
-        self.assertIn("merge (scheduled 6 to 3", text)                        # merges.retire: no children
-        self.assertIn("merge (scheduled 3 to 1)", text)
+        self.assertIn("6 domains, 6 held", text)                              # six climb; six candidates wait
+        self.assertIn("merge (final)", text)                                  # one merge, at the final window
+        self.assertNotIn("scheduled 3 to 1", text)
         self.assertNotIn("one hill", text)                                     # merges.on_evidence 0
         self.assertIn("final at", text)
-        self.assertIn("plateau-centre pick", text)
-        self.assertGreater(ex.utilization(), 0.9)
+        self.assertIn("pick ", text)
+        self.assertNotIn("plateau-centre", text)
+        self.assertGreater(ex.utilization(), 0.85)                    # children of the final merge go out before the next sweep
         self.assertGreater(out.best.score, 94.5)
-        pick = [l for l in logs.output if "plateau-centre pick" in l][0].split("pick ")[1].split(" ")[0]
+        pick = [l for l in logs.output if "engine: pick " in l][0].split("pick ")[1].split(" ")[0]
         self.assertEqual(out.submissions[-1][1], pick)                         # main submitted the search's pick
-        for l in logs.output:                                                   # at most 3 domains from minute 40
+        still_separate = False
+        for l in logs.output:                                                   # the basins are still separate at minute 51-61
             if " domains " in l and "t+" in l:
                 t = float(l.split("t+")[1].split("m")[0])
-                if 41 <= t < 61:
+                if 51 <= t < 61:
                     doms = l.split("domains ")[1].split(" | ")[0].split()
-                    self.assertLessEqual(len([x for x in doms if not x.endswith("/m")]), 3, l)
+                    if len([x for x in doms if not x.endswith("/m")]) > 1:
+                        still_separate = True
+        self.assertTrue(still_separate)
 
     def test_small_fleet(self):
         with self.assertLogs("search.engine", level="INFO") as logs:
@@ -319,6 +353,8 @@ class V42Test(unittest.TestCase):
                                 "pcr_indel_model": "NONE", "max_assembly_region_size": 650})
         picked = hills.cluster([(a, 90.0), (five, 89.9)], 6, band=0.5, min_far=hills.distance(a, five) + 1)
         self.assertEqual([c.key for c, _ in picked], [a.key])
+        more = hills.take([(five, 89.0), (a, 90.0)], 1, min_far=4, floor=80.0, avoid=[a])
+        self.assertEqual([c.key for c, _ in more], [five.key])
 
     def test_full_reapply_adds_running_sums_and_pairs(self):
         with knobs(climb__reapply_full=1):

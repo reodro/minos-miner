@@ -153,9 +153,9 @@ Review: submitted TRUE **83.554**, rank **37/67**, field best **83.876**, gap **
 
 Read against the project's own noise rule: the +0.41 from `min_base_quality_score` and the +0.37 from recombination children are real on this log. The chain's +0.05 is at the noise floor. The pick did nothing.
 
-## 2026-10-06 — v4.2, the current defaults
+## 2026-10-06 — v4.2
 
-`04f0211`. Written from that run and from an A/B of the switches on the stand-in landscape. Every change is a setting. The v4.1 behaviour is one switch away. Tests: 194 passed, including the v4.1 path with the switches off. **No fleet round has run v4.2 yet.**
+`04f0211`, fleet-tested the same day as `efb9a05`. Written from the v4.1 run and from an A/B of the switches on the stand-in landscape. Every change is a setting. The v4.1 behaviour is one switch away.
 
 | Setting | v4.2 default | What it answers in the 01:05 run | What it risks |
 |---|---|---|---|
@@ -198,7 +198,52 @@ The seven published floats, from the GATK 4.5 source:
 
 The sampler already writes floats to six decimal places. That is the sampler's rounding. GATK parses the double as written.
 
-The README's minute-by-minute table still describes v4.1 (three generations, evidence merges, recombination on the schedule). The defaults above are what a round runs today.
+Fleet result, same round **20261006T010500Z**, 972 workers, five hosts. 33,980 configs evaluated, 15,029 GATK runs. Submitted `a0a553cf29c757a6`, local 83.846, TRUE **83.583**, rank **34/67**, gap 0.293 to the field best 83.876. The best config in the review, `9fb5d377700a6c66`, was local 83.894, TRUE **83.625**. The plateau-centre pick chose a neighbour of that config and gave up 0.042 TRUE. The scout sampler sent nothing. Find-merge children were most of the runs, at a higher priority than the scan, and no scan finished. Submitted TRUE moved +0.029 from v4.1, inside one run's noise. The best reviewed config moved +0.070.
+
+A local genetic search over the top 20 configs of each replay, scored on this round's answer set, gained +0.006 by moving `max_assembly_region_size` from 217 to 218. The plateau the two replays share is exhausted.
+
+## 2026-10-07 — v4.8, the current tree
+
+On the v4.6 replay of `20261007T070500Z`, domain 1 reached 89.6484 at minute 9.5 and was still there at minute 30. Its first scan had gained 0.15, so the 0.05 rule kept the seat, and the workers stayed on a centre that was no longer moving. After a basin's first scan, ten minutes without a new best retires it. The next held candidate takes the seat. The retired centre remains a candidate, so the pick can still submit it.
+
+## 2026-10-07 — v4.7
+
+The opening identifies up to twelve centres and starts six. The other six are held and are not given workers. A basin whose first scan gains under 0.05 is retired, and the next held candidate takes that seat. The candidate after it stays held until that scan is back. v4.6 started all twelve at once; the fleet replay of `20261007T070500Z` is still that code.
+
+## 2026-10-07 — v4.6
+
+The fleet replay of v4.4 on `20261007T055300Z` merged six basins to three at minute 33. Over the next sixteen minutes only the leader moved, by 0.05, and the other two survivors were unchanged. The freed workers went into chain steps. v4.6 does not merge at minute 34 or at minute 50. The basins keep an even share of the workers until the final window. At that minute the strongest keeps its seat, the others hand it their differing settings and one capped set of recombination children, and those children are issued before the halved-step search and before any chain. The final is still iterated local search on that one centre, and the pick is still the highest local score.
+
+The replay that is running was started on v4.4. This change is not on those machines.
+
+## 2026-10-07 — v4.5
+
+The opening founds up to 12 basins (`domains.max`; a fleet of 972 workers has the seats, a 14-worker machine still has one). Seats within 0.5 of the best are filled first. Further seats may be up to 5 below the best, and still at least 6 settings apart. While any first scan is out, workers are split evenly across the live basins. Once every first scan is back, or at minute 34, a basin whose first scan gained under 0.05 is retired and the next unused candidate, far from the centres already used, takes its seat. That replacement happens once. The merge down to one domain at minute 50, and the raw-best pick, stay.
+
+The fleet replay of `20261007T055300Z` that is running was started on v4.4, before this change. It still founds at most 6 and does not replace a flat basin.
+
+## 2026-10-07 — v4.4
+
+The search is v4.3. A 14-worker replay of 20261007T044100Z founded one domain (one per eight workers), climbed it from local 83.12 to 83.64, and its truth score was 84.832 against a field best of 85.935 (rank 56 of 70). The same opening, given six slots, would also have founded centres at 82.74 and 82.71. v4.4 does not change founding, the scan, the 0.05 rule, the progress-weighted share, or the 50-minute merge. It writes one line when the merge to one domain starts, and one line at the pick:
+
+`basins at merge to 1: d0 opened 83.1200 first 83.4000 best 83.6400 <key> | d1 opened ...`
+
+`first` is the best point that basin's first scan measured (`pending` if that scan is not back). `best` is the centre at that moment. The same rows are stored on the run manifest, and the review scores `first_key` and `best_key` on the released truth alongside the final and the top local configs.
+
+A fleet replay reads two outcomes from those lines. If the secondary basins are still well behind the leader after the first scan and at the merge, the opening's distant regions are weaker and the missing winner was not in that sample. If one of them climbs about as far as the leader, the progress-weighted share is what to change next: an equal share until each first scan is back, and nothing else.
+
+## 2026-10-06 — v4.3
+
+Written from that replay and from the local genetic search. No fleet round has run v4.3 yet. The comparison is still 20261006T010500Z: TRUE 83.583 submitted, 83.625 the best this search has reviewed, 83.876 the field.
+
+- The submission is the highest local score. The neighbour-mean pick and the final's neighbour-scoring pass are gone.
+- A domain scans every setting first. A gain under 0.05 does not interrupt that scan. A gain of 0.05 moves the centre and the scan runs again. When the scan comes back under 0.05, the peak is held: no coarser sweep and no chains on that centre.
+- Nothing founded after the opening is a new domain. A cold domain in the middle of the round starts about half a point down, and the round is over before it climbs out.
+- An off-hill find is recombined with the nearest domain, one find at a time. Those children wait until the scan is back and go out at the same priority as a climb move. A scheduled merge still retires the weaker domain and keeps the transplant moves; the survivor also gets one capped set of recombination children, behind its scan. Queued children are cancelled when the domain retires or the centre moves.
+- The scout sampler is off (`scout.share` and `scout.late_share` are 0). Find-merge children stay.
+- The BAM grouping and the haplotype-cap reduction are unchanged. There is no float grid, and neither the allele cap nor the calling threshold is collapsed.
+
+The scheduled shrink to one domain, and the final on that domain, stay. The final names the raw best.
 
 ## What is in the tree now
 
@@ -212,8 +257,8 @@ The README's minute-by-minute table still describes v4.1 (three generations, evi
 | `portfolio.py` | 10-05 | Opening seeds. Legacy 749, then our reviewed runs. |
 | `hills.py` | v4 | The one distance rule. Ownership, founding, the scout's exclusion zone, and merges all ask it. |
 | `genetic.py` | v4, islands in v4.2 | Niched generations, island generations, merge children. |
-| `climber.py` | v4, scan and chains in v4.1 | One domain's ParamILS. Reports facts. Does not found, merge, or retire itself. |
-| `engine.py` | v4 | Opening, controller, scout, allocation, the pick. |
+| `climber.py` | v4, scan and chains in v4.1, scan hold in v4.3 | One domain's ParamILS. A flat scan holds the peak. Does not found, merge, or retire itself. |
+| `engine.py` | v4, v4.3 | Opening, controller, allocation, the raw-best pick. The scout sampler is off. |
 | `bamgroups.py` | v4.2 | The three BAM axes, reduced to the values the round can tell apart. |
 | `reductions.py` | v4.2 | The haplotype cap, collapsed upward after a finished run. |
 
@@ -229,8 +274,7 @@ Kept, because a round showed it:
 - Fine steps late, and inheriting the tested set and the finer steps at a merge (v3.1).
 - A Latin hypercube that actually covers every axis, and a scout that is forbidden inside a standing hill (v3.2).
 - Small batches for anything the search is waiting on (v4).
-- The plateau-centre pick, as a guard against answer-set blur. On 20261006T010500Z it selected the best config; the plateau was already flat.
-- The full-range scan at birth (v4.1). On 01:05 it almost never ran, and the one-axis move that did run was the largest single gain of the round.
+- The full-range scan at birth, and finishing it before recombination (v4.1, protected in v4.3). On 01:05 the one scan that ran was the largest single gain. On the v4.2 replay find-merge outranked it and none finished.
 - Steady breeding into idle workers (v4.2), because a generation launched at t+13 was thrown away at t+15.
 - Not pausing a domain for an evidence merge (v4.2). That pause is why the scan did not run.
 
@@ -240,15 +284,15 @@ Not kept, or not supported by the measurement:
 - Streamed random shakes as the way to use spare workers (v3). Rank went backwards.
 - Treating v4's 89.711 against v3.2's 89.770 as a reason to change the climb. The gap is inside 0.08.
 - Importance share 0.5 (v4.1). It erased the hill rule on 01:05.
-- Replacing recombination with transplants (v4.2's `merges.retire`) **as if the 01:05 run had asked for it**. The run's second large gain was the children.
+- Replacing recombination with transplants only (v4.2's `merges.retire` as first shipped). The v4.1 run's second large gain was the children. v4.3 puts one capped child set back, behind the scan.
+- The plateau-centre pick. On the v4.1 replay it matched the best config. On the v4.2 replay it gave up 0.042 TRUE.
+- The scout sampler. Its log line in v4.2 was find-merge, and the sampler itself sent nothing. v4.1's 540-scout line was the fallback when every domain was merging.
+- Founding a new domain after the opening. Configs nine or more axes from the v4.2 peak already scored 83.314 or below.
 
-## Open, as of v4.2
+## Open, as of v4.6
 
-1. v4.2 has not been fleet-tested. The next replay of 20261006T010500Z is the comparison: TRUE 83.55 is the number to beat, and 83.88 is the field.
-2. A new domain still does not have a protected share until its first scan is back. Gain-weighted allocation and a priority-6 find-merge both cut in front of that scan. The 01:05 run finished one scan.
-3. The scout fallback is uncapped when no domain has a move ready. That is the 540-scout line.
-4. A chain can recentre at 0.005 and abort a scan. The decisive bar is 0.05. The scan is the higher-value work.
-5. Island breeding and the top-600 candidate cap disagree. The cap was written to bound memory. It also deletes the other islands.
-6. Score the field-best config of 20261006T010500Z on that round's answer set before spending another version on exploiting the local plateau.
-7. `contamination_fraction_to_filter` has an exact finite resolution (762 runs on 01:05 if every evidence count up to depth 224 can occur). It is still the continuous range. The evidence count is known only after assembly, so a grid taken from raw depth is a safe superset and is not in the search.
-8. The other four live floats stay continuous. Their plateaus are the data's own probabilities, and a preset step can fall between two of them.
+1. v4.4 has not been fleet-tested. The replay should be read for each founded basin's first-scan score and its score at the merge to one domain, then those configs' truth scores. TRUE 83.625 on 20261006T010500Z is the best this search has reviewed there, and 83.876 is that field. On 20261007T044100Z the one-domain local run was TRUE 84.832 against a field best of 85.935.
+2. Island breeding and the top-600 candidate cap disagree. The cap was written to bound memory. It also deletes the other islands.
+3. Score the field-best config of 20261006T010500Z on that round's answer set. That is one run, not a new domain.
+4. `contamination_fraction_to_filter` has an exact finite resolution (762 runs on 01:05 if every evidence count up to depth 224 can occur). It is still the continuous range. The evidence count is known only after assembly, so a grid taken from raw depth is a safe superset and is not in the search.
+5. The other four live floats stay continuous. Their plateaus are the data's own probabilities, and a preset step can fall between two of them.

@@ -92,6 +92,10 @@ class Climber:
                  scan: bool = False):
         self.id, self.space, self.book = id, space, book
         self.centre, self.best = centre, score
+        self.birth_score = score
+        self.first_scan_score: Optional[float] = None       # best point the first scan measured
+        self.first_scan_key: Optional[str] = None
+        self.first_scan_held: Optional[bool] = None         # True: that point did not move the centre
         self.born = now
         self.owner = owner                                 # config -> the domain whose hill it is on (None: no hill)
         self.steps: Dict[str, float] = {a: book.axes[a].step for a in book.names}
@@ -102,11 +106,13 @@ class Climber:
         self.tried: Set[str] = {centre.key}
         self.pool: List[Move] = []
         self.inflight = 0
-        self.state = "climb"                               # climb | perturb | final  ("exhausted" is never reached)
+        self.state = "climb"                               # climb | perturb | final | exhausted
         self.mode = "coarse"                               # coarse | fine
         self.scale = 1.0                                   # fine-mode scale, halved per exhausted fine sweep
         self.fresh = True                                  # the centre's sweep is not sent yet
         self.scan_next = scan                              # the first sweep is a full-range scan
+        self.sweep_is_scan = False                         # the sweep in flight is that scan
+        self.scan_flat = False                             # the scan came back under climb.decisive: the peak is held
         self.wide_next = self.wide_done = False            # the wide round of this centre: queued / done
         self.eager_wide = False                            # set by the engine: few domains, so wide with the first sweep
         self.sweep_sent = self.sweep_back = 0
@@ -327,11 +333,13 @@ class Climber:
         for kind, ch in self.queued:                       # re-applied winners and settings shared by other domains
             self._add(kind, self.centre, self.best, ch, out)
         self.queued = []
+        self.sweep_is_scan = False
         if self.state == "final":
             out += self.singles(self.centre, self.best, live, "final", self.scale)
             out += self.pairs(live, rng, self.scale, kind="final")
         elif self.scan_next:
             self.scan_next = False
+            self.sweep_is_scan = True
             out += self.scan_moves(live)
             self.note(f"full-range scan: {len(out)} configs")
         elif self.wide_next:
@@ -359,6 +367,8 @@ class Climber:
         (sweeps, then perturbation) first; when it is waiting for results or has nothing, chains take the room."""
         self._live, self._rng = live, rng
         out = self._main(live, rng, room)
+        if self.scan_flat and not self.scan_next:
+            return out                                 # a flat scan is the end of this peak; chains do not follow it
         if not out and room > 0:
             out = self._start_chains(live, rng, room)
         return out
@@ -375,6 +385,8 @@ class Climber:
         if self.state in ("climb", "final") and self.sweep_sent and \
                 self.sweep_back < tune("climb.back_frac") * self.sweep_sent:
             return []                                      # the sweep is still coming back
+        if self.state == "climb" and self.scan_flat and not self.scan_next:
+            return []                                      # the scan came back under 0.05: do not start a coarser climb
         if self.state == "final":                          # a halved final sweep, down to the floor; then chains
             if any(self.scale * st > self._floor(a) for a, st in self.steps.items()):
                 self.scale *= 0.5
@@ -562,10 +574,20 @@ class Climber:
         """Changes to try on the centre at the next sweep (settings shared by another domain, a final pairing)."""
         self.queued.append((kind, changes))
 
+    def scan_open(self) -> bool:
+        """A full-range scan is about to be sent, or is still short of climb.back_frac of its results."""
+        if self.scan_next:
+            return True
+        return bool(self.sweep_is_scan and self.sweep_sent
+                    and self.sweep_back < tune("climb.back_frac") * self.sweep_sent)
+
     def offer(self, config: Config, score: float, now: float) -> bool:
-        """A global point (a wave cell, a scout) the registry puts on this hill: the centre moves there when it is
-        better by the resolution. Not counted as the domain's own progress."""
+        """A point the registry puts on this hill. A gain of climb.decisive moves the centre at once and the scan
+        runs again. A smaller gain does not interrupt a scan, and does not move a peak whose scan already came
+        back flat. Not counted as the domain's own progress."""
         if config.key == self.centre.key or score <= self.best + tune("climb.accept_min"):
+            return False
+        if score < self.best + tune("climb.decisive") and (self.scan_open() or self.scan_flat):
             return False
         self._recentre(config, score, now, (), own=False)
         return True
@@ -574,6 +596,7 @@ class Climber:
         self.state, self.pool, self.fresh, self.scale = "final", [], True, 0.5
         self.winners = []
         self.scan_next = self.wide_next = False
+        self.sweep_is_scan = self.scan_flat = False
         for ch in self.chains.values():                    # the final is about this one point
             ch.base, ch.base_score = self.centre, self.best
 
@@ -623,6 +646,8 @@ class Climber:
             self._recentre(config, score, now, move.axes if current else (), own=True)
             return True
         if score > self.best + tune("climb.accept_min") and move.kind in CHAIN_KINDS:
+            if score < self.best + tune("climb.decisive") and (self.scan_open() or self.scan_flat):
+                return False                                    # a chain under 0.05 does not abort the scan
             self._credit(move, score)                                   # a chain beat the domain: its centre moves
             self.note(f"a chain found {score:.4f}")
             self._recentre(config, score, now, (), own=True)
@@ -632,12 +657,36 @@ class Climber:
             self.winners.append((move, config, score))
         return self._maybe_recentre(now)
 
+    def _record_first_scan(self, score: float, key: str, held: bool) -> None:
+        """The first scan's best point, once. Later scans do not overwrite it."""
+        if self.first_scan_score is not None:
+            return
+        self.first_scan_score, self.first_scan_key, self.first_scan_held = score, key, held
+        self.note("first scan %.4f (opened %.4f, %s)" % (score, self.birth_score, "peak held" if held else "centre moved"))
+
     def _credit(self, move: Move, score: float) -> None:
         for a in move.axes:
             if a in self.steps:
                 self.axis_gain[a] = self.axis_gain.get(a, 0.0) + (score - move.centre_score)
 
     def _maybe_recentre(self, now: float) -> bool:
+        back = self.sweep_sent and self.sweep_back >= tune("climb.back_frac") * self.sweep_sent
+        if self.scan_flat and not self.scan_next:
+            self.winners = []                              # the rest of a flat scan does not move the centre
+            return False
+        if self.sweep_is_scan and back:
+            score, key = self.best, self.centre.key
+            for _, cfg, s in self.winners:
+                if s > score:
+                    score, key = s, cfg.key
+            self.winners = []
+            self.sweep_is_scan = False
+            if score > self.best + tune("climb.decisive"):
+                return False                            # a decisive gain already moved the centre
+            self.scan_flat = True
+            self._record_first_scan(score, key, held=True)
+            self.note(f"scan back, gain {score - self.best:.4f}: peak held")
+            return False
         if not self.winners or self.sweep_back < tune("climb.back_frac") * max(1, self.sweep_sent):
             return False
         move, config, score = max(self.winners, key=lambda t: t[2])
@@ -677,7 +726,10 @@ class Climber:
             self.steps[axis] = max(self._floor(axis), self.steps[axis] * 0.5)
 
     def _recentre(self, config: Config, score: float, now: float, axes: Sequence[str], own: bool) -> None:
+        was_scan = self.sweep_is_scan
         gain = score - self.best
+        if was_scan:
+            self._record_first_scan(score, config.key, held=False)
         if own and gain > 0:
             self.gains.append((now, gain))
             self.equal_accepts = 0
@@ -691,6 +743,12 @@ class Climber:
         self.fresh = True
         self.wide_done = False
         self.sweep_sent = self.sweep_back = 0
+        self.sweep_is_scan = False
+        if gain >= tune("climb.decisive") and self.state != "final":
+            self.scan_next = True                      # the scan of the new centre is the next sweep
+            self.scan_flat = False
+            if self.state == "exhausted":
+                self.state = "climb"
         if self.state == "perturb":
             self.state = "climb"
         self.scale = 1.0 if self.state != "final" else self.scale

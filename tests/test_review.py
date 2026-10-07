@@ -38,6 +38,7 @@ class PickAndSummaryTest(unittest.TestCase):
     def test_pick_final_baseline_then_top(self):
         configs = {k: {"local": s} for k, s in [("a", 90), ("b", 80), ("c", 85), ("base", 70), ("x", None), ("z", 0.0)]}
         self.assertEqual(pick_configs(configs, "b", "base", 2), ["b", "base", "a", "c"])
+        self.assertEqual(pick_configs(configs, "b", "base", 1, ["c"]), ["b", "base", "c", "a"])
         self.assertEqual(pick_configs(configs, "a", "gone", 1), ["a"])           # unknown keys are skipped
         self.assertNotIn("z", pick_configs(configs, "a", "base", 10))            # scored 0: not worth a true score
 

@@ -26,7 +26,7 @@ class TuningTest(unittest.TestCase):
 
     def test_defaults_without_a_file(self):
         self.assertIsNone(TUNING.path)                       # tests never read the repo's tuning.json
-        self.assertEqual(tune("scout.share"), 0.15)
+        self.assertEqual(tune("scout.share"), 0.0)
         self.assertEqual(self.t.get("climb.shake_k"), [2, 3, 5, 8])
         self.t.use_file(self.path)                           # no file yet: still the defaults
         self.assertEqual(self.t.values, DEFAULTS)
@@ -37,7 +37,7 @@ class TuningTest(unittest.TestCase):
         self.assertEqual((self.t.get("scout.share"), self.t.get("merges.mutated")), (0.2, 10))
         self.assertEqual([c["name"] for c in self.t.changes], ["merges.mutated", "scout.share"])
         self.write({})
-        self.assertEqual(self.t.get("scout.share"), 0.15)
+        self.assertEqual(self.t.get("scout.share"), 0.0)
 
     def test_bad_values_are_rejected_and_the_value_in_force_stays(self):
         self.t.use_file(self.path)
@@ -73,7 +73,7 @@ class TuningTest(unittest.TestCase):
         self.t.round_started()
         self.write({"domains.max": 4, "scout.share": 0.1})
         self.assertEqual(self.t.get("scout.share"), 0.1)     # live: now
-        self.assertEqual(self.t.get("domains.max"), 6)       # round: waits
+        self.assertEqual(self.t.get("domains.max"), 12)      # round: waits
         self.assertEqual(self.t.snapshot()["pending"], {"domains.max": 4})
         self.t.round_ended()
         self.assertEqual(self.t.get("domains.max"), 4)

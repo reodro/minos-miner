@@ -53,3 +53,17 @@ class Hills:
             if all(self.distance(c, o) >= min_far for o, _ in out):
                 out.append((c, s))
         return out
+
+    def take(self, ranked: Sequence[Tuple[Config, float]], k: int, min_far: int, floor: float,
+             avoid: Sequence[Config] = ()) -> List[Tuple[Config, float]]:
+        """Up to `k` more centres, best first, each at least `min_far` from the others and from `avoid`, none below
+        `floor`. Used to fill the opening out to domains.max, and to replace a basin whose first scan did not move."""
+        out: List[Tuple[Config, float]] = []
+        for c, s in ranked:
+            if len(out) >= k or s < floor:
+                break
+            if any(self.distance(c, z) < min_far for z in avoid):
+                continue
+            if all(self.distance(c, o) >= min_far for o, _ in out):
+                out.append((c, s))
+        return out
