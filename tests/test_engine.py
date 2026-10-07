@@ -219,7 +219,7 @@ class ClimberTest(unittest.TestCase):
         self.assertEqual(d.first_scan_score, jumped)                             # the first scan moved the centre
         self.assertFalse(d.first_scan_held)
 
-    def test_a_flat_scan_holds_the_peak(self):
+    def test_a_resolved_scan_gain_moves_the_centre_without_a_rescan(self):
         space, book, names = setup()
         geno = [a for a in GENOTYPING_PARAMS if a in space.names]
         live = book.live(0.0) + geno
@@ -235,13 +235,30 @@ class ClimberTest(unittest.TestCase):
             if m is head:
                 continue
             d.take()
-            d.consider(m, True, m.config, 88.01, False, 1.0)
+            d.consider(m, True, m.config, 88.0, False, 1.0)
+        self.assertFalse(d.scan_flat)
+        self.assertFalse(d.scan_next)                                            # 0.05 is what restarts the full scan
+        self.assertEqual(d.centre.key, head.config.key)
+        self.assertAlmostEqual(d.first_scan_score, 88.0 + 2 * ACCEPT_MIN)
+        self.assertFalse(d.first_scan_held)
+        nxt = d.refill(live, random.Random(1), 50)
+        self.assertTrue(nxt)
+        self.assertNotIn("scan", {m.kind for m in nxt})
+
+    def test_a_scan_under_the_answer_set_resolution_holds_the_peak(self):
+        space, book, names = setup()
+        geno = [a for a in GENOTYPING_PARAMS if a in space.names]
+        live = book.live(0.0) + geno
+        d = Climber(0, space, book, space._assemble({}), 88.0, 0.0, extra_axes=geno, scan=True)
+        centre = d.centre.key
+        moves = d.refill(live, random.Random(0), 500)
+        for m in moves:
+            d.take()
+            d.consider(m, True, m.config, 88.0 + ACCEPT_MIN / 2, False, 1.0)
         self.assertTrue(d.scan_flat)
         self.assertEqual(d.centre.key, centre)
-        self.assertAlmostEqual(d.first_scan_score, 88.0 + 2 * ACCEPT_MIN)        # the scan's best point, centre held
         self.assertTrue(d.first_scan_held)
-        self.assertEqual(d.birth_score, 88.0)
-        self.assertEqual(d.refill(live, random.Random(1), 50), [])               # no coarse climb and no chains
+        self.assertEqual(d.refill(live, random.Random(1), 50), [])
 
     def test_siblings_are_one_genotyping_and_one_pairhmm_step(self):
         space, d, live = self.make()
