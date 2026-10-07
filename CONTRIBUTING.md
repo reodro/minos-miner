@@ -57,7 +57,7 @@ Four parts, three people. These rules keep us from breaking each other - and, ab
 
 ## 7. Machines
 
-- Every machine (main VPS and fleet nodes) runs **one GATK worker per CPU thread, minus one spare per 20 threads (cores - cores // 20)**, 1 thread each
+- Every machine (main VPS and fleet nodes) runs **floor(cores x 0.9)** GATK workers, 1 thread each
   (`common.settings.default_workers()`, override with `MINOS_WORKERS`); fleet nodes run one scorer process per GATK
   worker.
 - Same GATK image (`broadinstitute/gatk:4.5.0.0`) and the same patch jar everywhere; a node that fails its

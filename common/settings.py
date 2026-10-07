@@ -83,9 +83,8 @@ def _ram_worker_cap() -> int:
 
 
 def default_workers(cores: int = 0) -> int:
-    """GATK workers per machine (1 thread each): one per CPU thread minus one spare per 20 threads for scoring and
-    the search (cores - cores // 20: all 12 on a 12-thread machine, 950 on 1000), and when the count is this
-    machine's own, also its RAM cap (ram_worker_cap: available RAM minus a reserve, / GB_PER_WORKER). Same rule on every fleet
+    """GATK workers per machine (1 thread each): floor(cores * 0.9), and when the count is this machine's own,
+    also its RAM cap (ram_worker_cap: available RAM minus a reserve, / GB_PER_WORKER). Same rule on every fleet
     machine; override with MINOS_WORKERS (or a host's "workers" in fleet.json).
 
     An explicit `cores` argument is the CPU rule only, so a caller sizing a remote node is not capped by this
@@ -96,7 +95,7 @@ def default_workers(cores: int = 0) -> int:
         return int(env)
     auto = not cores
     cores = cores or os.cpu_count() or 1
-    workers = max(1, cores - cores // 20)
+    workers = max(1, math.floor(cores * 0.9))
     if auto:
         workers = min(workers, _ram_worker_cap())
     return workers

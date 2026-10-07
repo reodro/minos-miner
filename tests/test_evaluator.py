@@ -85,10 +85,10 @@ class VariantFileTest(unittest.TestCase):
 
 
 class WorkersRuleTest(unittest.TestCase):
-    def test_gatk_workers_one_per_cpu_thread_minus_5_percent(self):
+    def test_gatk_workers_are_floor_of_90_percent_of_cores(self):
         from common.settings import default_workers
         with mock.patch.dict(os.environ, {"MINOS_WORKERS": ""}):
-            self.assertEqual([default_workers(c) for c in (2, 8, 16, 32, 36, 180)], [2, 8, 16, 31, 35, 171])
+            self.assertEqual([default_workers(c) for c in (2, 8, 16, 32, 36, 180)], [1, 7, 14, 28, 32, 162])
 
 
 class VariantCostTest(unittest.TestCase):

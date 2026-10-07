@@ -103,9 +103,9 @@ MAX_WARM = 2                     # JVMs kept after a run so a later genotyping v
 MAX_SERVER_JOBS = 200            # a GATK server (MinosServer) is replaced after this many jobs
 SERVER_IDLE_S = 600              # ... and leaves by itself after this long without a job
 SERVER_VERIFY_EVERY = int(os.environ.get("MINOS_SERVER_VERIFY", "40"))   # every Nth solo server run is re-run cold
-ACTIVITY_CACHE = os.environ.get("MINOS_ACTIVITY_CACHE", "1") != "0"     # per-skeleton activity states (AssemblyRegionIterator)
-# per-region assemblies (MinosAssemblyCache): off unless MINOS_ASSEMBLY_CACHE=1 - one file per region (1.6 M files, 6.5 GB
-# for one 60-min round) until the files are packed and deleted with the round
+# Both caches are off unless explicitly enabled. The activity cache reuses a skeleton's per-locus states;
+# the assembly cache writes one file per region (1.6 M files, 6.5 GB in one 60-min round).
+ACTIVITY_CACHE = os.environ.get("MINOS_ACTIVITY_CACHE", "0") == "1"
 ASSEMBLY_CACHE = os.environ.get("MINOS_ASSEMBLY_CACHE", "0") == "1"
 # rounds whose VCFs and scoring cache stay on disk after they end (the review reads the top configs' VCFs when the
 # truth is out, ~1 round later); older rounds ended here are deleted (finish_round). 0 keeps every round.

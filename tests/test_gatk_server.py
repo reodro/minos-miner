@@ -146,6 +146,8 @@ class ActivityCacheTest(unittest.TestCase):
 
     def test_one_directory_per_skeleton_and_never_for_repairs_or_unbatchable_configs(self):
         from tests.helpers import ranges
+        self.addCleanup(setattr, G, "ACTIVITY_CACHE", G.ACTIVITY_CACHE)
+        G.ACTIVITY_CACHE = True                                                   # off by default (MINOS_ACTIVITY_CACHE=1)
         d = ranges().defaults("gatk").params
         dir_of = lambda c, props=None: self.runner._activity_cache(c, "full", props).get("minos.activity.dir")  # noqa: E731
         a = Config("gatk", {**d, "min_pruning": 2})
@@ -157,7 +159,6 @@ class ActivityCacheTest(unittest.TestCase):
         self.assertNotEqual(dir_of(a), dir_of(early))              # a read setting: another skeleton
         self.assertIsNone(dir_of(a, {"minos.repair.log": "/data/output/r"}))
         self.assertIsNone(dir_of(Config("gatk", {**d, "emit_ref_confidence": "GVCF"})))
-        self.addCleanup(setattr, G, "ACTIVITY_CACHE", G.ACTIVITY_CACHE)
         G.ACTIVITY_CACHE = False
         self.assertIsNone(dir_of(a))
 

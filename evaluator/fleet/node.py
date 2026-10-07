@@ -69,8 +69,8 @@ def fetch_reference(chrom: str, data_dir: str) -> None:
 class Node:
     def __init__(self, workers: int, runner, scorer_factory, score_threads: Optional[int] = None,
                  score_dir: Optional[str] = None):
-        """`score_threads` scorer processes (default `scorer_processes(workers)`, not one per worker): main keeps a
-        slot busy until its result is scored, so a worker's slot covers GATK and then scoring.
+        """One scorer per GATK worker (`score_threads` overrides): main keeps a slot busy until its result is scored, so
+        a worker's slot covers GATK and then scoring, and every finished GATK result is scored at once.
         `score_dir` set: the scorers are separate processes (each its own GIL) scoring with upstream's hap.py path.
         Unset (tests): threads sharing `scorer_factory`'s scorer."""
         from evaluator.local import LocalExecutor
@@ -350,7 +350,7 @@ def main() -> None:
     ap.add_argument("--stdio", action="store_true", help="serve main over stdin/stdout (how main starts it over ssh)")
     ap.add_argument("--selftest-only", action="store_true", help="run the self-test, print the result, exit")
     ap.add_argument("--workers", type=int)
-    ap.add_argument("--score-threads", type=int, help="scorer processes; default: one per six GATK workers, at least two")
+    ap.add_argument("--score-threads", type=int, help="scorer processes; default: one per GATK worker")
     ap.add_argument("--fake", action="store_true", help="tests only: FakeRunner/FakeScorer, no GATK, no self-test")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s node: %(message)s")
