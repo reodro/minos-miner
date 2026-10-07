@@ -3,7 +3,9 @@
 Runs next to the live miner (a background thread on main, which is otherwise idle: the fleet does the evaluating)
 and every `poll_s` (5 min) looks at the recent runs in <status_dir>/rounds.jsonl:
 
-    truth released?  -> "review" line: answer-set accuracy (ours vs the released truth), and the TRUE score of
+    truth released?  -> "review" line: answer-set accuracy (ours vs the released truth: strict record match, and
+                        "as_scored" - our answer set scored like a callset, so only what the score can see counts),
+                        and the TRUE score of
                         the final config, the baseline and the top-k configs by local score (their VCFs are reused
                         when on this machine, else GATK re-runs them here - exact, so the result is what the
                         validator saw), with Spearman(local, true), pick gap and local - true of the final.
@@ -65,6 +67,46 @@ def answer_set_accuracy(germline: Iterable[Variant], synthetic: Iterable[Tuple[V
             "synthetic_gt": _pr({exact(v) for v, _ in synthetic}, {exact(v) for v in ts}),
             "n_targets": {"ours": n_targets, "truth": truth_n,
                           "ratio": round(n_targets / truth_n, 4) if n_targets and truth_n else None}}
+
+
+def write_answer_set_vcf(germline: Iterable[Variant], synthetic: Iterable[Tuple[Variant, float]],
+                         contigs: Dict[str, int], path: Path) -> Path:
+    """Our answer set as a bgzipped, indexed VCF: every record with its genotype, germline and synthetic alike - all
+    the score sees of a truth file (the SYNTHETIC flag is written for reading; the score never uses it)."""
+    import pysam
+    recs = [(v, False) for v in germline] + [(v, True) for v, _ in synthetic]
+    order = {c: i for i, c in enumerate(contigs)}
+    recs.sort(key=lambda t: (order.get(t[0].chrom, len(order)), t[0].pos, t[0].ref, t[0].alt))
+    path = Path(path)
+    text = path.with_name(path.name[:-len(".gz")] if path.name.endswith(".gz") else path.name + ".txt")
+    with open(text, "w") as f:
+        f.write("##fileformat=VCFv4.2\n")
+        f.writelines(f"##contig=<ID={c},length={n}>\n" for c, n in contigs.items())
+        f.write('##INFO=<ID=SYNTHETIC,Number=0,Type=Flag,Description="Predicted injected variant">\n')
+        f.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n')
+        f.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tANSWER\n")
+        for v, syn in recs:
+            f.write(f"{v.chrom}\t{v.pos}\t.\t{v.ref}\t{v.alt}\t.\tPASS\t{'SYNTHETIC' if syn else '.'}\tGT\t{v.gt}\n")
+    pysam.tabix_compress(str(text), str(path), force=True)
+    pysam.tabix_index(str(path), preset="vcf", force=True)
+    text.unlink()
+    return path
+
+
+def answer_set_as_scored(result) -> dict:
+    """Our answer set scored like a callset against the released truth, through the validator's own path: what its
+    errors are worth to the score. Spellings of one variant match, labels are ignored, genotypes count. `core` is the
+    difficulty-weighted F1 (1.0 = no error the score can see); `core_points` = what its gap is worth in score points."""
+    from common.scoring import V2_CORE_WEIGHT
+    classes = {}
+    for k, c in result.counts.items():
+        f1 = 2 * c.tp / (2 * c.tp + c.fp + c.fn) if c.tp + c.fp + c.fn else None
+        classes[k] = {"tp": c.tp, "fn": c.fn, "fp": c.fp, "f1": None if f1 is None else round(f1, 5)}
+    core = result.core
+    return {"core": None if core is None else round(core, 5),
+            "missed": sum(c.fn for c in result.counts.values()), "extra": sum(c.fp for c in result.counts.values()),
+            "core_points": None if core is None else round(100 * V2_CORE_WEIGHT * (1 - core), 4),
+            "classes": classes}
 
 
 def pick_configs(configs: Dict[str, dict], final: Optional[str], baseline: Optional[str], top_k: int) -> List[str]:
@@ -195,6 +237,10 @@ class Reviewer:
             row["answer_set"] = answer_set_accuracy(ours["germline"], ours["synthetic"], oracle.germline,
                                                     [c.variant for c in oracle.synthetic], ours["n_targets"],
                                                     oracle.n_targets)
+            try:
+                row["answer_set"]["as_scored"] = self._answer_set_as_scored(rnd, oracle, ours, d)
+            except Exception as e:  # noqa: BLE001 - the strict numbers above still stand
+                log.warning("review %s: scoring our answer set failed: %s", run_id, e)
         configs = m.get("configs") or {}
         keys = pick_configs(configs, m.get("final_config"), m.get("baseline_config"), self.top_k)
         true, gate, rerun = self._true_scores(rnd, oracle, keys, configs, m)
@@ -268,6 +314,15 @@ class Reviewer:
             log.info("review %s: %d configs added to the portfolio (profile %s)", m["tag"], n, profile)
         except Exception as e:  # noqa: BLE001 - the portfolio must never lose a review
             log.warning("review: portfolio update failed: %s", e)
+
+    def _answer_set_as_scored(self, rnd: Round, oracle, ours: dict, run_dir: Path) -> dict:
+        import evaluator
+        with open(rnd.reference + ".fai") as f:
+            contigs = {c: int(n) for c, n, *_ in (line.split("\t") for line in f) if c == rnd.chrom}
+        vcf = write_answer_set_vcf(ours["germline"], ours["synthetic"], contigs, run_dir / "answer_set.vcf.gz")
+        self._scorer = self._scorer or evaluator.scorer()
+        res = self._scorer.score(CallSet(rnd.round_id, "answer-set", str(vcf), _sha(vcf), 0.0), oracle)
+        return answer_set_as_scored(res)
 
     def _append(self, row: dict) -> None:
         if self.board is not None:

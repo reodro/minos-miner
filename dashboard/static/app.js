@@ -357,8 +357,11 @@ function renderResult(res, finished) {
       rank ? `median ${fix(rank.field_median)}` : "", "k-configs"),
     kpi("Over the baseline", s.gain_over_baseline != null ? `+${fix(s.gain_over_baseline)}` : "–",
       s.spearman != null ? `local vs true order: Spearman ${fix(s.spearman, 2)}` : "", "k-gatk"),
-    kpi("Answer set", syn.precision != null ? `${fix(syn.precision, 3)} / ${fix(syn.recall, 3)}` : "–",
-      `synthetic precision / recall · germline ${ger.precision != null ? fix(ger.precision, 3) : "–"} / ${ger.recall != null ? fix(ger.recall, 3) : "–"}`, "k-answer"),
+    a.as_scored && a.as_scored.core != null
+      ? kpi("Answer set", fix(a.as_scored.core, 4),
+          `as scored · ${a.as_scored.missed} missed, ${a.as_scored.extra} extra (≤ ${fix(a.as_scored.core_points, 3)} pts) · strict synthetic ${syn.precision != null ? fix(syn.precision, 3) : "–"} / ${syn.recall != null ? fix(syn.recall, 3) : "–"}`, "k-answer")
+      : kpi("Answer set", syn.precision != null ? `${fix(syn.precision, 3)} / ${fix(syn.recall, 3)}` : "–",
+          `synthetic precision / recall · germline ${ger.precision != null ? fix(ger.precision, 3) : "–"} / ${ger.recall != null ? fix(ger.recall, 3) : "–"}`, "k-answer"),
   );
 }
 

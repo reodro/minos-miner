@@ -3,8 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from common.types import Variant
-from main.review import answer_set_accuracy, history, pick_configs, summarize
+from common.types import ClassCounts, ScoreResult, Variant
+from main.review import (answer_set_accuracy, answer_set_as_scored, history, pick_configs, summarize,
+                         write_answer_set_vcf)
 
 
 def v(pos, gt="0/1", alt="G"):
@@ -73,6 +74,26 @@ class HistoryTest(unittest.TestCase):
             self.assertEqual([r["run_id"] for r in rounds], ["T1-1", "T2-2"])
             self.assertEqual(reviewed, {"T1-1"})
             self.assertEqual(ranked, {"T1-1"})
+
+
+class AsScoredTest(unittest.TestCase):
+    def test_answer_set_vcf_holds_every_record_sorted_with_genotypes(self):
+        import pysam
+        with tempfile.TemporaryDirectory() as d:
+            path = write_answer_set_vcf([v(300, "1/1"), v(100)], [(v(200, alt="AT"), 0.9)], {"chr20": 1000},
+                                        Path(d) / "answer_set.vcf.gz")
+            self.assertTrue(Path(str(path) + ".tbi").exists())
+            with pysam.VariantFile(str(path)) as f:
+                got = [(r.pos, r.alts[0], "SYNTHETIC" in r.info, r.samples["ANSWER"]["GT"]) for r in f]
+        self.assertEqual(got, [(100, "G", False, (0, 1)), (200, "AT", True, (0, 1)), (300, "G", False, (1, 1))])
+
+    def test_as_scored_summary(self):
+        counts = {"snp_het": ClassCounts(98, 1, 1), "indel_1bp": ClassCounts(10, 0, 0)}
+        r = ScoreResult("r", "answer-set", 1, counts, 1, 548, core=0.99)
+        out = answer_set_as_scored(r)
+        self.assertEqual((out["core"], out["missed"], out["extra"]), (0.99, 1, 1))
+        self.assertAlmostEqual(out["core_points"], 0.7, places=4)
+        self.assertEqual(out["classes"]["indel_1bp"]["f1"], 1.0)
 
 
 if __name__ == "__main__":
