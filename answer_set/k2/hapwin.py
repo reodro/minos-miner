@@ -27,6 +27,9 @@ FEATS = ["post", "post2", "lr2", "anchored", "n_haps", "edit_other", "ref_reads"
          "called_indel", "answer_indel", "called_p_min", "called_p_max", "called_not_cand", "answer_p_min",
          "answer_p_max", "hp_max", "donor_in", "width"]
 KINDS = {"adds": 0, "removes": 1, "changes": 2}
+# window models trained with the GATK evidence (meta window_hc; hcrun.py): GATK's calls inside the window - how many,
+# whether their DNA pair is the genotyper's called pair or the answer's, their QUAL. A third opinion on the same DNA.
+FEATS_HC = ["hc_n", "hc_agree_called", "hc_agree_answer", "hc_qual_min", "hc_qual_max"]
 
 
 def save_windows(path, hg):
@@ -122,13 +125,17 @@ def _hp_max(seq):
     return best
 
 
-def candidates(windows, answer, p_of, donor, bed):
+def candidates(windows, answer, p_of, donor, bed, hc=None):
     """Windows inside the confident region whose called pair differs from the answer's, with their features.
     answer: {key: (zyg, synthetic)} (the per-variant answer, the person's records included); p_of: {key: model
-    score} of the per-variant candidates; donor: the person's GIAB records {key: zyg}. -> [(s, e, window,
+    score} of the per-variant candidates; donor: the person's GIAB records {key: zyg}; hc: the GATK run's calls
+    (hcrun.load_calls) for window models trained with them (FEATS + FEATS_HC). -> [(s, e, window,
     answer records inside [(key, zyg)], called events {key: zyg}, feature vector)]."""
     ak = sorted(answer)
     ap = [k[0] for k in ak]
+    if hc is not None:
+        hk = sorted(hc)
+        hp = [k[0] for k in hk]
     out = []
     for s, e, w in windows:
         if "called" not in w or not bed.contains(s) or not bed.contains(e) or bed.covered_bp(s, e) != e - s + 1:
@@ -170,7 +177,17 @@ def candidates(windows, answer, p_of, donor, bed):
              "answer_p_min": min([p_of.get(k, 2.0) for k in A], default=nan),
              "answer_p_max": max([p_of.get(k, 2.0) for k in A], default=nan),
              "hp_max": _hp_max(ref), "donor_in": float(sum(k in donor for k in A)), "width": e - s + 1}
-        out.append((s, e, w, [(k, answer[k][0]) for k in A], ev, np.array([f[n] for n in FEATS], dtype=float)))
+        names = FEATS
+        if hc is not None:
+            names = FEATS + FEATS_HC
+            H = _inside(hk, hp, s, e)
+            hps = pairs_of(ref, s, [(k, "hom" if hc[k]["hc_hom"] else "het") for k in H]) if H is not None else None
+            q = [hc[k]["hc_qual"] for k in H] if H else []
+            f.update(hc_n=nan if H is None else float(len(H)),
+                     hc_agree_called=nan if hps is None else float(called in hps),
+                     hc_agree_answer=nan if hps is None else float(bool(hps & aps)),
+                     hc_qual_min=min(q, default=nan), hc_qual_max=max(q, default=nan))
+        out.append((s, e, w, [(k, answer[k][0]) for k in A], ev, np.array([f[n] for n in names], dtype=float)))
     return out
 
 

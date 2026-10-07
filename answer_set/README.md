@@ -33,7 +33,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k023_20261006T1148) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k025_20261007T0751) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -162,6 +162,16 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   round fall in every indel class (>= 8 bp 0.089 -> 0.070, 1 bp 0.069 -> 0.059, 2-3 bp 0.069 -> 0.057); old-pattern
   rounds +0.008 (t 2.10, better 26 / equal 5 / worse 15, worst -0.080). Ranking 18 near-top GATK configs on 4 rounds:
   0/411 close pairs misordered, as k022.
+- k025 (1000G, released 2026-10-07) = k023's recipe (person's part by the rule, hapgeno, round_feats) plus three
+  read-comparison columns in that round context (`rd_frac_rel`, `rd_site_n`, `rd_site_sup`; k023 used only the first
+  three of `tracks.ROUND_FEATS`): edited-read fraction against the round's het level of edited indels, other edited
+  alleles at the position, and edited-read cover of the site. 147 of 153 inserted het indels k023 missed while fewer
+  than 10% of the alignments showed them were seen by the read comparison — at 10-20% of the reads (the new pattern's
+  low-fraction hets) or as two inserted alleles splitting the reads. Trained on 64 rounds (k023's 59 plus 5 later
+  new-pattern); 8 newest new-pattern rounds held out. hap.py vs k023 on those 8 (full models, never in training):
+  mean +0.071 per round (t 3.75, better 7/8, worst -0.0005); mean score 99.506 -> 99.577; FN down in every class.
+  Six old-pattern fold rounds: +0.009 (t 0.73, better 4 / worse 2). Worst frozen round 20261006T201700Z (HG01953)
+  99.123 -> 99.185.
 
 ## Open work
 
@@ -170,8 +180,8 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   spots with no window.
 - **Spelling**: ~28% of replaced windows are still not spelled exactly like Minos (~17% need spellings no option
   produces yet).
-- **1000G**: the person's part is exact (k012); what is left is the inserted mutations (~4 missed + ~2 extra 1-bp
-  indels per round) - the model still trains on every candidate; training it only on candidates outside the person's
-  list (as GIAB) may help. A new round (2026-10-04 10:41) had fewer extras (62) and more inserted
-  1-bp indels (19% of inserted, before ~11%) - watch whether Minos changed its 1000G mix.
+- **1000G**: the person's part is exact (k012). Live new-pattern rounds (from 2026-10-05 05:53) still cost ~0.4 points
+  vs old-pattern; k025 recovered +0.07 of that on frozen rounds. Worst leftover is HG01953-style high-FP rounds
+  (~99.19). The model still trains on every candidate; training it only on candidates outside the person's list
+  (as GIAB) may help.
 - **`update()` during a live round** (parked by the user).

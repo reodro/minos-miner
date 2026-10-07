@@ -473,6 +473,36 @@ class K2AssembleTest(unittest.TestCase):
         self.assertEqual([r[:5] for r in recs], [(100, "A", "G", "het", False)])        # 1000G: nothing SYNTHETIC
 
 
+class K2RoundFeatsTest(unittest.TestCase):
+    """1000G round-level columns (k022+) plus the k024 read-comparison site context. k023 only uses the first three."""
+
+    def test_six_columns_and_k023_indices(self):
+        import numpy as np
+        from answer_set.k2 import tracks
+        from answer_set.k2.features import FEATURES
+        n = 200
+        X = np.full((n, len(FEATURES)), np.nan)
+        X[:, FEATURES.index("is_indel")] = 1
+        X[:, FEATURES.index("rd_support")] = 5
+        X[:, FEATURES.index("alt_frac")] = np.linspace(0.2, 0.95, n)
+        X[:, FEATURES.index("rd_frac")] = np.linspace(0.15, 0.9, n)
+        X[:, FEATURES.index("rd_cover")] = 20
+        pos = np.array([100 + i // 3 for i in range(n)])
+        Y = tracks.with_round_feats(X, pos)
+        self.assertEqual(Y.shape, (n, len(FEATURES) + 6))
+        self.assertFalse(np.all(np.isnan(Y[:, -6:])))
+        base = len(FEATURES)
+        self.assertEqual([tracks.col_index(x) for x in tracks.ROUND_FEATS], list(range(base, base + 6)))
+        self.assertTrue(np.any(Y[:, tracks.col_index("rd_site_n")] >= 1))
+
+    def test_new_name_skips_gaps(self):
+        from unittest import mock
+        from answer_set.k2 import tracks
+        with mock.patch.object(tracks, "all_versions", return_value=["k006_a", "k007_b", "k023_c"]):
+            name = tracks.new_name("kg")
+        self.assertTrue(name.startswith("k024_"), name)
+
+
 ROUND_1641 = os.path.join(SETTINGS.rounds_dir, "20261001T164100Z")
 
 

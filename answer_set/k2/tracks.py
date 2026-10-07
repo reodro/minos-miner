@@ -42,7 +42,8 @@ GIAB_ONLY = ["in_mode_donor", "in_donor_bed", "donor_dist_log", "donor_indel_nea
              "hap_alt", "hap_ref", "hap_n", "hap_frac", "hap_rank", "hap_margin", "hap_cluster",
              "only_rd", "rd_orig", "rd_orig_frac", "rd_sib_max", "rd_sib_ratio",
              "only_hg", "hg_post", "hg_hom", "hg_reads", "hg_anchored", "hg_lr", "hg_n_haps", "hg_rd_sup", "hg_rd_ori",
-             "hg_edit", "hg_edit_ori", "hg_unedit", "hg_win_edit_other", "hg_edit_q"]
+             "hg_edit", "hg_edit_ori", "hg_unedit", "hg_win_edit_other", "hg_edit_q",
+             "only_hc", "hc_called", "hc_qual", "hc_gq", "hc_af", "hc_hom", "hc_near"]
 KG_ONLY = ["kg_mode", "in_dragen", "dragen_qual", "dragen_gq", "dragen_hom", "in_panel", "only_dragen",
            "dragen_and_gatk", "gatk_person_checked", "gatk_person_called", "gatk_person_same_gt",
            "spot_gt_same", "disagree10", "disagree30", "disagree100", "gatk_alleles_near",
@@ -104,6 +105,7 @@ RD_FEATS = ["rd_support", "rd_cover", "rd_frac", "only_rd", "rd_orig", "rd_orig_
 
 
 HG_SET = [f for f in GIAB_ONLY if f.startswith("hg_") or f == "only_hg"]   # the genotyper's measurements
+HC_SET = [f for f in GIAB_ONLY if f.startswith("hc_") or f == "only_hc"]   # the GATK evidence (hcrun.py)
 
 # Round-level measurements (kg versions with meta round_feats), computed from the candidate table itself, appended after
 # FEATURES. From the 2026-10-05 05:53 round Minos inserts 1000G indels at lower read fractions (inserted hom indels
@@ -111,12 +113,18 @@ HG_SET = [f for f in GIAB_ONLY if f.startswith("hg_") or f == "only_hg"]   # the
 # comparison shows as Minos's edits (rd_support >= 3), (share at 0.6-0.85) / (share >= 0.85) was 0.15-0.49 in all 46
 # earlier rounds and 0.87-1.01 after, the het mode's median 0.44-0.46 before and 0.37-0.39 after: the round tells which
 # pattern it has, so the model need not guess from a date.
-ROUND_FEATS = ["rnd_ind_ratio", "rnd_ind_hetmed", "alt_frac_rel"]
+# k025 (2026-10-07): the read comparison in the same round context. 147 of 153 inserted het indels k023 missed while
+# fewer than 10% of the alignments showed them were seen by the read comparison - at 10-20% of the reads (the new
+# pattern's low-fraction hets, which the old rounds taught the model to treat as noise), or as two inserted alleles
+# at one position splitting the reads. rd_frac_rel: the edited-read fraction against the round's het level of edited
+# indels; rd_site_n: other edited alleles at the position; rd_site_sup: edited reads of every allele at it / cover.
+ROUND_FEATS = ["rnd_ind_ratio", "rnd_ind_hetmed", "alt_frac_rel", "rd_frac_rel", "rd_site_n", "rd_site_sup"]
 ROUND_MIN_INDELS = 100
 
 
-def with_round_feats(X):
-    """X (FEATURES columns first) with ROUND_FEATS appended; NaN where the round has too few edited indels."""
+def with_round_feats(X, pos=None):
+    """X (FEATURES columns first) with ROUND_FEATS appended; NaN where the round has too few edited indels (and the
+    per-position columns NaN without pos, the candidates' positions)."""
     import numpy as np
     n = len(X)
     out = np.full((n, len(ROUND_FEATS)), np.nan)
@@ -130,6 +138,22 @@ def with_round_feats(X):
             out[:, 0] = np.mean((a >= 0.6) & (a < 0.85)) / max(hi, 0.01)
             out[:, 1] = np.median(het)
             out[:, 2] = af / (2 * out[0, 1])
+        rs = np.nan_to_num(X[:, FEATURES.index("rd_support")])
+        rf = X[:, FEATURES.index("rd_frac")]
+        ind = X[:, FEATURES.index("is_indel")] == 1
+        e = rf[ind & (rs >= 3) & (rf > 0.15) & (rf < 0.6)]
+        if len(e) >= ROUND_MIN_INDELS:
+            out[:, 3] = rf / (2 * np.median(e))
+        if pos is not None:
+            pos = np.asarray(pos)
+            u, inv = np.unique(pos, return_inverse=True)
+            has = (rs >= 2).astype(float)
+            n_at = np.bincount(inv, weights=has, minlength=len(u))
+            sup_at = np.bincount(inv, weights=rs, minlength=len(u))
+            cov = np.nan_to_num(X[:, FEATURES.index("rd_cover")])
+            cov_at = np.zeros(len(u)); np.maximum.at(cov_at, inv, cov)
+            out[:, 4] = n_at[inv] - has
+            out[:, 5] = np.where(cov_at[inv] > 0, sup_at[inv] / np.maximum(cov_at[inv], 1), np.nan)
     return np.hstack([X[:, :len(FEATURES)], out])
 
 
@@ -173,7 +197,15 @@ def all_versions(track):
 
 
 def new_name(track):
-    return f"{PREFIX[track]}{len(all_versions(track)) + 1:03d}_{time.strftime('%Y%m%dT%H%M', time.gmtime())}"
+    """Next version name: one past the highest number already used (skipped numbers stay skipped)."""
+    n = 0
+    pre, plen = PREFIX[track], len(PREFIX[track])
+    for v in all_versions(track):
+        if v.startswith(pre) and "_" in v[plen:]:
+            num = v[plen:v.index("_", plen)]
+            if num.isdigit():
+                n = max(n, int(num))
+    return f"{pre}{n + 1:03d}_{time.strftime('%Y%m%dT%H%M', time.gmtime())}"
 
 
 def active_name(track):

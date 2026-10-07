@@ -35,6 +35,10 @@ KG_READDIFF = int(os.environ.get("MINOS_KG_RD", "0"))
 # 1000G rounds: the local haplotype genotyper too (hapgeno.py, against the person's public originals); follows the
 # 1000G model (meta kg_hapgeno = the hapgeno.VERSION it was trained with; build.py sets it). Needs KG_READDIFF.
 KG_HAPGENO = int(os.environ.get("MINOS_KG_HG", "0"))
+# GIAB rounds: a GATK HaplotypeCaller run with one fixed configuration (hcrun.py) as evidence - its calls the other
+# steps never listed become candidates (only_hc), and every candidate gets the run's call (hc_*). Follows the GIAB model
+# (meta hc_evidence = the hcrun.VERSION it was trained with; build.py sets it); prepare.py --hc turns it on.
+HC_EVIDENCE = int(os.environ.get("MINOS_HC", "0"))
 HG_CALL = 0.5                   # genotyper events at least this likely become candidates,
 HG_EDIT_ORI = 2                 # and so do events carried by edited reads from at least this many originals
 HG_FEATS = ("hg_post", "hg_hom", "hg_reads", "hg_anchored", "hg_lr", "hg_n_haps", "hg_edit", "hg_edit_ori", "hg_unedit",
@@ -96,6 +100,9 @@ FEATURES = [
     # the event, the distinct originals they came from, unedited reads carrying it (the donor's own DNA), and edited
     # reads in the window carrying other sequences (local Minos noise)
     "hg_edit", "hg_edit_ori", "hg_unedit", "hg_win_edit_other", "hg_edit_q",
+    # GIAB: the fixed-configuration GATK run (hcrun.py): found only by it, and its call at each candidate - called,
+    # QUAL, GQ, its read fraction, hom, another of its calls within 10 bp (the same event written otherwise)
+    "only_hc", "hc_called", "hc_qual", "hc_gq", "hc_af", "hc_hom", "hc_near",
 ]
 
 
@@ -489,6 +496,31 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
                 n_hg_only += 1
             rd_info["hg_candidates_added"] = n_hg_only
             rd_info["hg_windows"] = len(wins)
+    hc = None
+    if HC_EVIDENCE and mode_giab:
+        from answer_set.k2 import hcrun
+        try:
+            hc = hcrun.run(str(bam), str(ref_path(chrom)), chrom, a, b, workdir, pieces=max(1, threads))
+        except Exception as e:  # noqa: BLE001  (never stuck: the model sees NaN for the run's measurements)
+            rd_info["hc_error"] = str(e)[:500]
+        if hc is not None:
+            n_hc_only = 0
+            for k in hc:
+                if (k in cands or k in own or not (a <= k[0] <= b) or abs(len(k[1]) - len(k[2])) > 50
+                        or not (dbed.contains(k[0]) and dbed.contains(k[0] + len(k[1]) - 1))):
+                    continue
+                L = len(k[2]) - len(k[1])
+                f = {n: np.nan for n in FEATURES}
+                f.update(is_indel=float(L != 0), indel_len=float(L), abs_len=float(abs(L)), alt_n=0.0, only_hc=1.0)
+                i = k[0] - lo
+                f["hp_len"], f["hp_len_after"] = _hp(seq, i)
+                f["str_period2"] = _str2(seq, i)
+                w = seq[max(0, i - 50): i + 51]
+                f["gc50"] = (w.count("G") + w.count("C")) / max(1, len(w))
+                cands[k] = f
+                n_hc_only += 1
+            rd_info["hc_calls"] = len(hc)
+            rd_info["hc_candidates_added"] = n_hc_only
     keys = list(cands)
     prof = tract_profiles(bam, chrom, lo, seq, [k for k in keys if len(k[1]) != len(k[2])])
     if mode_giab:
@@ -611,6 +643,19 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
         for n_ in localhap.FEATS if mode_giab else ("hap_alt", "hap_ref", "hap_n", "hap_frac", "hap_rank",
                                                       "hap_margin", "hap_cluster"):
             f[n_] = float(h_[n_]) if h_ else np.nan
+    if hc is not None:
+        hc_keys = sorted(hc)
+        hc_pos = [k[0] for k in hc_keys]
+        for k in keys:
+            f = cands[k]
+            v = hc.get(k)
+            f["hc_called"] = float(v is not None)
+            for n_ in ("hc_qual", "hc_gq", "hc_af", "hc_hom"):
+                f[n_] = v[n_] if v else np.nan
+            j0, j1 = bisect.bisect_left(hc_pos, k[0] - 10), bisect.bisect_right(hc_pos, k[0] + len(k[1]) + 10)
+            f["hc_near"] = float(any(o != k for o in hc_keys[j0:j1]))
+            if np.isnan(f.get("only_hc", np.nan)):
+                f["only_hc"] = 0.0
     X = np.array([[cands[k].get(n, np.nan) for n in FEATURES] for k in keys], dtype=float)
     info = {"mode_donor": mode_donor, "mode_giab": bool(mode_giab), "donor_scores": donor_scores,
             "n_candidates": len(keys), "median_dp": med_dp, "kg": kg_info, "n_dragen": len(dragen)}
@@ -618,4 +663,5 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
     info["readdiff"] = rd_info
     info["kg_readdiff"] = int(bool(KG_READDIFF) and not mode_giab)
     info["kg_hapgeno"] = int(KG_HAPGENO) if (not mode_giab and rd_on and hg_window is not None) else 0
+    info["hc_evidence"] = int(HC_EVIDENCE) if hc is not None else 0
     return keys, X, info, donors, beds

@@ -33,6 +33,9 @@ def window_model():
                                           random_state=0)
 
 
+HC = False                       # --hc: window features with the GATK evidence (hapwin.FEATS_HC, meta window_hc)
+
+
 def round_rows(r, base, cost):
     """(features, label, answer right, gain if fixed, loss if broken) for a prepared round's candidate windows."""
     tag = r["name"]
@@ -47,7 +50,14 @@ def round_rows(r, base, cost):
     pa = tracks.apply_source_thr(meta, r["X"], tracks.apply_class_thr(meta, keys, p_raw), p_raw)
     answer = assemble(r, pa, ph, meta["threshold"], meta.get("bed_rule", True))
     bed = Bed(donor_bed(r["info"]["mode_donor"]), parse_region(r["info"]["region"])[0])
-    cands = hapwin.candidates(hapwin.load_windows(wpath), answer, dict(zip(keys, p_raw)), r["_donor"], bed)
+    hc = None
+    if HC:
+        from answer_set.k2 import hcrun
+        hpath = CACHE / "prepare" / tag / "hc.norm.vcf.gz"
+        if not hpath.exists():
+            return None
+        hc = hcrun.load_calls(hpath)
+    cands = hapwin.candidates(hapwin.load_windows(wpath), answer, dict(zip(keys, p_raw)), r["_donor"], bed, hc)
     if not cands:
         return None
     y, ok = hapwin.label(cands, truth_of(r))
@@ -58,7 +68,10 @@ def round_rows(r, base, cost):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", required=True, help="GIAB track version whose answers the windows correct")
+    ap.add_argument("--hc", action="store_true", help="with the GATK evidence (needs rounds prepared with --hc)")
     args = ap.parse_args()
+    global HC
+    HC = args.hc
     t0 = time.time()
     bmeta = tracks.meta("giab", args.base)
     rs = load(set(bmeta["rounds"]))
@@ -99,7 +112,8 @@ def main():
     name = tracks.new_name("giab")
     src, dst = tracks.vdir("giab", args.base), tracks.dev_dir("giab", name)
     dst.mkdir(parents=True, exist_ok=True)
-    for f in list(tracks.RELEASE_FILES) + [f"fold{i}_{k}.joblib" for i in range(10) for k in ("model", "hom")]:
+    for f in list(tracks.RELEASE_FILES) + ["spelling.joblib"] + \
+            [f"fold{i}_{k}.joblib" for i in range(10) for k in ("model", "hom", "spelling")]:
         for d in (src, tracks.dev_dir("giab", args.base)):
             if (d / f).exists():
                 shutil.copy2(d / f, dst / f)
@@ -107,7 +121,9 @@ def main():
     joblib.dump(final, dst / "window.joblib")
     for f, mdl in fold_models.items():
         joblib.dump(mdl, dst / f"fold{f}_window.joblib")
-    meta = dict(bmeta, created=tracks.now(), window_thr=thr, window_features=hapwin.FEATS, window_base=args.base,
+    bmeta = {k: v for k, v in bmeta.items() if k not in ("window_thr_group", "window_thr_group_of")}  # the old model's
+    meta = dict(bmeta, created=tracks.now(), window_thr=thr, window_base=args.base, window_hc=int(HC),
+                window_features=hapwin.FEATS + (hapwin.FEATS_HC if HC else []),
                 window_heldout={"fixed": table[thr][1], "broken": table[thr][2], "net_snp_units": round(table[thr][0], 1)})
     (dst / "meta.json").write_text(json.dumps(meta, indent=1))
     tracks.log("giab", "train_window", version=name, base=args.base, threshold=thr)

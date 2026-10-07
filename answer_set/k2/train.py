@@ -4,6 +4,8 @@ Prepared rounds live in this clone's <cache_dir>/answer_set/k2/prepared/ (prepar
 <tag>.json (round info) and <tag>.truth.norm.vcf.gz (the released truth, normalised like the candidates).
 """
 import json
+import os
+from pathlib import Path
 
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
@@ -11,7 +13,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from answer_set.k2.features import FEATURES
 from answer_set.k2.util import CACHE, parse_region, read_alleles
 
-PREPARED = CACHE / "prepared"
+PREPARED = Path(os.environ["MINOS_PREPARED"]) if os.environ.get("MINOS_PREPARED") else CACHE / "prepared"
 IN_DONOR = FEATURES.index("in_mode_donor")
 
 N_BEFORE_SPOT = FEATURES.index("spot_gt_same")   # measurements appended later are padded for old rounds
@@ -22,6 +24,7 @@ N_BEFORE_GATKONLY = FEATURES.index("only_gatk")
 N_BEFORE_RDX = FEATURES.index("only_rd")
 N_BEFORE_SIB = FEATURES.index("rd_sib_max")
 N_BEFORE_HG = FEATURES.index("only_hg")
+N_BEFORE_HC = FEATURES.index("only_hc")
 N_DROPPED_AT_END = 2                               # noise_lambda, noise_logp: prepared, then dropped (hurt new rounds)
 
 
@@ -38,13 +41,17 @@ def load(names=None):
         if n == len(FEATURES) + N_DROPPED_AT_END:
             d["X"] = d["X"][:, :len(FEATURES)]
             n = len(FEATURES)
+        elif n == N_BEFORE_HC + N_DROPPED_AT_END:      # prepared before the GATK evidence, with the dropped columns
+            d["X"] = d["X"][:, :N_BEFORE_HC]
+            n = N_BEFORE_HC
         if n > len(FEATURES) or (n < len(FEATURES) and n not in (N_BEFORE_SPOT, N_BEFORE_MASK, N_BEFORE_ANNOT, N_BEFORE_RD,
                                                                    N_BEFORE_GATKONLY, N_BEFORE_RDX, N_BEFORE_SIB,
-                                                                   N_BEFORE_HG)):
+                                                                   N_BEFORE_HG, N_BEFORE_HC)):
             continue                               # prepared with an older feature set (re-run prepare)
         if n < len(FEATURES):                      # prepared before later measurements: unknown (NaN)
             d["X"] = np.hstack([d["X"], np.full((len(d["X"]), len(FEATURES) - n), np.nan)])
-            info["no_hg_features"] = True
+            info["no_hc_features"] = True
+            info["no_hg_features"] = n < N_BEFORE_HC
             info["no_sib_features"] = n < N_BEFORE_HG
             info["no_rdx_features"] = n < N_BEFORE_SIB
             info["no_gatkonly_features"] = n < N_BEFORE_RDX

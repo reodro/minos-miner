@@ -117,6 +117,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         gmeta = tracks.meta("giab", gname)
         features.RD_1BP_FACTOR = gmeta.get("rd_1bp_factor", 1.0)
         features.HAP_GENOTYPER = int(gmeta.get("hap_genotyper", 0))      # True (g009) == 1
+        features.HC_EVIDENCE = int(gmeta.get("hc_evidence", 0))
     kname = (track_versions or {}).get("kg") or tracks.active_name("kg")
     features.KG_READDIFF = int(tracks.meta("kg", kname).get("kg_readdiff", 0)) if kname else 0
     features.KG_HAPGENO = int(tracks.meta("kg", kname).get("kg_hapgeno", 0)) if kname else 0
@@ -128,7 +129,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     thr = meta["threshold"]
     meta = dict(meta, giab_bed_rule=meta.get("bed_rule", False))
     if meta.get("round_feats") and len(keys):                   # round-level measurements (tracks.ROUND_FEATS)
-        X = tracks.with_round_feats(X)
+        X = tracks.with_round_feats(X, np.array([k[0] for k in keys]))
     X_full = X
     if meta.get("features") and meta["features"] != FEATURES:      # use exactly its own columns
         X = X[:, [tracks.col_index(n) for n in meta["features"]]] if len(keys) else X
@@ -171,8 +172,13 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         from answer_set.k2 import hapwin
         wm = tracks.load_window(track, (track_versions or {}).get(track) or tracks.active_name(track), exclude_round)
         answer = {(r[0], r[1], r[2]): (r[3], r[4]) for r in recs}
+        hc_calls = None
+        if meta.get("window_hc"):                       # window model trained with the GATK evidence (hcrun.py)
+            from answer_set.k2 import hcrun
+            hp_ = out / "work" / "hc.norm.vcf.gz"
+            hc_calls = hcrun.load_calls(hp_) if hp_.exists() else {}
         cands = hapwin.candidates(hapwin.load_windows(out / "work" / "hg_windows.pkl.gz"), answer,
-                                  dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]])
+                                  dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]], hc_calls)
         if cands:
             pw = wm.predict_proba(np.vstack([c[5] for c in cands]))[:, 1]
             vname = (track_versions or {}).get(track) or tracks.active_name(track)
