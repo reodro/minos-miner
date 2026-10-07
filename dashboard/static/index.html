@@ -6,9 +6,9 @@
 <title>Minos dashboard</title>
 <script src="/static/theme.js?v=17"></script>
 <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
-<link rel="stylesheet" href="/static/app.css?v=17">
+<link rel="stylesheet" href="/static/app.css?v=24">
 <script src="/static/vendor/uPlot.iife.min.js" defer></script>
-<script src="/static/app.js?v=17" defer></script>
+<script src="/static/app.js?v=24" defer></script>
 </head>
 <body>
 <header class="top">
@@ -17,7 +17,7 @@
   <span class="chip" id="phase-chip">–</span>
   <div class="spacer"></div>
   <div class="muted num" id="updated"></div>
-  <nav class="tabs" aria-label="Views"><a href="#live" id="tab-live" class="on">Live</a><a href="#settings" id="tab-settings">Settings</a></nav>
+  <nav class="tabs" aria-label="Views"><a href="#live" id="tab-live" class="on">Live</a><a href="#history" id="tab-history">History</a><a href="#settings" id="tab-settings">Settings</a></nav>
   <button class="btn theme-toggle" id="theme" type="button">Dark</button>
   <button class="btn" id="logout" type="button">Log out</button>
 </header>
@@ -81,6 +81,19 @@
   <section class="panel" aria-labelledby="h-feed">
     <h2 id="h-feed">Events <span class="sub">engine decisions, setting changes and warnings, newest first</span></h2>
     <div class="feed" id="feed"></div>
+  </section>
+</main>
+
+<main id="view-history" hidden>
+  <div class="settings-bar" role="toolbar" aria-label="History actions">
+    <h2>History</h2>
+    <span class="muted" id="history-state"></span>
+    <div class="spacer"></div>
+    <button class="btn" id="history-refresh" type="button">Refresh</button>
+  </div>
+  <section class="panel">
+    <div class="muted">Finished runs, newest first. Select one to see its scores, the search, and the answer set.</div>
+    <div class="hist" id="history-list"></div>
   </section>
 </main>
 

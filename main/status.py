@@ -66,6 +66,7 @@ class StatusBoard:
         self._baseline: Optional[str] = None
         self._baseline_cfg: Optional[dict] = None
         self._util: list = []                               # running / workers samples for average utilization
+        self._workers = 0                                   # most GATK workers seen during this round
         self._ex0: Optional[dict] = None                    # executor counters at the round's first tick
         self._seen: set = set()                             # config keys already plotted
         self._tuning0: Optional[dict] = None                # the settings in force when the round started
@@ -78,6 +79,7 @@ class StatusBoard:
 
     def _started(self, round, deadline_ts, baselines):
         self._client, self._answer, self._util, self._ex0, self._seen = None, None, [], None, set()
+        self._workers = 0
         self._tuning0 = dict(TUNING.values)
         self._baseline = baselines[0].key if baselines else None
         self._baseline_cfg = baselines[0].to_dict() if baselines else None
@@ -99,7 +101,7 @@ class StatusBoard:
         n = a.notes or {}
         self.state["answer_set"] = {
             "regime": a.regime.value, "donor": a.donor, "germline": len(a.germline), "synthetic": len(a.synthetic),
-            "n_targets": a.n_targets, "n_targets_source": n.get("n_targets_source"), "seconds": n.get("seconds"),
+            "n_targets": a.n_targets, "n_targets_source": n.get("n_targets_source"), "seconds": _build_seconds(n),
             "degraded": n.get("degraded"), "version": a.version,
             "ready_ts": (self.state.get("answer_set") or {}).get("ready_ts") or time.time(),   # the first version's
             "composition": {"germline": _composition(a.germline),
@@ -152,6 +154,7 @@ class StatusBoard:
         self.state["executor"] = ex
         if ex and ex.get("workers"):
             self._util.append(ex.get("running", 0) / ex["workers"])
+            self._workers = max(self._workers, int(ex["workers"]))
         self._write()
 
     def round_ended(self, mined) -> None:
@@ -189,7 +192,7 @@ class StatusBoard:
                "started": started, "ended": ended,
                "answer_set": {"regime": a.get("regime"), "donor": a.get("donor"), "n_targets": a.get("n_targets"),
                               "n_targets_source": a.get("n_targets_source"),
-                              "build_s": round(sum((a.get("seconds") or {}).values()), 1) if a.get("seconds") else None,
+                              "build_s": a.get("seconds"),
                               "degraded": a.get("degraded"), "composition": a.get("composition")},
                "evaluator": {"kind": ex.get("kind"), "evaluated": evaluated, "failed": out.failed if out else 0,
                              "per_min": round(evaluated / max((ended - started) / 60, 1e-9), 2),
@@ -199,6 +202,7 @@ class StatusBoard:
                              "batches": (ex.get("round") or {}).get("batches_run"),
                              "repairs": (ex.get("round") or {}).get("repairs_run"),
                              "nodes": len(ex.get("nodes") or []) or None,
+                             "workers": self._workers or (int(ex["workers"]) if ex.get("workers") else None),
                              "utilization": round(sum(self._util) / len(self._util), 3) if self._util else None},
                "search": {"best_local": best, "final_config": final, "baseline_config": self._baseline,
                           "baseline_local": local.get(self._baseline),
@@ -273,6 +277,20 @@ class StatusBoard:
 
 
 # ---- summaries (plain python; the dashboard only formats them) -----------------------------------------------------
+def _build_seconds(notes: dict):
+    """Build time in seconds. k2 stores it on the report as {features, total}; older notes stored a dict to sum."""
+    secs = (notes or {}).get("seconds") or ((notes or {}).get("report") or {}).get("seconds")
+    if isinstance(secs, (int, float)) and not isinstance(secs, bool):
+        return round(secs, 1)
+    if isinstance(secs, dict):
+        total = secs.get("total")
+        if isinstance(total, (int, float)) and not isinstance(total, bool):
+            return round(total, 1)
+        parts = [v for v in secs.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return round(sum(parts), 1) if parts else None
+    return None
+
+
 def _composition(variants, ps=None) -> dict:
     """SNP/indel split, genotype counts (het/hom), het:hom ratio, Ti/Tv of SNPs; for synthetic also the confidence."""
     snp = indel = het = hom = other = ti = tv = 0

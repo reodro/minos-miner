@@ -81,12 +81,15 @@ async function api(path, opts = {}) {
 
 // ---- tabs -----------------------------------------------------------------------------------------------------------
 function showTab() {
-  const settings = location.hash === "#settings";
-  $("view-live").hidden = settings;
-  $("view-settings").hidden = !settings;
-  $("tab-live").classList.toggle("on", !settings);
-  $("tab-settings").classList.toggle("on", settings);
-  if (settings) loadSettings();
+  const hash = location.hash === "#settings" ? "settings" : location.hash === "#history" ? "history" : "live";
+  $("view-live").hidden = hash !== "live";
+  $("view-history").hidden = hash !== "history";
+  $("view-settings").hidden = hash !== "settings";
+  $("tab-live").classList.toggle("on", hash === "live");
+  $("tab-history").classList.toggle("on", hash === "history");
+  $("tab-settings").classList.toggle("on", hash === "settings");
+  if (hash === "settings") loadSettings();
+  else if (hash === "history") loadHistory();
   else if (chart) setTimeout(sizeChart, 0);
 }
 window.addEventListener("hashchange", showTab);
@@ -657,6 +660,96 @@ $("save").addEventListener("click", async () => {
     updateButtons();
   }
 });
+
+// ---- history: finished runs from rounds.jsonl. Loaded when the tab opens, not on the live poll. ----
+let historyRuns = [];
+let historySelected = null;
+
+function when(ts) {
+  if (ts == null) return "";
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`;
+}
+function rankOf(r) {
+  if (r.rank == null || r.field == null) return "–";
+  return `${int(r.rank)} / ${int(r.field)}`;
+}
+function searchedFor(r) {
+  if (r.started == null || r.ended == null) return "–";
+  const min = Math.max(0, Math.round((r.ended - r.started) / 60));
+  const h = Math.floor(min / 60), m = min % 60;
+  return h ? `${h} h ${m} min` : `${m} min`;
+}
+function reviewState(r) {
+  if (r.ranked) return ["ranked", "good"];
+  if (r.reviewed) return ["reviewed", "warn"];
+  return ["waiting", ""];
+}
+function stat(tone, label, value) {
+  return h("div", {class: `hist-stat ${tone}`}, h("div", {class: "label", text: label}), h("div", {class: "value", text: value}));
+}
+function group(title, tiles) {
+  return h("div", {class: "hist-group"}, h("div", {class: "cap", text: title}), h("div", {class: "hist-stats"}, ...tiles));
+}
+
+async function loadHistory() {
+  $("history-state").textContent = "Loading…";
+  try {
+    const r = await api("/api/history");
+    if (!r.ok) { $("history-state").textContent = "Could not load history."; return; }
+    const body = await r.json();
+    historyRuns = body.runs || [];
+    if (historySelected && !historyRuns.some((x) => x.run_id === historySelected)) historySelected = null;
+    $("history-state").textContent = historyRuns.length ? `${historyRuns.length} finished runs` : "No finished runs yet.";
+    renderHistory();
+  } catch (e) { /* a 401 already sent the browser to the login page */ }
+}
+
+function renderHistory() {
+  const list = $("history-list");
+  if (!historyRuns.length) {
+    list.replaceChildren(h("div", {class: "muted", text: "No finished runs yet."}));
+  } else {
+    list.replaceChildren(...historyRuns.flatMap((r) => {
+      const sel = r.run_id === historySelected;
+      const item = h("article", {class: sel ? "hist-run sel" : "hist-run",
+        onclick: () => { historySelected = sel ? null : r.run_id; renderHistory(); }},
+        h("div", {class: "who"}, r.tag || r.run_id,
+          h("span", {class: "sub", text: [r.region, r.kind, when(r.ended || r.started)].filter(Boolean).join(" · ")})),
+        h("span", {class: "spacer"}),
+        h("span", {class: `chip ${reviewState(r)[1]}`, text: reviewState(r)[0]}));
+      if (!sel) return item;
+      const trueScore = r.true_score != null ? r.true_score : r.final_true;
+      const local = r.final_local != null ? r.final_local : r.best_local;
+      const germ = r.germline_truth ? `${int(r.germline_match)} / ${int(r.germline_truth)}` : "–";
+      const n = r.n_truth != null ? `${int(r.n_ours)} / ${int(r.n_truth)}` : int(r.n_ours);
+      const who = [r.regime, r.donor].filter(Boolean).join(" ") || "–";
+      return [item, h("div", {class: "hist-detail"},
+        group("Score", [
+          stat("score", "TRUE", fix(trueScore, 3)),
+          stat("score", "Local at submit", fix(local, 3)),
+          stat("score", "Rank", rankOf(r)),
+          stat("score", "Field best", fix(r.field_best, 3)),
+          stat("score", "Gap", fix(r.gap_to_best, 3)),
+        ]),
+        group("Search", [
+          stat("work", "Workers", int(r.workers)),
+          stat("work", "Evaluated", int(r.evaluated)),
+          stat("work", "Searched", searchedFor(r)),
+        ]),
+        group("Answer set", [
+          stat("set", "Donor", who),
+          stat("set", "Score", r.answer_score != null ? fix(r.answer_score, 4) : "–"),
+          stat("set", "Germline exact", germ),
+          stat("set", "N", n),
+          stat("set", "Build", r.build_s != null ? `${fix(r.build_s, 0)} s` : "–"),
+        ]))];
+    }));
+  }
+}
+
+$("history-refresh").addEventListener("click", loadHistory);
 
 // ---- start ----------------------------------------------------------------------------------------------------------
 showTab();

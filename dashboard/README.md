@@ -1,7 +1,7 @@
 # dashboard
 
 The live dashboard on main: what the miner is doing right now, and an editor for the search's settings. It is
-behind a login. History is not shown here yet (main still records it in `status/rounds.jsonl`).
+behind a login. The History tab lists finished runs from `status/rounds.jsonl`.
 
 - **Address**: `https://<main's IP>:8443` (the bare `http://<IP>` redirects there).
 - **First use**: set the password on main, then log in as `admin`:
@@ -20,6 +20,7 @@ behind a login. History is not shown here yet (main still records it in `status/
   of engine decisions, setting changes and warnings.
 - **Themes**: "clean white" for light and "midnight" for dark. The page follows the system setting until the
   Light/Dark button in the top bar is used; the choice is remembered in that browser.
+- **History tab**: one block per finished run, newest first. Select a run and three groups open under it. Score: TRUE, local at submit, rank, field best, gap. Search: GATK workers (saved from the next round on; older runs have none), configs evaluated, how long the search ran. Answer set: donor, its score against the released truth (the same core the live Result panel shows), germline exact match, N, build time.
 - **Settings tab**: every setting in `common/tuning.py` by group, with the value in force on main, the default and
   your value. Live settings apply on main within about a second; round settings wait for the next round. Values are
   checked before the file is written, and main checks them again; a rejected value keeps the one in force.

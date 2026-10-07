@@ -6,6 +6,7 @@ so it can never slow down or break mining; main applies settings itself (common/
   POST /api/login        {"user", "password"} -> a session cookie; 5 failures from one address lock it for 15 min
   POST /api/logout
   GET  /api/status       main's live.json as it is, the server's clock, and the run's review/rank rows when they exist
+  GET  /api/history      one row per finished run from rounds.jsonl (round, review, rank), newest first
   GET  /api/settings     every setting's metadata and default, the file's overrides and what main would reject
   PUT  /api/settings     {"set": {name: value}, "reset": [name]} -> checked, then the file is replaced atomically
 
@@ -33,6 +34,91 @@ STATIC = HERE / "static"
 COOKIE = "minos_session"
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+
+
+def _num(row: Optional[dict], *keys):
+    cur = row or {}
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur if isinstance(cur, (int, float)) and not isinstance(cur, bool) else None
+
+
+def _text(row: Optional[dict], *keys):
+    cur = row or {}
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur if isinstance(cur, str) else None
+
+
+def history_of(path: Path) -> list:
+    """One compact row per finished run. Later lines of the same type replace earlier ones. Newest run first.
+    The review's per-config list is left out: the panel only needs the summary."""
+    found: dict = {}
+    order: list = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        rid, kind = row.get("run_id"), row.get("type")
+        if not rid or kind not in ("round", "review", "rank"):
+            continue
+        if rid not in found:
+            found[rid] = {}
+            order.append(rid)
+        found[rid][kind] = row
+    out = []
+    for rid in order:
+        parts = found[rid]
+        rnd, rev, rank = parts.get("round"), parts.get("review"), parts.get("rank")
+        search = (rev or {}).get("search") or {}
+        germ = ((rev or {}).get("answer_set") or {}).get("germline_exact") or {}
+        out.append({
+            "run_id": rid,
+            "tag": _text(rnd, "tag") or _text(rev, "tag") or _text(rank, "tag"),
+            "region": _text(rnd, "region"),
+            "kind": _text(rnd, "kind"),
+            "mode": _text(rnd, "mode"),
+            "started": _num(rnd, "started"),
+            "ended": _num(rnd, "ended"),
+            "donor": _text(rnd, "answer_set", "donor"),
+            "regime": _text(rnd, "answer_set", "regime"),
+            "best_local": _num(rnd, "search", "best_local"),
+            "evaluated": _num(rnd, "evaluator", "evaluated"),
+            "failed": _num(rnd, "evaluator", "failed"),
+            "nodes": _num(rnd, "evaluator", "nodes"),
+            "workers": _num(rnd, "evaluator", "workers"),
+            "build_s": _num(rnd, "answer_set", "build_s"),
+            "n_ours": _num(rnd, "answer_set", "n_targets"),
+            "final_true": search.get("final_true") if isinstance(search.get("final_true"), (int, float)) else None,
+            "final_local": search.get("final_local") if isinstance(search.get("final_local"), (int, float)) else None,
+            "baseline_true": search.get("baseline_true") if isinstance(search.get("baseline_true"), (int, float)) else None,
+            "spearman": search.get("spearman") if isinstance(search.get("spearman"), (int, float)) else None,
+            "pick_gap": search.get("pick_gap") if isinstance(search.get("pick_gap"), (int, float)) else None,
+            "gain_over_baseline": search.get("gain_over_baseline") if isinstance(search.get("gain_over_baseline"), (int, float)) else None,
+            "germline_match": germ.get("match") if isinstance(germ.get("match"), int) else None,
+            "germline_truth": germ.get("truth") if isinstance(germ.get("truth"), int) else None,
+            "n_truth": _num(rev, "answer_set", "n_targets", "truth"),
+            "answer_score": _num(rev, "answer_set", "as_scored", "core"),
+            "true_score": _num(rank, "true_score"),
+            "rank": _num(rank, "rank"),
+            "field": _num(rank, "field"),
+            "field_best": _num(rank, "field_best"),
+            "field_median": _num(rank, "field_median"),
+            "gap_to_best": _num(rank, "gap_to_best"),
+            "reviewed": rev is not None,
+            "ranked": rank is not None,
+        })
+    out.sort(key=lambda r: (r.get("ended") or r.get("started") or 0), reverse=True)
+    return out
 
 
 def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = None, auth_file: Optional[Path] = None,
@@ -132,6 +218,12 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
         except (OSError, ValueError):
             live = None                                   # main is replacing it right now: the next poll gets it
         return {"now": time.time(), "live": live, "result": result_of(live)}
+
+    @app.get("/api/history")
+    async def history(request: Request):
+        if user_of(request) is None:
+            return denied()
+        return {"runs": history_of(history_file)}
 
     def result_of(live: Optional[dict]) -> Optional[dict]:
         """The round, review and rank rows main appended for the run on screen (rounds.jsonl), newest of each."""
