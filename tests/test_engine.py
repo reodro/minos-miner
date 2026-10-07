@@ -274,7 +274,8 @@ class EngineRoundTest(unittest.TestCase):
             out, ex = virtual_round(950, minutes=72, hills=2)
         text = "\n".join(logs.output)
         self.assertIn("wave 0 ", text)
-        self.assertIn("bred into idle workers", text)                         # opening.steady: no generations
+        for i in range(1, 4):
+            self.assertIn(f"wave {i} ", text)                                 # three opening generations
         self.assertIn("founding at", text)
         self.assertIn("6 domains, 6 held", text)                              # six climb; six candidates wait
         self.assertIn("merge (final)", text)                                  # one merge, at the final window
@@ -399,6 +400,17 @@ class V42Test(unittest.TestCase):
         kinds = collections.Counter(m.kind for m in moves)
         self.assertGreater(kinds["wide"], 0)
         self.assertGreater(kinds["n1"], 0)
+
+    def test_a_final_child_can_take_a_setting_from_a_third_parent(self):
+        space, book, names = setup()
+        a = space._assemble({})
+        b = space._assemble({"min_mapping_quality_score": 50})
+        c = space._assemble({"assembly_region_padding": 300})
+        kids = genetic.across_children(space, [a, b, c], random.Random(1), names, 80)
+        self.assertGreater(len(kids), 0)
+        self.assertTrue(any(k.params.get("min_mapping_quality_score") == b.params["min_mapping_quality_score"]
+                            and k.params.get("assembly_region_padding") == c.params["assembly_region_padding"]
+                            for k in kids))
 
     def test_retire_merge_hands_over_settings_as_transplants(self):
         space, d, live = ClimberTest().make()

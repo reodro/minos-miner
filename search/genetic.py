@@ -93,6 +93,26 @@ def merge_children(space: Space, a: Config, b: Config, rng: random.Random, names
     return list(out.values())
 
 
+def across_children(space: Space, parents: Sequence[Config], rng: random.Random, names: Sequence[str],
+                    n: int) -> List[Config]:
+    """One generation over every parent. Each child takes each setting from any of them, so a retired domain's
+    value can sit next to a live domain's in the same child. `n` children, mutated at MUTATE_FRAC."""
+    if len(parents) < 2 or n <= 0:
+        return []
+    lead = parents[0]
+    out: Dict[str, Config] = {}
+    tries = 0
+    while len(out) < n and tries < 8 * n:
+        tries += 1
+        params = {name: rng.choice(parents).params.get(name, space.specs[name].default) for name in names}
+        c = space._assemble({**lead.params, **params})
+        if c is not None and rng.random() < MUTATE_FRAC:
+            c = mutate(space, c, rng, names) or c
+        if c is not None and all(c.key != p.key for p in parents):
+            out.setdefault(c.key, c)
+    return list(out.values())
+
+
 def merge3_children(space: Space, parents: Sequence[Config], rng: random.Random, names: Sequence[str],
                     n_generation: int = 100) -> List[Config]:
     """A three-way (or more) merge: the leader paired with each other parent, plus one generation over all of them,

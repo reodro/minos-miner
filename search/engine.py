@@ -1,4 +1,12 @@
-"""The search engine (v4.9): the changes made while v4.8 was running.
+"""The search engine (v4.10): three opening generations, and the final breeds every domain.
+Owner: search.
+
+v4.10 keeps v4.9's climb. The opening runs opening.generations (3) generations after wave 0, and a small gain
+does not end it before those three have been launched. At the final, one capped generation takes each setting
+from any domain's centre, including domains retired earlier in the round. The keeper is still the strongest
+basin still climbing. The other live basins still hand over their differing settings as moves.
+
+The search engine (v4.9): the changes made while v4.8 was running.
 Owner: search.
 
 v4.9 keeps v4.8's six climbing basins, six held candidates, and the ten-minute stall. Two changes landed while
@@ -445,7 +453,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if not st["gens_done"]:
                 can = back >= tune("opening.launch_back") or (back >= 0.5 and idle is not None and idle >= tune("opening.launch_idle") * cap)
                 if can and len(candidates) >= 4:
-                    if w >= 2 and top() - wave_best[w] < tune("opening.min_gain"):        # the last generation gained too little
+                    if w >= tune("opening.generations") and top() - wave_best[w] < tune("opening.min_gain"):
                         st["gens_done"] = True
                         say("generations stop after %d (last gained %.3f) t+%.1fm", w, top() - wave_best[w],
                                  elapsed() / 60)
@@ -481,7 +489,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 return
             if st["bred"] >= cap * (st["marks"] + 1):
                 st["marks"] += 1
-                if st["marks"] >= 2 and top() - st["mark"] < tune("opening.min_gain"):
+                if st["marks"] >= tune("opening.generations") and top() - st["mark"] < tune("opening.min_gain"):
                     st["gens_done"] = True
                     say("breeding stops after %d children (the last %d gained %.3f) t+%.1fm", st["bred"], cap,
                         top() - st["mark"], elapsed() / 60)
@@ -598,21 +606,27 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 n += keep.transplant(p.centre, names())
             if rest:
                 st["runner_up"] = rest[0].centre
-            other = rest[0].centre if rest else (guest[0] if guest is not None else None)
+            pool: List[Tuple[Config, float]] = []
+            seen: Set[str] = set()
+            for d in sorted(domains.values(), key=lambda d: -d.best):
+                if d.centre.key in seen:
+                    continue
+                seen.add(d.centre.key)
+                pool.append((d.centre, d.best))
             n_kids = 0
-            if other is not None:
+            if len(pool) >= 2:
                 tried = keep.tried
-                kids = [k for k in genetic.merge_children(space, keep.centre, other, rng, names())
-                        if k.key not in tried and fresh(k)]
                 limit = max(tune("merges.children_min"), int(cap * tune("merges.children_share")))
-                if len(kids) > limit:
-                    kids = rng.sample(kids, limit)
+                kids = [k for k in genetic.across_children(space, [c for c, _ in pool], rng, names(), limit)
+                        if k.key not in tried and fresh(k)]
                 behind.setdefault(keep.id, []).extend(("recomb", k, 0) for k in kids)
                 n_kids = len(kids)
-            say("merge (%s): domain %d keeps %.4f, %s; %d transplant moves, %d children behind its scan t+%.1fm",
+            n_retired = sum(1 for s in status.values() if s == "retired")
+            say("merge (%s): domain %d keeps %.4f, %s; %d transplant moves, %d children from %d centres "
+                "(%d retired) behind its scan t+%.1fm",
                 why, keep.id, keep.best,
-                ", ".join(f"domain {p.id} ({p.best:.4f}) retired" for p in rest) or "a find handed over", n, n_kids,
-                elapsed() / 60)
+                ", ".join(f"domain {p.id} ({p.best:.4f}) retired" for p in rest) or "a find handed over",
+                n, n_kids, len(pool), n_retired, elapsed() / 60)
 
         def resolve(mj: MergeJob) -> Climber:
             merges.pop(mj.id, None)
@@ -1147,7 +1161,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.9", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.10", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),

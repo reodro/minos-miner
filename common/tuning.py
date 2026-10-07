@@ -106,7 +106,8 @@ KNOBS_LIST: List[Knob] = [
     Knob("opening.launch_idle", 0.25, 0.0, 1.0, LIVE, "share",
          "Or once this share of the workers is idle, with half of the previous wave back."),
     Knob("opening.min_gain", 0.05, 0.0, 1.0, LIVE, "score",
-         "A generation that gains less than this ends the opening."),
+         "Once opening.generations generations have come back, a further generation that gains less than this ends "
+         "the opening. It does not stop the opening before those generations have been launched."),
     Knob("opening.found_back", 0.8, 0.1, 1.0, LIVE, "share",
          "After the last generation, domains are founded once this share of it is back."),
     Knob("opening.max_min", 15.0, 2.0, 30.0, LIVE, "min", "Hard limit of the opening."),
@@ -114,9 +115,10 @@ KNOBS_LIST: List[Knob] = [
          "1: the generations breed on separate islands (one per domain, never mating across, a child that lands on "
          "another island's best is redrawn, equal children per island) and founding takes one domain per island. "
          "0: soft niches."),
-    Knob("opening.steady", 1, 0, 1, LIVE, "count",
-         "1: no generations - children are bred into idle workers as they free up (opening.generations x the workers "
-         "in all); 0: generations."),
+    Knob("opening.steady", 0, 0, 1, LIVE, "count",
+         "0: opening.generations discrete generations after wave 0. 1: children are bred into idle workers as they "
+         "free up (opening.generations x the workers in all). Either way the opening does not stop early before "
+         "that many generations."),
     Knob("opening.portfolio_share", 0.4, 0.0, 1.0, ROUND, "share",
          "Share of wave 0 taken by portfolio seeds (the legacy portfolio, then ours); the rest is a hypercube."),
     Knob("domains.max", 12, 1, 12, ROUND, "count",
