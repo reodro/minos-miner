@@ -136,7 +136,7 @@ background; nothing here edits `fleet.json`, which is the user's file.
    .venv/bin/python -m evaluator.fleet.control provision <host> ...    # no host: every host in fleet.json
    .venv/bin/python -m evaluator.fleet.control status                  # cores, workers, image, jar, genomes, code
    ```
-   A node gets min(0.9 x cores, available RAM / 1.3 GB) workers. A node with little RAM per core gets few workers
+   A node gets min(cores - cores // 20, available RAM / 1.3 GB) workers. A node with little RAM per core gets few workers
    (98 GB -> 73) and still runs out of memory under load (5x slower in the v4 test): rent at least 4 GB per core.
 4. **On main, before the run:** rebuild the patch after a patch change (`bash evaluator/gatk_patch/build.sh`), run
    the unit tests, and set the dashboard password once (`.venv/bin/python -m dashboard passwd`).
