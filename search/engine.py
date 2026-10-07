@@ -1,4 +1,11 @@
-"""The search engine (v4.9): a gain the answer set can resolve moves the centre.
+"""The search engine (v4.10): the last five minutes of the climb start no new basin.
+Owner: search.
+
+v4.10 keeps v4.9's resolved-gain rule. For the five minutes before the final (schedule.no_new_before_final_min),
+a stalled basin retires and its workers join the basins already climbing. A new centre is not founded: its scan
+would not finish before the merge.
+
+The search engine (v4.9): a gain the answer set can resolve moves the centre.
 Owner: search.
 
 v4.9 keeps v4.8's six climbing basins, six held candidates, and the ten-minute stall. The answer set separates
@@ -776,6 +783,12 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 elif abs(a.best - b.best) <= tune("merges.close") and dist < MIN_FAR + 2 and \
                         now - tested_pair.get((a.id, b.id), -1e9) > 60 * tune("merges.midpoint_retest_min"):
                     test_midpoint(a, b)
+            # The climb ends at the final. In the last minutes a new centre cannot finish a scan, so a stall
+            # frees its workers for the basins already climbing and no replacement is born.
+            t_now = left()
+            until_final = (t_now - at("final")) if t_now is not None else 1e9
+            until_by = at("reduce_to_1_by") - elapsed()
+            no_new = min(until_final, until_by) <= T(60 * tune("schedule.no_new_before_final_min"))
             # A failed first scan loses its seat. The next held candidate takes it, one at a time: the one after
             # waits until this scan is back. Sooner than minute 34 when every live scan is already back.
             if not st["final"] and st["founded"]:
@@ -791,23 +804,31 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                             d.first_scan_score, d.birth_score, elapsed() / 60)
                         retire(d)
                         st["owed"] += 1
-                    if st["owed"] and reserve and not any(
+                    if no_new:
+                        st["owed"] = 0
+                    elif st["owed"] and reserve and not any(
                             origin.get(d.id) == "the next candidate" and d.first_scan_score is None for d in live()):
                         c, s = reserve.pop(0)
                         birth(c, s, "the next candidate")
                         st["owed"] -= 1
                         say("next candidate at %.4f, %d held, %d swaps still waiting t+%.1fm", s, len(reserve),
                             st["owed"], elapsed() / 60)
-            # A basin that has stopped moving gives its workers to a new centre. The clock starts at the last
+            # A basin that has stopped moving gives its workers to the next candidate, or, in the last minutes of
+            # the climb, to the basins already climbing. The clock starts at the last
             # time its best changed, and only after the first scan has come back.
             if not st["final"] and st["founded"]:
                 limit = T(60 * tune("domains.stall_min"))
                 stalled = [d for d in live() if d.state != "final" and d.first_scan_score is not None
                            and not d.scan_open() and now - d.history[-1][0] >= limit]
                 for d in stalled:
+                    if no_new and not any(x is not d for x in live()):
+                        continue                               # the last basin keeps its workers
                     say("domain %d retired at %.4f (no gain for %.0f min) t+%.1fm", d.id, d.best,
                         tune("domains.stall_min"), elapsed() / 60)
                     retire(d)
+                    if no_new:
+                        say("its workers join the basins still climbing t+%.1fm", elapsed() / 60)
+                        continue
                     nxt = reserve.pop(0) if reserve else None
                     if nxt is None:
                         ranked = [(c, s) for c, s in sorted(candidates.values(), key=lambda t: -t[1])
@@ -1130,7 +1151,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.9", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.10", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),

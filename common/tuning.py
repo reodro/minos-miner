@@ -146,6 +146,9 @@ KNOBS_LIST: List[Knob] = [
          "The final starts here at the latest."),
     Knob("schedule.final_min", 10.0, 1.0, 30.0, LIVE, "min",
          "The final starts when this much time is left, if it has not started yet."),
+    Knob("schedule.no_new_before_final_min", 5.0, 0.0, 30.0, LIVE, "min",
+         "For this long before the final, a stalled basin retires and its workers join the basins already climbing. "
+         "No new centre is founded."),
     Knob("schedule.pick_s", 90.0, 10.0, 600.0, LIVE, "s",
          "The highest-scoring config is named this many seconds before the search ends (not scaled)."),
     Knob("merges.on_evidence", 0, 0, 1, LIVE, "count",
