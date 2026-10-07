@@ -177,8 +177,8 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
             from answer_set.k2 import hcrun
             hp_ = out / "work" / "hc.norm.vcf.gz"
             hc_calls = hcrun.load_calls(hp_) if hp_.exists() else {}
-        cands = hapwin.candidates(hapwin.load_windows(out / "work" / "hg_windows.pkl.gz"), answer,
-                                  dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]], hc_calls)
+        wins = hapwin.load_windows(out / "work" / "hg_windows.pkl.gz")
+        cands = hapwin.candidates(wins, answer, dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]], hc_calls)
         if cands:
             pw = wm.predict_proba(np.vstack([c[5] for c in cands]))[:, 1]
             vname = (track_versions or {}).get(track) or tracks.active_name(track)
@@ -191,6 +191,10 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
             wthr = dict(meta["window_thr_group"], default=meta["window_thr"]) if meta.get("window_thr_group") \
                 else meta["window_thr"]
             recs, n_windows = hapwin.apply(recs, cands, pw, wthr, respell_fn)
+        fa_emit = pysam.FastaFile(str(ref_path(chrom)))
+        recs, n_sp, n_emit = hapwin.emit_from_called(recs, wins, donor, beds[info["mode_donor"]], fa_emit, chrom,
+                                                     dict(zip(keys, p_raw)))
+        n_windows = (n_windows or 0) + n_sp + n_emit
     donor_raw = None
     if info["mode_giab"]:
         from answer_set.k2.util import donor_records

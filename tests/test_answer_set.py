@@ -423,6 +423,74 @@ class K2SpellingTest(unittest.TestCase):
         self.assertEqual((out, n), (recs, 1))                         # not respelled, the person's record kept
 
 
+class K2EmitFromCalledTest(unittest.TestCase):
+    """Donor-aware leftover: the called pair is the original DNA plus Minos events, written left-aligned."""
+
+    def setUp(self):
+        import tempfile
+        import pysam
+        from answer_set.k2.util import Bed
+        self.tmp = tempfile.TemporaryDirectory()
+        # window 101-132: donor het C>CA at 103, hom insertion A>AAAG at 116 (the 055300Z 29679878 pattern)
+        self.ref = "CTCAAAAAAAAAAAAAAGAAAAGAAAGAAATT"
+        with open(f"{self.tmp.name}/chrE.fa", "w") as f:
+            f.write(">chrE\n" + "N" * 100 + self.ref + "N" * 20 + "\n")
+        pysam.faidx(f"{self.tmp.name}/chrE.fa")
+        self.fa = pysam.FastaFile(f"{self.tmp.name}/chrE.fa")
+        with open(f"{self.tmp.name}/c.bed", "w") as f:
+            f.write("chrE\t0\t200\n")
+        self.bed = Bed(f"{self.tmp.name}/c.bed", "chrE")
+        self.s = 101
+        self.donor = (103, "C", "CA")
+        self.syn = (116, "A", "AAAG")
+        from answer_set.k2 import hapwin
+        hap0 = hapwin._apply(self.ref, self.s, [self.donor, self.syn])
+        hap1 = hapwin._apply(self.ref, self.s, [self.syn])
+        self.w = {"ref": self.ref, "pair": (hap0, hap1), "post": 0.99}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_adds_hom_indel_on_top_of_donor(self):
+        from answer_set.k2 import hapwin
+        recs = [(103, "C", "CA", "het", False, 2.0)]
+        donor = {self.donor: "het"}
+        wins = [(self.s, self.s + len(self.ref) - 1, self.w)]
+        out, n_sp, n_add = hapwin.emit_from_called(recs, wins, donor, self.bed, self.fa, "chrE",
+                                                   {self.syn: 0.5})
+        self.assertEqual(n_add, 1)
+        self.assertIn((116, "A", "AAAG", "hom", True, 0.99), out)
+        self.assertIn(recs[0], out)                                 # donor untouched
+
+    def test_leaves_windows_that_already_have_synthetics(self):
+        from answer_set.k2 import hapwin
+        recs = [(103, "C", "CA", "het", False, 2.0),
+                (116, "A", "AAAG", "het", True, 0.5),
+                (116, "A", "AAAAG", "het", True, 0.4)]
+        donor = {self.donor: "het"}
+        wins = [(self.s, self.s + len(self.ref) - 1, self.w)]
+        out, n_sp, n_add = hapwin.emit_from_called(recs, wins, donor, self.bed, self.fa, "chrE")
+        self.assertEqual((n_sp, n_add), (0, 0))
+        self.assertEqual(out, recs)
+
+    def test_donor_genotype_not_rewritten(self):
+        from answer_set.k2 import hapwin
+        recs = [(103, "C", "CA", "het", False, 2.0)]
+        donor = {self.donor: "het"}
+        wins = [(self.s, self.s + len(self.ref) - 1, self.w)]
+        out, _, _ = hapwin.emit_from_called(recs, wins, donor, self.bed, self.fa, "chrE")
+        self.assertEqual([r for r in out if not r[4]], recs)
+
+    def test_ignores_weak_candidates(self):
+        from answer_set.k2 import hapwin
+        recs = [(103, "C", "CA", "het", False, 2.0)]
+        donor = {self.donor: "het"}
+        wins = [(self.s, self.s + len(self.ref) - 1, self.w)]
+        out, n_sp, n_add = hapwin.emit_from_called(recs, wins, donor, self.bed, self.fa, "chrE",
+                                                   {self.syn: 0.1})
+        self.assertEqual((n_sp, n_add, out), (0, 0, recs))
+
+
 class K2WriteTest(unittest.TestCase):
     """The person's own records are written exactly as Minos's truth writes them: NIST's REF, ALT order and genotype
     order (2|1 -> 2/1). The validator classes a two-allele record by the allele its genotype names first."""

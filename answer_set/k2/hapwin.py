@@ -12,6 +12,10 @@ from the per-variant answer's, a model (trained on released rounds: is the calle
 where to replace the answer's records by the called sequences' events. The person's own GIAB records are never
 removed: a window qualifies only if the called pair carries every one of them. hap.py compares DNA, so the spelling
 of the events does not matter for the score.
+
+emit_from_called: when the called pair is the donor haplotypes plus leftover 1-3 bp Minos events (the original
+reads vs the round), and the window has no synthetic records yet, write those leftovers if they are already
+candidates with p >= EMIT_MIN_P (below the 1-bp cut, so the per-variant model declined them).
 """
 from __future__ import annotations
 
@@ -318,3 +322,200 @@ def apply(recs, cands, p, thr, respell_fn=None):
     kept = [r for r in recs if (r[0], r[1], r[2]) not in drop or not r[4]]
     have = {(r[0], r[1], r[2]) for r in kept}
     return kept + [r for r in add if (r[0], r[1], r[2]) not in have], len(taken)
+
+
+def _donor_assignments(donor_recs):
+    """Each way to place het donor records on one haplotype (hom always on). None if too many hets."""
+    hom = [k for k, z in donor_recs if z == "hom"]
+    het = [k for k, z in donor_recs if z != "hom"]
+    if len(het) > 8:
+        return None
+    return [hom + [k for i, k in enumerate(het) if mask >> i & 1] for mask in range(2 ** len(het))]
+
+
+def _applied_gpos(seq, s, alle):
+    """1-based genomic pos of each base in _apply(seq, s, alle) (inserted bases keep the event POS)."""
+    out, i = [], 0
+    for p, r, a in sorted(alle):
+        j = p - s
+        if j < i or seq[j:j + len(r)] != r:
+            return None
+        out.extend(s + k for k in range(i, j))
+        for t in range(len(a)):
+            out.append(p + t if t < len(r) else p + len(r) - 1)
+        i = j + len(r)
+    out.extend(s + k for k in range(i, len(seq)))
+    return out
+
+
+def _events_src_to_dst(fa, chrom, src, dst, gpos):
+    """Simple events turning src into dst, positions mapped from src indices to genomic via gpos."""
+    import parasail
+    from answer_set.k2 import hapcand, hapgeno
+    if src == dst:
+        return []
+    best = None
+    for mm, go, ge in hapgeno.SCHEMES:
+        hapgeno._MATRICES.setdefault(mm, parasail.matrix_create("ACGTN", 1, -mm))
+        raw = hapgeno._decompose(src, dst, 1, mm, go, ge)
+        if not raw or any(abs(len(x[1]) - len(x[2])) > hapcand.MAX_INDEL for x in raw):
+            continue
+        ev = []
+        ok = True
+        for p, r, a in raw:
+            if p < 1 or p > len(gpos):
+                ok = False
+                break
+            ev.append(hapcand.left_align(fa, chrom, gpos[p - 1], r, a))
+        if not ok:
+            continue
+        key = (len(ev),)
+        if best is None or key < best[0]:
+            best = (key, ev)
+    return None if best is None else best[1]
+
+
+def _leftover_on_hap(fa, chrom, s, ref, hap, used):
+    """Minos events on top of donor assignment `used` that produce hap, or None."""
+    base = _apply(ref, s, used)
+    if base is None:
+        return None
+    if base == hap:
+        return []
+    gpos = _applied_gpos(ref, s, used)
+    if gpos is None or len(gpos) != len(base):
+        return None
+    extra = _events_src_to_dst(fa, chrom, base, hap, gpos)
+    if extra is None:
+        return None
+    merged = list(used) + list(extra)
+    if _apply(ref, s, merged) != hap:
+        return None
+    if not _clean(tuple(sorted(set(merged))), s, ref, hap):
+        return None
+    return extra
+
+
+def spell_called(fa, chrom, s, w, donor_recs):
+    """Called pair as {key: zyg}, donor records kept as their own events. None if a hap cannot be spelled that way.
+
+    Pair each called haplotype with a donor haplotype (the originals) and take the leftover Minos events;
+    a homopolymer can look like the donor insertion on both copies, so assignments are chosen so the two
+    leftovers agree as well as they can, then checked to reproduce the called pair.
+    """
+    ref = w["ref"]
+    asg = _donor_assignments(donor_recs)
+    if asg is None:
+        return None
+    used_of = {}
+    for used in asg:
+        seq = _apply(ref, s, used)
+        if seq is None:
+            return None
+        used_of[seq] = used
+    dpair = pairs_of(ref, s, donor_recs) if donor_recs else {(ref, ref)}
+    if not dpair or len(dpair) != 1:
+        return None
+    d1, d2 = next(iter(dpair))
+    c1, c2 = tuple(sorted(w["pair"]))
+    best = None
+    for x, y in ((d1, d2), (d2, d1)):
+        if x not in used_of or y not in used_of:
+            continue
+        e1 = _leftover_on_hap(fa, chrom, s, ref, c1, used_of[x])
+        e2 = _leftover_on_hap(fa, chrom, s, ref, c2, used_of[y])
+        if e1 is None or e2 is None:
+            continue
+        s1, s2 = set(e1), set(e2)
+        key = (len(s1 | s2), len(s1 ^ s2))
+        if best is None or key < best[0]:
+            best = (key, s1, s2)
+    if best is None:
+        return None
+    _, a, b = best
+    out = {k: z for k, z in donor_recs}
+    for k in a | b:
+        if k not in out:
+            out[k] = "hom" if k in a and k in b else "het"
+    got = pairs_of(ref, s, list(out.items()))
+    if not got or tuple(sorted(w["pair"])) not in got:
+        return None
+    return out
+
+
+def _short_indel_extras(ev, donor_keys):
+    """Leftover events worth writing: 1-3 bp indels, no SNPs, disjoint from the person's records."""
+    extra = [k for k in ev if k not in donor_keys]
+    if not extra or len(extra) > 3:
+        return None
+    if any(k in donor_keys for k in extra):
+        return None
+    L = [abs(len(k[1]) - len(k[2])) for k in extra]
+    if any(x == 0 or x > 3 for x in L):
+        return None
+    return extra
+
+
+EMIT_MIN_P = 0.3                 # leftover must already be a per-variant candidate this strong (below the 1-bp cut)
+
+
+def emit_from_called(recs, windows, donor, bed, fa, chrom, p_of=None):
+    """Where the genotyper's pair is the donor haplotypes plus leftover 1-3 bp Minos events, the
+    window has no synthetic records yet, and each leftover is already a candidate with p >= EMIT_MIN_P,
+    write those leftovers (original → round). The person's GIAB records are never removed.
+    -> (records, n_respelled, n_added)."""
+    p_of = p_of or {}
+    ak = sorted((r[0], r[1], r[2]) for r in recs)
+    ap = [k[0] for k in ak]
+    by = {(r[0], r[1], r[2]): r for r in recs}
+    taken, n_sp, n_add = [], 0, 0
+    add, drop = [], set()
+    order = sorted((w for w in windows if "pair" in w[2] and "ref" in w[2]), key=lambda t: -t[2].get("post", 0.0))
+    for s, e, w in order:
+        if not bed.contains(s) or not bed.contains(e) or bed.covered_bp(s, e) != e - s + 1:
+            continue
+        if any(not (e < a or s > b) for a, b in taken):
+            continue
+        if w.get("post", 0.0) < 0.95:
+            continue
+        if w["pair"][0] == w["ref"] and w["pair"][1] == w["ref"]:
+            continue
+        dlen = [abs(len(h) - len(w["ref"])) for h in w["pair"]]
+        has_indel = any(len(k[1]) != len(k[2]) for c in w.get("called") or () for k in c.get("events") or ())
+        if max(dlen) == 0 and not has_indel:
+            continue
+        A = _inside(ak, ap, s, e)
+        if A is None:
+            continue
+        donor_recs = [(k, donor[k]) for k in A if k in donor]
+        ev = spell_called(fa, chrom, s, w, donor_recs)
+        if ev is None:
+            continue
+        if any(k not in ev for k, _ in donor_recs):
+            continue
+        ref = w["ref"]
+        called = tuple(sorted(w["pair"]))
+        aps = pairs_of(ref, s, [(k, by[k][3]) for k in A])
+        eps = pairs_of(ref, s, list(ev.items()))
+        if not eps or called not in eps:
+            continue
+        extra = _short_indel_extras(ev, set(donor))
+        if extra:
+            extra = [k for k in extra if p_of.get(k, 0.0) >= EMIT_MIN_P]
+        syn_in = [k for k in A if k not in donor]
+        # only ADD into windows that have no synthetic records yet (donor / empty).
+        if syn_in or not extra or (aps and called in aps):
+            continue
+        taken.append((s, e))
+        hom_pos = {k[0] for k in extra if ev[k] == "hom"}
+        for k in A:
+            if k not in donor and k[0] in hom_pos:
+                drop.add(k)
+        for k in extra:
+            if k in donor or (k in by and not by[k][4]):
+                continue
+            add.append((k[0], k[1], k[2], ev[k], True, float(w["post"])))
+        n_add += 1
+    kept = [r for r in recs if (r[0], r[1], r[2]) not in drop]
+    have = {(r[0], r[1], r[2]) for r in kept}
+    return kept + [r for r in add if (r[0], r[1], r[2]) not in have], n_sp, n_add
