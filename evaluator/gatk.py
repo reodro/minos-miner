@@ -32,6 +32,7 @@ import gzip
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import atexit
@@ -106,6 +107,9 @@ ACTIVITY_CACHE = os.environ.get("MINOS_ACTIVITY_CACHE", "1") != "0"     # per-sk
 # per-region assemblies (MinosAssemblyCache): off unless MINOS_ASSEMBLY_CACHE=1 - one file per region (1.6 M files, 6.5 GB
 # for one 60-min round) until the files are packed and deleted with the round
 ASSEMBLY_CACHE = os.environ.get("MINOS_ASSEMBLY_CACHE", "0") == "1"
+# rounds whose VCFs and scoring cache stay on disk after they end (the review reads the top configs' VCFs when the
+# truth is out, ~1 round later); older rounds ended here are deleted (finish_round). 0 keeps every round.
+KEEP_ROUNDS = int(os.environ.get("MINOS_KEEP_ROUNDS", "3"))
 SERVER_MOUNTS = ("/srv/data", "/srv/cache", "/srv/work")                   # data_dir, cache_dir, the runner's work_dir
 
 SAFE_ANNOTATION_EXCLUSIONS = (
@@ -320,6 +324,16 @@ def _stop_all_servers() -> None:
         srv.stop(runtime)
 
 
+def _remove_under(path: Path, root: Path) -> None:
+    """Delete directory `path` if it lies strictly inside `root` (never anything else)."""
+    try:
+        p, r = path.resolve(), root.resolve()
+    except OSError:
+        return
+    if p != r and r in p.parents and p.is_dir():
+        shutil.rmtree(p, ignore_errors=True)
+
+
 class GatkRunner:
     """The validator's HaplotypeCaller command (minos_subnet/templates/gatk.py) plus the verified speed-ups."""
 
@@ -338,6 +352,8 @@ class GatkRunner:
         self._warm_reserved = 0
         self._live: Dict[str, tuple] = {}            # container name -> (round_id, config keys it computes)
         self._live_lock = threading.Lock()
+        self._ended_tags: set = set()                # rounds kill_round ended: none of their jobs starts any more
+        self._prune_lock = threading.Lock()
         self._kbest: Dict[tuple, int] = {}           # (round, config key, fidelity) -> cap that reproduces its run
         # GATK servers (persistent JVMs, gatk_patch MinosServer): on unless MINOS_GATK_SERVER=0 or without the patch.
         self.server = self.patch_jar is not None and os.environ.get("MINOS_GATK_SERVER", "1") != "0"
@@ -403,6 +419,8 @@ class GatkRunner:
 
     def kill_round(self, round_id: str) -> int:
         """Kill this runner's running containers of one round (the round is over: their results are useless)."""
+        with self._live_lock:
+            self._ended_tags.add(Round.tag_of(round_id))
         with self._warm_lock:
             for key in [k for k in self._warm if k[0] == round_id]:
                 self._warm.pop(key).stop()
@@ -419,6 +437,43 @@ class GatkRunner:
         if ids:
             subprocess.run(["docker", "kill", *ids], capture_output=True)
         return len(ids)
+
+    def finish_round(self, round_id: str) -> None:
+        """The round is over (after kill_round): free its disk. Its activity and assembly caches go at once (only that
+        round's runs read them). Its VCFs and scoring cache stay for the review until KEEP_ROUNDS newer rounds ended
+        here, then go too. The rounds ended here are listed in work_dir/ended_rounds.txt, so a restarted miner still
+        deletes them; rounds never ended here (e.g. stored test rounds only analysed) are never touched."""
+        tag = Round.tag_of(round_id)
+        for sub in ("activity", "assembly"):
+            _remove_under(self.work_dir / tag / sub, self.work_dir)
+        if KEEP_ROUNDS <= 0:
+            return
+        listing = self.work_dir / "ended_rounds.txt"
+        dcache = Path(SETTINGS.cache_dir) / "dcache"
+        with self._prune_lock:
+            try:
+                ended = [t for t in listing.read_text().split() if t != tag]
+            except OSError:
+                ended = []
+            ended.append(tag)
+            old, ended = ended[:-KEEP_ROUNDS], ended[-KEEP_ROUNDS:]
+            for t in old:
+                _remove_under(self.work_dir / t, self.work_dir)
+                _remove_under(dcache / t, dcache)
+            try:
+                listing.parent.mkdir(parents=True, exist_ok=True)
+                tmp = listing.with_name(f"{listing.name}.{uuid.uuid4().hex[:8]}.tmp")
+                tmp.write_text("".join(t + "\n" for t in ended))
+                os.replace(tmp, listing)
+            except OSError as e:
+                log.warning("cannot write %s: %s", listing, e)
+        if old:
+            log.info("round %s ended: deleted the VCFs and scoring caches of %s", tag, ", ".join(old))
+
+    def _round_ended(self, name: str) -> bool:
+        """Whether container `name` (<prefix>-<round tag>-<id>) belongs to a round kill_round ended."""
+        with self._live_lock:
+            return any(name.startswith(f"{self.container_prefix}-{t}-") for t in self._ended_tags)
 
     def kill_configs(self, round_id: str, keys: Iterable[str]) -> int:
         """Kill the running containers computing any of these configs for the round (their results are not wanted:
@@ -441,6 +496,8 @@ class GatkRunner:
         `reserved`: warm_dir holds one of the MAX_WARM slots, given back here.
         """
         name = cmd[cmd.index("--name") + 1]
+        if self._round_ended(name):
+            return subprocess.CompletedProcess(cmd, 137, "", "round ended")
         if warm_dir is None and self.server and not cold:
             done = self._run_on_server(cmd)
             if done is not None:
@@ -809,6 +866,8 @@ class GatkRunner:
             srv.stop(self.runtime)
         if state == "timeout":
             return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {self.timeout_s}s")
+        if state != "ok" and self._round_ended(name):   # kill_round stopped the server: no cold rerun for an ended round
+            return subprocess.CompletedProcess(cmd, 137, "", "round ended")
         if state != "ok":                            # never trust a failing server: the job runs cold
             with self._server_lock:
                 self.server_stats["fallbacks"] += 1

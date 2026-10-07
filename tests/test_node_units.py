@@ -110,5 +110,19 @@ class NodeForgetTest(unittest.TestCase):
                 shutil.rmtree(d, ignore_errors=True)
 
 
+class ScorerProcessCountTest(unittest.TestCase):
+    """One scorer per GATK worker oversubscribes a small machine. The default follows the callset rate."""
+
+    def test_default_is_one_per_six_workers_not_one_per_worker(self):
+        from evaluator.pool import scorer_processes
+        # workers -> (old: one per worker, new)
+        expect = {1: (1, 1), 12: (12, 2), 16: (16, 2), 64: (64, 10), 950: (950, 158)}
+        for workers, (old, new) in expect.items():
+            self.assertEqual(old, workers)
+            self.assertEqual(scorer_processes(workers), new)
+        node = Node(12, _NoRunner(), lambda i: _CountingScorer())
+        self.assertEqual(node.score_threads, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

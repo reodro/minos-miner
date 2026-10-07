@@ -112,6 +112,27 @@ class GatkServerTest(unittest.TestCase):
         self.assertEqual(self.runner._servers_idle, [])         # and it was dropped
         self.assertTrue((d / "stop").exists())
 
+    def test_an_ended_round_runs_nothing_more_not_even_cold(self):
+        d = self.work / "servers" / "s2"
+        d.mkdir(parents=True)
+        srv = G._GatkServer(_FakeProc(), open(d / "jvm.log", "w"), d, "minos-run-srv-s2", 30)
+        self.runner._start_server = lambda: srv
+        _answer(d, ["dead server exited"])                      # kill_round stopped the server under the job
+        cmd = ["docker", "run", "--name", "minos-run-T-1", "-v", f"{self.work}:/data/output", "img", "java",
+               "-cp", "x", "org.broadinstitute.hellbender.Main", "HaplotypeCaller", "-O", "/data/output/R/o.vcf.gz"]
+        self.runner._ended_tags.add("T")
+        p = self.runner._run_on_server(cmd)
+        self.assertEqual((p.returncode, p.stderr), (137, "round ended"))   # no cold rerun of the dead job
+        self.assertEqual(self.runner.server_stats["fallbacks"], 0)
+        started = []
+        self.runner._docker_run = lambda *a, **k: started.append(1)
+        self.assertEqual(self.runner._docker(cmd).returncode, 137)        # and no new job of that round starts
+        self.assertEqual(started, [])
+        other = [a.replace("minos-run-T-1", "minos-run-T2-1") for a in cmd]
+        self.runner.server = False
+        self.runner._docker(other)                                         # another round still runs
+        self.assertEqual(started, [1])
+
 
 class ActivityCacheTest(unittest.TestCase):
     """GatkRunner names one activity-cache directory per skeleton (what a batch shares) for every patched run."""
@@ -156,6 +177,62 @@ class ActivityCacheTest(unittest.TestCase):
         self.assertEqual(props(Config("gatk", {**d, "emit_ref_confidence": "GVCF"})), {})
         G.ASSEMBLY_CACHE = False
         self.assertEqual(props(a), {})
+
+
+class RoundCleanupTest(unittest.TestCase):
+    """finish_round: a round's caches go when it ends, its VCFs once KEEP_ROUNDS newer rounds ended on this machine."""
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for p in (mock.patch.object(G, "SETTINGS", SimpleNamespace(cache_dir=str(self.tmp))),
+                  mock.patch.object(G, "KEEP_ROUNDS", 3)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.work = self.tmp / "callsets"
+        self.ids = [f"2026-01-0{d}T00:00:00+00:00" for d in range(1, 7)]
+        for rid in self.ids + ["2025-12-31T00:00:00+00:00"]:      # the last one: a stored round never mined here
+            t = Round.tag_of(rid)
+            for d in (self.work / t / "activity" / "sk", self.work / t / "assembly" / "ab", self.tmp / "dcache" / t):
+                d.mkdir(parents=True)
+                (d / "f").write_text("x")
+            (self.work / t / "k_full.vcf.gz").write_text("x")
+
+    def runner(self):
+        return G.GatkRunner(work_dir=str(self.work), patch_jar=None, runtime="docker")
+
+    def kept(self):
+        return sorted(t for t in [Round.tag_of(r) for r in self.ids] if (self.work / t / "k_full.vcf.gz").exists())
+
+    def test_caches_go_at_once_and_vcfs_after_three_newer_rounds_also_across_restarts(self):
+        tags = [Round.tag_of(r) for r in self.ids]
+        r = self.runner()
+        r.finish_round(self.ids[0])
+        self.assertFalse((self.work / tags[0] / "activity").exists())
+        self.assertFalse((self.work / tags[0] / "assembly").exists())
+        self.assertTrue((self.work / tags[0] / "k_full.vcf.gz").exists())      # kept for the review
+        for rid in self.ids[1:3]:
+            r.finish_round(rid)
+        self.assertEqual(self.kept(), tags)                                     # 3 ended: nothing older to delete
+        self.runner().finish_round(self.ids[3])                                 # a restarted miner
+        self.assertFalse((self.work / tags[0]).exists())
+        self.assertFalse((self.tmp / "dcache" / tags[0]).exists())
+        self.assertEqual(self.kept(), tags[1:])
+        r.finish_round(self.ids[1])                                             # ended again: the newest now
+        r.finish_round(self.ids[4])
+        self.assertEqual(self.kept(), [tags[1], tags[3], tags[4], tags[5]])     # tags[2] was the oldest
+        self.assertTrue((self.work / "20251231T000000Z" / "k_full.vcf.gz").exists())   # never ended here: untouched
+        self.assertTrue((self.work / "20251231T000000Z" / "activity").exists())
+
+    def test_keep_rounds_0_deletes_only_the_caches(self):
+        G.KEEP_ROUNDS = 0
+        r = self.runner()
+        for rid in self.ids:
+            r.finish_round(rid)
+        self.assertEqual(len(self.kept()), len(self.ids))
+        self.assertFalse(any((self.work / Round.tag_of(rid) / "activity").exists() for rid in self.ids))
 
 
 if __name__ == "__main__":

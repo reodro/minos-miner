@@ -139,7 +139,8 @@ def main() -> None:
     TUNING.use_file()                             # tuning.json overrides (the dashboard edits it); re-read on change
     import evaluator
     fleet = evaluator.fleet_executor(args.fleet) if args.fleet else None
-    scoring = None if fleet is not None else evaluator.scoring_pool(args.workers)   # the nodes score on a fleet
+    # Nodes score themselves. Here, scorers follow the callset rate, not one process per GATK worker.
+    scoring = None if fleet is not None else evaluator.scoring_pool(evaluator.scorer_processes(args.workers))
     try:
         if args.cmd == "replay":
             replay(args.tag, args.minutes, args.workers, fleet, scoring)

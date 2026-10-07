@@ -606,6 +606,9 @@ class LocalExecutor:
         kill = getattr(self.runner, "kill_round", None)
         if kill:
             kill(round_id)
+        finish = getattr(self.runner, "finish_round", None)
+        if finish:                                 # its disk: caches now, VCFs once newer rounds ended
+            finish(round_id)
 
     def cost_hint(self, job: EvalJob) -> float:
         """0 if done or in flight; if a queued job would carry it in its batch, the runner's variant cost

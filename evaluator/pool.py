@@ -62,6 +62,20 @@ def _proc_score_unit(css: list, aset: AnswerSet) -> list:
 
 
 
+def scorer_processes(workers: int) -> int:
+    """Scorer processes for a machine that runs this many GATK workers.
+
+    One hap.py process scores about six callsets a minute. A worker finishes less than one walk a
+    minute. One scorer per six workers matches that, with at least two on any machine that has more
+    than one worker, and never more scorers than workers. One per worker puts a second runnable on
+    every core.
+    """
+    n = max(1, int(workers))
+    if n == 1:
+        return 1
+    return min(n, max(2, n // 6))
+
+
 class ScoringPool:
     def __init__(self, parallel: int, score_dir: Optional[str] = None, scorer=None):
         """`score_dir` set: `parallel` scorer processes (upstream's hap.py path, the decision cache in score_dir).
