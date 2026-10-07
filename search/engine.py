@@ -1,4 +1,10 @@
-"""The search engine (v4.10): three opening generations, and the final breeds every domain.
+"""The search engine (v4.11): one full-range scan per basin.
+Owner: search.
+
+v4.11 keeps v4.10. A basin scans every setting once, at founding. A later gain, including one of 0.05, moves
+the centre and the neighbourhood climb continues. It does not start the scan again.
+
+The search engine (v4.10): three opening generations, and the final breeds every domain.
 Owner: search.
 
 v4.10 keeps v4.9's climb. The opening runs opening.generations (3) generations after wave 0, and a small gain
@@ -1161,7 +1167,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.10", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.11", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),

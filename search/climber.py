@@ -754,8 +754,8 @@ class Climber:
         self.sweep_is_scan = False
         if gain > tune("climb.accept_min") and self.state != "final":
             self.scan_flat = False                     # a resolved gain is a new centre; the neighbourhood climb goes on
-            if gain >= tune("climb.decisive"):
-                self.scan_next = True                  # only a gain of 0.05 restarts the full-range scan
+            if gain >= tune("climb.decisive") and self.first_scan_score is None:
+                self.scan_next = True                  # one full-range scan per basin; a later gain stays on the neighbourhood
             if self.state == "exhausted":
                 self.state = "climb"
         if self.state == "perturb":

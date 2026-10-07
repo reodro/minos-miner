@@ -218,6 +218,7 @@ class ClimberTest(unittest.TestCase):
         self.assertTrue(d.consider(m, True, m.config, jumped, False, 2.0))
         self.assertEqual(d.first_scan_score, jumped)                             # the first scan moved the centre
         self.assertFalse(d.first_scan_held)
+        self.assertFalse(d.scan_next)                                            # that scan is the basin's only one
 
     def test_a_resolved_scan_gain_moves_the_centre_without_a_rescan(self):
         space, book, names = setup()
@@ -237,7 +238,7 @@ class ClimberTest(unittest.TestCase):
             d.take()
             d.consider(m, True, m.config, 88.0, False, 1.0)
         self.assertFalse(d.scan_flat)
-        self.assertFalse(d.scan_next)                                            # 0.05 is what restarts the full scan
+        self.assertFalse(d.scan_next)                                            # the first scan does not start another
         self.assertEqual(d.centre.key, head.config.key)
         self.assertAlmostEqual(d.first_scan_score, 88.0 + 2 * ACCEPT_MIN)
         self.assertFalse(d.first_scan_held)
