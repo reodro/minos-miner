@@ -1,4 +1,13 @@
-"""The search engine (v4.11): one full-range scan per basin.
+"""The search engine (v4.12): twelve basins climb, then the moving six keep the workers.
+Owner: search.
+
+v4.12 keeps v4.11's one scan per basin. The opening births every centre it found, up to twelve, and one of them
+is the scored config farthest from the others, down to 5 points below the opening best. Halfway from founding to
+the final, once every first scan is back, the six with the highest score-plus-gain keep climbing. The rest retire
+and their workers join those six. A stall after that cut does not birth another domain. A coarse sweep that
+finishes goes on to the fine neighbourhood and does not launch the wide all-pairs round.
+
+The search engine (v4.11): one full-range scan per basin.
 Owner: search.
 
 v4.11 keeps v4.10. A basin scans every setting once, at founding. A later gain, including one of 0.05, moves
@@ -258,7 +267,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         wave_back: List[int] = []
         wave_best: List[float] = []                  # best score seen when each wave launched
         reserve: List[Tuple[Config, float]] = []
-        st = {"founded": False, "gens_done": False, "r3": False, "r3_done": False, "replaced": False, "r1": False,
+        st = {"founded": False, "founded_at": 0.0, "cut": False, "gens_done": False, "r3": False, "r3_done": False,
+              "replaced": False, "r1": False,
               "owed": 0,
               "final": False,
               "last_share": 0.0, "last_log": t0, "last_publish": t0 - TICK_S, "scouts": 0, "runner_up": None, "picked": False}
@@ -532,12 +542,35 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if len(picked) < n_domains:
                 picked += hills.take(ranked, n_domains - len(picked), min_far, best - 5.0, [c for c, _ in picked])
             near_keys = {c.key for c, _ in near}
-            seats = min(6, len(picked))
-            for c, s in picked[:seats]:
-                birth(c, s, "the opening" if c.key in near_keys else "the opening, past the band")
-            for c, s in picked[seats:]:
-                reserve.append((c, s))
-                was_centre.add(c.key)                      # held: not a find to merge into a live basin
+            far_key = None
+            if len(picked) >= 2:                              # the last seat is the farthest config, if one is farther
+                anchors = picked[:-1]
+                anchor_keys = {c.key for c, _ in anchors}
+                current = picked[-1]
+                cur_dist = min(hills.distance(current[0], a) for a, _ in anchors)
+                best_far = None
+                best_dist = cur_dist
+                for c, s in ranked:
+                    if c.key in anchor_keys or s < best - 5.0:
+                        continue
+                    dist = min(hills.distance(c, a) for a, _ in anchors)
+                    if dist <= cur_dist:
+                        continue
+                    if best_far is None or dist > best_dist or (dist == best_dist and s > best_far[1]):
+                        best_dist = dist
+                        best_far = (c, s)
+                if best_far is not None and best_far[0].key != current[0].key:
+                    picked = anchors + [best_far]
+                    far_key = best_far[0].key
+            for c, s in picked:
+                if c.key == far_key:
+                    why = "the opening, far from the clump"
+                elif c.key in near_keys:
+                    why = "the opening"
+                else:
+                    why = "the opening, past the band"
+                birth(c, s, why)
+            st["founded_at"] = elapsed()
             say("founding at t+%.1fm: %d domains, %d held (%d within %.2f of the best) from %d scored configs (waves %s)",
                 elapsed() / 60, len(live()), len(reserve), len(near), band, len(candidates),
                 " ".join(f"{b}/{h}" for b, h in zip(wave_back, wave_heads)))
@@ -805,9 +838,25 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             until_final = (t_now - at("final")) if t_now is not None else 1e9
             until_by = at("reduce_to_1_by") - elapsed()
             no_new = min(until_final, until_by) <= T(60 * tune("schedule.no_new_before_final_min"))
+            # Halfway from founding to the final, once every first scan is back, the six that are highest
+            # after adding their gain since that scan keep the workers. The others retire.
+            if not st["final"] and st["founded"] and not st["cut"]:
+                climbing = [d for d in live() if d.state != "final"]
+                final_at = (tl if tl is not None and tl > 0 else ROUND_S) - at("final")
+                half = st["founded_at"] + 0.5 * max(0.0, final_at - st["founded_at"])
+                if len(climbing) > 6 and elapsed() >= half and all(d.first_scan_score is not None for d in climbing):
+                    ranked_d = sorted(climbing, key=lambda d: (2 * d.best - d.first_scan_score, d.best), reverse=True)
+                    keep, drop = ranked_d[:6], ranked_d[6:]
+                    st["cut"] = True
+                    for d in drop:
+                        gain = d.best - d.first_scan_score
+                        say("domain %d retired at %.4f (cut, gain %.4f) t+%.1fm", d.id, d.best, gain, elapsed() / 60)
+                        retire(d)
+                    say("cut at t+%.1fm: keeping %s", elapsed() / 60,
+                        " ".join("%d:%.3f" % (d.id, d.best) for d in keep))
             # A failed first scan loses its seat. The next held candidate takes it, one at a time: the one after
             # waits until this scan is back. Sooner than minute 34 when every live scan is already back.
-            if not st["final"] and st["founded"]:
+            if not st["final"] and st["founded"] and reserve and not st["cut"]:
                 lv = [d for d in live() if d.state != "final"]
                 swap_out = any(origin.get(d.id) == "the next candidate" and d.first_scan_score is None for d in lv)
                 scans_back = bool(lv) and all(d.first_scan_score is not None for d in lv)
@@ -820,7 +869,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                             d.first_scan_score, d.birth_score, elapsed() / 60)
                         retire(d)
                         st["owed"] += 1
-                    if no_new:
+                    if no_new or st["cut"]:
                         st["owed"] = 0
                     elif st["owed"] and reserve and not any(
                             origin.get(d.id) == "the next candidate" and d.first_scan_score is None for d in live()):
@@ -837,12 +886,12 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 stalled = [d for d in live() if d.state != "final" and d.first_scan_score is not None
                            and not d.scan_open() and now - d.history[-1][0] >= limit]
                 for d in stalled:
-                    if no_new and not any(x is not d for x in live()):
+                    if (no_new or st["cut"]) and not any(x is not d for x in live()):
                         continue                               # the last basin keeps its workers
                     say("domain %d retired at %.4f (no gain for %.0f min) t+%.1fm", d.id, d.best,
                         tune("domains.stall_min"), elapsed() / 60)
                     retire(d)
-                    if no_new:
+                    if no_new or st["cut"]:
                         say("its workers join the basins still climbing t+%.1fm", elapsed() / 60)
                         continue
                     nxt = reserve.pop(0) if reserve else None
@@ -1167,7 +1216,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.11", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.12", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),

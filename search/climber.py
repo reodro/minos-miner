@@ -395,9 +395,7 @@ class Climber:
             return []
         if self.state == "climb":
             if self.mode == "coarse":
-                if not self.wide_done:                     # the legacy pipeline's all-pairs rung, once per centre
-                    self.wide_done = self.wide_next = self.fresh = True
-                    return self._main(live, rng, room)
+                self.wide_done = True                      # no wide pair round: the v4.11 climbs spent it and gained nothing
                 self.mode = "fine"
                 for a in self.steps:
                     self.steps[a] = max(self._floor(a), self.steps[a] * 0.5)

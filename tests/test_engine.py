@@ -130,11 +130,8 @@ class ClimberTest(unittest.TestCase):
         moves = d.refill(live, rng, 500)
         self.drain(d, moves, lambda m: 87.0)                                    # nothing wins anywhere
         moves = d.refill(live, rng, 500)
-        self.assertEqual({m.kind for m in moves}, {"wide"})                    # the all-pairs round first
-        self.assertTrue(all(len(m.axes) == 2 for m in moves))
-        self.drain(d, moves, lambda m: 87.0)
-        moves = d.refill(live, rng, 500)
-        self.assertEqual(d.mode, "fine")
+        self.assertEqual(d.mode, "fine")                                       # a flat coarse sweep skips the wide round
+        self.assertNotIn("wide", {m.kind for m in moves})
         self.assertIn("n3", {m.kind for m in moves})
         seen = set()
         for _ in range(80):
@@ -154,7 +151,9 @@ class ClimberTest(unittest.TestCase):
         centre = d.centre.key
         self.drain(d, moves, lambda m: 88.0)                                    # identical calls everywhere
         self.assertEqual(d.centre.key, centre)
-        self.assertEqual({m.kind for m in d.refill(live, rng, 500)}, {"wide"})
+        nxt = d.refill(live, rng, 500)
+        self.assertEqual(d.mode, "fine")
+        self.assertNotIn("wide", {m.kind for m in nxt})
 
     def test_a_new_domain_scans_every_setting_over_its_range(self):
         space, book, names = setup()
@@ -278,7 +277,8 @@ class EngineRoundTest(unittest.TestCase):
         for i in range(1, 4):
             self.assertIn(f"wave {i} ", text)                                 # three opening generations
         self.assertIn("founding at", text)
-        self.assertIn("6 domains, 6 held", text)                              # six climb; six candidates wait
+        self.assertIn("12 domains, 0 held", text)                             # all twelve climb from founding
+        self.assertIn("cut at", text)                                         # halfway, the moving six keep the workers
         self.assertIn("merge (final)", text)                                  # one merge, at the final window
         self.assertNotIn("scheduled 3 to 1", text)
         self.assertNotIn("one hill", text)                                     # merges.on_evidence 0
@@ -393,6 +393,19 @@ class V42Test(unittest.TestCase):
                     d.consider(m, True, m.config, 87.0, False, 1.0)
             kinds = [ch for kind, ch in d.queued if kind == "reapply"]
             self.assertEqual(len(kinds), 3 + 2 + 3)                    # 3 alone, 2 running sums, 3 pairs
+
+    def test_a_finished_coarse_sweep_does_not_start_the_wide_pair_round(self):
+        space, d, live = ClimberTest().make()
+        d.fresh = False
+        d.scan_next = False
+        d.wide_done = False
+        d.eager_wide = False
+        d.mode = "coarse"
+        d.state = "climb"
+        d.sweep_sent = d.sweep_back = 1
+        moves = d.refill(live, random.Random(0), 500)
+        self.assertFalse(any(m.kind == "wide" for m in moves))
+        self.assertEqual(d.mode, "fine")
 
     def test_few_domains_send_the_wide_round_with_the_first_coarse_sweep(self):
         space, d, live = ClimberTest().make()
