@@ -187,21 +187,25 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 
 /* schedule */
 .schedule, .ticks, .lane { margin-left: var(--axis-l); margin-right: var(--axis-r); }
-.lane { position: relative; height: 18px; }
+.lane { position: relative; height: 18px; overflow: visible; }
 .lane .seg { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; padding: 0 6px; font-size: 11px;
   font-weight: 600; white-space: nowrap; overflow: hidden; border-radius: 4px; background: var(--scout-soft); color: var(--ink);
-  border: 1px solid var(--scout); }
+  border: 1px solid var(--scout); min-width: 4px; }
+.lane .lane-label { position: absolute; top: 0; height: 18px; display: flex; align-items: center; margin-left: 6px;
+  font-size: 11px; font-weight: 600; white-space: nowrap; color: var(--ink); }
 .seg.submit { background: var(--track); color: var(--muted); }
 .schedule { position: relative; height: 44px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: var(--panel-2); }
 .schedule .seg { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; padding: 0 8px; font-size: 12px;
   font-weight: 600; white-space: nowrap; overflow: hidden; border-right: 1px solid var(--panel); }
 .seg.opening { background: var(--open); color: var(--on-strong); }
 .seg.climb { background: var(--accent); color: var(--on-strong); }
+.seg.perturb { background: var(--warn); color: var(--on-strong); }
 .seg.merge { background: var(--merge); color: var(--on-strong); }
 .seg.final { background: var(--final); color: var(--on-strong); }
 .schedule .done { position: absolute; top: 0; bottom: 0; left: 0; background: var(--bg); opacity: .45; pointer-events: none; }
 .schedule .now { position: absolute; top: -1px; bottom: -1px; width: 2px; background: var(--ink); }
 .schedule .pick { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--final); }
+.schedule .replace { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--open); }
 .ticks { position: relative; height: 16px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
 
@@ -225,6 +229,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .lineage text.score { fill: var(--ink); font-variant-numeric: tabular-nums; }
 .lineage .band.opening { fill: var(--open-soft); } .lineage .band.merge { fill: var(--merge-soft); }
 .lineage .band.final { fill: var(--final-soft); } .lineage .band.climb { fill: var(--panel); }
+.lineage .band.perturb { fill: var(--warn-soft); }
 .lineage .row { fill: var(--accent); } .lineage .row.perturb { fill: var(--warn); }
 .lineage .row.exhausted { fill: var(--bad); } .lineage .row.final { fill: var(--final); }
 .lineage .row.merging { fill: var(--merge); } .lineage .row.retired { fill: var(--retired); }

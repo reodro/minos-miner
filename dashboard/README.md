@@ -12,12 +12,7 @@ behind a login. The History tab lists finished runs from `status/rounds.jsonl`.
 
 ## What it shows
 
-- **Live tab**: round, phase, time left, best local score, submissions, configs scored, busy workers, domains, GATK
-  runs and the answer set as status blocks; the round's schedule with a marker for now; the domain tree (each domain
-  a row over time, merges joining their parents, scout finds marked); a card per live domain (best, state, mode,
-  climbing rate, work in flight against its allotment, origin); merges in progress; the opening's waves; the scout
-  and the pick; every score over time with the best line and submissions; one block per fleet node; an event feed
-  of engine decisions, setting changes and warnings.
+- **Live tab**: round, phase, time left, best local score, submissions, configs scored, busy workers, and the answer set. The schedule is the current engine: opening, six climbing basins, no new basin in the last minutes, then one merge at the final. A domain card shows the score it opened at and its first scan. The scout sampler is shown as off. Scores, fleet nodes, and the event feed are unchanged.
 - **Themes**: "clean white" for light and "midnight" for dark. The page follows the system setting until the
   Light/Dark button in the top bar is used; the choice is remembered in that browser.
 - **History tab**: one block per finished run, newest first. Select a run and three groups open under it. Score: TRUE, local at submit, rank, field best, gap. Search: GATK workers (saved from the next round on; older runs have none), configs evaluated, how long the search ran. Answer set: donor, its score against the released truth (the same core the live Result panel shows), germline exact match, N, build time.

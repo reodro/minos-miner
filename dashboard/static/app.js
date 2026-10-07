@@ -196,7 +196,6 @@ function renderKpis(L, R, S, E, X, finished) {
   const lastSub = subs.length ? subs[subs.length - 1] : null;
   const left = R.deadline_ts ? R.deadline_ts - now() : null;
   const live = E ? E.domains.filter((d) => d.status === "live").length : 0;
-  const merging = E ? E.domains.filter((d) => d.status === "merging").length : 0;
   const perRun = S.gatk_runs_done ? (S.delivered || 0) / S.gatk_runs_done : null;
   const A = L.answer_set;
   $("kpis").replaceChildren(
@@ -209,7 +208,7 @@ function renderKpis(L, R, S, E, X, finished) {
       : kpi("Workers busy", X ? int(X.running) : "–", X ? `of ${int(X.workers)} · ${int(X.queued)} queued · ${int(S.in_flight)} in flight` : "", "k-workers"),
     finished ? kpi("Domains", E ? `${E.domains.filter((d) => d.status !== "retired").length}` : "–", E ? `at the end · ${E.domains.length} in the round` : "", "k-domains")
       : kpi("Domains", E ? `${live} / ${E.max_domains}` : "–",
-        E ? `climbing · ${merging} merging in ${E.merges.length} merge${E.merges.length === 1 ? "" : "s"} · ${E.domains.length} so far` : "", "k-domains"),
+        E ? `climbing · ${E.pending || 0} held · ${E.domains.length} founded` : "", "k-domains"),
     kpi("GATK runs", int(S.gatk_runs), perRun ? `${perRun.toFixed(2)} configs per run` : "", "k-gatk"),
     kpi("Answer set", A ? int(A.germline) : "building",
       A ? `germline + ${int(A.synthetic)} synthetic · ${A.regime || ""} · donor ${A.donor || "?"} · ${int(A.n_targets)} targets` : "", "k-answer"),
@@ -217,16 +216,20 @@ function renderKpis(L, R, S, E, X, finished) {
 }
 
 function segments(E) {
+  // v4.9: six basins climb until one merge at the final. Minute 34 replaces a flat first scan.
+  // The last five minutes before the final (scaled) start no new basin.
   const sc = E.schedule;
   const founded = E.domains.length ? Math.min(...E.domains.map((d) => d.born_s)) : null;
   const openEnd = founded != null ? founded : Math.max(E.elapsed_s, Math.min(sc.opening_max_s, sc.reduce_to_3_start_s));
+  const vals = (last && last.settings && last.settings.values) || {};
+  const noNewMin = vals["schedule.no_new_before_final_min"] != null ? vals["schedule.no_new_before_final_min"] : 5;
+  const scale = sc.scale || 1;
+  const noNew = Math.max(openEnd, sc.final_by_s - noNewMin * 60 * scale);
   const cut = (a, b) => [Math.max(0, a), Math.max(Math.max(0, a), Math.min(sc.length_s, b))];
   return [
     ["opening", "Opening", ...cut(0, openEnd)],
-    ["climb", "Climb", ...cut(openEnd, sc.reduce_to_3_start_s)],
-    ["merge", "6 → 3", ...cut(sc.reduce_to_3_start_s, sc.reduce_to_3_by_s)],
-    ["climb", "Climb", ...cut(sc.reduce_to_3_by_s, sc.reduce_to_1_start_s)],
-    ["merge", "3 → 1", ...cut(sc.reduce_to_1_start_s, sc.final_by_s)],
+    ["climb", "Six basins", ...cut(openEnd, noNew)],
+    ["perturb", "No new basin", ...cut(noNew, sc.final_by_s)],
     ["final", "Final", ...cut(sc.final_by_s, sc.length_s)],
   ].filter((g) => g[3] - g[2] > 1);
 }
@@ -251,9 +254,16 @@ function renderAnswerLane(ax, finished) {
   if (A && !A.ready_ts) { lane.replaceChildren(); return; }               // a status file from before main recorded it
   const ready = A && A.ready_ts ? A.ready_ts - ax.start : null;
   const end = ready != null ? ready : Math.max(5, now() - ax.start);
-  const pct = (t) => `${(100 * Math.max(0, Math.min(ax.total, t))) / ax.total}%`;
+  const frac = ax.total > 0 ? Math.max(0, Math.min(1, end / ax.total)) : 0;
+  const pct = `${frac * 100}%`;
   const label = ready != null ? `answer set ${Math.round(ready)} s` : "answer set…";
-  lane.replaceChildren(h("div", {class: "seg", style: {left: "0", width: pct(end)}, title: label, text: label}));
+  // The bar is the build's true length. A build of about a minute is a sliver of a 72-minute round,
+  // so the words sit beside it instead of inside it.
+  const wide = frac > 0.7;
+  lane.replaceChildren(
+    h("div", {class: "seg", style: {left: "0", width: pct}, title: label}, wide ? label : null),
+    wide ? null : h("span", {class: "lane-label", style: {left: pct}, text: label}),
+  );
 }
 
 function renderSchedule(E, finished) {
@@ -276,7 +286,8 @@ function renderSchedule(E, finished) {
     style: {left: x(a), width: `${(100 * (b - a)) / L}%`}, title: `${label}: ${mins(a)} to ${mins(b)}`}, label));
   const t = finished ? L : E.elapsed_s + o;
   els.push(h("div", {class: "done", style: {width: x(t)}}));
-  els.push(h("div", {class: "pick", style: {left: x(E.schedule.pick_s + o)}, title: "plateau-centre pick"}));
+  els.push(h("div", {class: "pick", style: {left: x(E.schedule.pick_s + o)}, title: "the highest local score is named"}));
+  els.push(h("div", {class: "replace", style: {left: x(E.schedule.reduce_to_3_start_s + o)}, title: "a first scan that gained under 0.05 is replaced"}));
   if (!finished) els.push(h("div", {class: "now", style: {left: x(t)}, title: `now: ${mins(t)}`}));
   box.replaceChildren(...els);
   const all = [...new Set([0, ...segs.map((g) => Math.round(g[3] / 60))])].sort((a, b) => a - b);
@@ -285,7 +296,7 @@ function renderSchedule(E, finished) {
     if (marks.length && m - marks[marks.length - 1] < 2) marks[marks.length - 1] = m; else marks.push(m);
   }
   ticks.replaceChildren(...marks.map((m) => h("span", {style: {left: x(m * 60)}, text: `${m}`})));
-  $("schedule-sub").textContent = `minutes from the round's start; the search's stages scaled ×${E.schedule.scale.toFixed(2)} to this round`;
+  $("schedule-sub").textContent = `${E.version || "search"} · six basins climb, six wait, one merge at the final · stages scaled ×${E.schedule.scale.toFixed(2)}`;
 }
 
 function rowClass(d) {
@@ -378,6 +389,7 @@ function renderDomains(E, finished) {
   if (!live.length) { box.replaceChildren(h("div", {class: "empty", text: E.phase === "opening" ? "The opening is still running." : "No live domain."})); return; }
   box.replaceChildren(...live.map((d) => {
     const cls = d.status === "merging" ? "merging" : d.state === "final" ? "final" : "";
+    const led = (E.basins || []).find((b) => b.id === d.id);
     return h("div", {class: `card ${cls}`},
       h("div", {class: "head"}, h("b", {text: `Domain ${d.id}`}),
         finished ? chip("finished", "final") : chip(d.status === "merging" ? "merging" : d.state, d.status === "merging" ? "merging" : d.state),
@@ -385,10 +397,11 @@ function renderDomains(E, finished) {
       h("div", {class: "big", text: fix(d.best)}),
       bar(d.allotted ? d.inflight / Math.max(d.allotted, d.inflight) : 0, "", null),
       kv([
+        led ? ["opened", fix(led.opened)] : null,
+        led ? ["first scan", led.first == null ? "pending" : fix(led.first)] : null,
         ["climbing", `${d.progress_per_min >= 0 ? "+" : ""}${fix(d.progress_per_min)} / min`],
         finished ? null : ["in flight", d.status === "merging" ? `${d.inflight}, merging` : `${d.inflight} of ${fix(d.allotted, 0)} allotted`],
         ["configs tried", int(d.tried)],
-        finished || !d.chains ? null : ["chains", `${d.chains}${d.perturb_rounds ? ` · perturbation round ${d.perturb_rounds}` : ""}`],
         ["born at", mins(d.born_s)],
         d.parents.length ? ["merged from", d.parents.map((p) => `D${p}`).join(", ")] : null,
         ["centre", h("span", {class: "mono", text: d.centre.slice(0, 12)})],
@@ -418,29 +431,30 @@ function renderWaves(E, R) {
         h("span", {class: "num muted", text: `${int(w.back)} / ${int(w.sent)} back`})),
       bar(w.sent ? w.back / w.sent : 0, "open", null),
       gain != null ? h("div", {class: "muted", text: `the next wave started ${gain >= 0 ? "+" : ""}${fix(gain)} higher`}) : null);
-  }), h("div", {class: "muted", text: E.phase === "opening" ? "Domains are founded when the opening ends." : `Founded ${E.domains.filter((d) => d.origin === "the opening").length} domains.`}));
+  }), h("div", {class: "muted", text: E.phase === "opening" ? "Six basins start when the opening ends. Six more wait." : `${E.domains.filter((d) => d.origin === "the opening").length} opened · ${int(E.pending)} waiting`}));
 }
 
 function renderScout(E, S, finished) {
   const box = $("scout");
   if (!E) { box.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); return; }
-  const target = Math.max(1, Math.floor(E.capacity * E.scout.share));
-  const finds = E.domains.filter((d) => d.origin.startsWith("a scout find")).length;
+  const scoutOff = !E.scout.share;
+  const target = Math.max(1, Math.floor(E.capacity * (E.scout.share || 0)));
   box.replaceChildren(
     h("div", {class: "rowline"},
       h("div", {class: "top-line"}, h("b", {text: "Scout"}),
-        h("span", {class: "num muted", text: finished ? "stopped" : `${int(E.scout.in_flight)} / ${int(target)} in flight`})),
-      bar(finished ? 0 : E.scout.in_flight / target, "scout", null)),
+        h("span", {class: "num muted", text: scoutOff ? "off" : finished ? "stopped" : `${int(E.scout.in_flight)} / ${int(target)} in flight`})),
+      scoutOff ? h("div", {class: "muted", text: "A find is recombined with the nearest basin. It does not found a domain."})
+        : bar(finished ? 0 : E.scout.in_flight / target, "scout", null)),
     kv([
       ["finds tested", int(E.scout.finds_tested)],
       ["finds being tested", int(E.scout.finds_testing)],
-      ["domains founded from finds", int(finds)],
+      ["held candidates", int(E.pending)],
       ["scored candidates kept", int(E.candidates)],
     ]),
     h("div", {class: "rowline"}, h("b", {text: "Pick"}),
       E.pick ? kv([["config", h("span", {class: "mono", text: E.pick.key.slice(0, 12)})], ["its score", fix(E.pick.score)],
         ["best score", fix(E.pick.best)], ["neighbour mean", fix(E.pick.neighbour_mean)]])
-        : h("div", {class: "muted", text: `made ${mins(E.schedule.length_s - E.schedule.pick_s)} before the end`})),
+        : h("div", {class: "muted", text: "the highest local score, named before the search ends"})),
   );
 }
 
