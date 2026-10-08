@@ -184,6 +184,35 @@ class ClimberTest(unittest.TestCase):
         self.assertEqual(d.best, 88.2)
         self.assertEqual(d.best_fp, 1.6)
 
+    def test_a_refused_config_keeps_the_setting_that_raised_core(self):
+        space, d, live = self.make()
+        d.best_fp = 2.0
+        d.best_core = 0.89
+        moves = d.refill(live, random.Random(0), 20)
+        m = next(x for x in moves if x.kind == "n1")
+        d.take()
+        centre = d.centre.key
+        a = m.axes[0]
+        self.assertFalse(d.consider(m, True, m.config, 90.0, False, 1.0, fp=2.4, core=0.90))
+        self.assertEqual(d.centre.key, centre)                                 # the dirtier config stays behind
+        self.assertEqual(d.pros[a], m.config.params[a])
+        self.assertEqual(d.take_pros(), [(a, m.config.params[a])])
+        self.assertFalse(d.consider(m, True, m.config, 90.0, False, 1.0, fp=2.4, core=0.88))
+        self.assertEqual(d.take_pros(), [])                                    # a lower core is not a pro
+
+    def test_a_cut_domain_hands_its_gained_settings_to_the_basins_that_stay(self):
+        space, d, live = self.make()
+        moves = d.refill(live, random.Random(1), 20)
+        m = next(x for x in moves if len(x.axes) == 1)
+        a = m.axes[0]
+        other = Climber(1, space, d.book, m.config, 87.0, 0.0)
+        d.axis_gain[a] = 0.02
+        d.axis_gain["not_a_gain"] = -1.0
+        n = d.hand(d.gained(), [other])
+        self.assertEqual(n, 1)
+        self.assertIn(("share", {a: d.centre.params[a]}), other.queued)
+        self.assertEqual(d.hand(d.gained(), [other]), 0)                        # already queued
+
     def test_the_core_seat_keeps_a_higher_score_when_false_positives_rise(self):
         space, d, live = self.make()
         d.allow_fp = True

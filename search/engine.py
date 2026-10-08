@@ -1,4 +1,12 @@
-"""The search engine (v4.18): a scan that failed is sent again.
+"""The search engine (v4.19): a config that loses still keeps the settings that helped.
+Owner: search.
+
+v4.19 keeps v4.18. A scored config the centre does not take can still hold one setting that raised core.
+That setting is tried, alone, on the basins that stay. At the cut, each retired basin hands over the same
+kind of setting: the values that raised core, and the centre's value on every axis whose moves gained.
+The settings that did not gain stay behind with the config.
+
+The search engine (v4.18): a scan that failed is sent again.
 Owner: search.
 
 v4.18 keeps v4.17. A full-range scan whose every result failed (a full disk, a crash) is not a flat peak.
@@ -341,6 +349,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         ids = [0, 0]                                 # next domain id, next merge id
         candidates: Dict[str, Tuple[Config, float]] = {}
         fp_of: Dict[str, float] = {}                     # config key -> false positives per target, when measured
+        core_of: Dict[str, float] = {}                   # config key -> core, when measured
         part_keep: Dict[str, List[Tuple[float, Config]]] = {"core": [], "fp": []}   # top measured core and FP rate
         island_of: Dict[str, int] = {}               # opening.islands: config key -> island
         was_centre: Set[str] = set()
@@ -725,6 +734,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             was_centre.add(c.key)
             if c.key in fp_of:
                 d.best_fp = fp_of[c.key]
+            if c.key in core_of:
+                d.best_core = core_of[c.key]
             say("domain %d born at %.4f (%s) t+%.1fm", d.id, s, why, elapsed() / 60)
             return d
 
@@ -990,7 +1001,9 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                         d.history.append((clock(), d.best, "cut"))   # the stall clock starts over for the basins that stay
                     for d in drop:
                         gain = d.best - d.first_scan_score
-                        say("domain %d retired at %.4f (cut, gain %.4f) t+%.1fm", d.id, d.best, gain, elapsed() / 60)
+                        handed = d.hand(d.gained(), keep)
+                        say("domain %d retired at %.4f (cut, gain %.4f); %d gained settings go to the basins that stay t+%.1fm",
+                            d.id, d.best, gain, handed, elapsed() / 60)
                         retire(d)
                     say("cut at t+%.1fm: keeping %s", elapsed() / 60,
                         " ".join("%d:%.3f" % (d.id, d.best) for d in keep))
@@ -1072,8 +1085,14 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if now - st["last_share"] >= 60 * tune("sharing.every_min") and len(live()) > 1:
                 st["last_share"] = now
                 for d in live():
+                    pairs = [(a, v) for a, v in d.pros.items()]
                     for a in sorted(d.axis_gain, key=lambda x: -d.axis_gain[x])[:tune("sharing.settings")]:
+                        if d.axis_gain[a] <= 0 or a in d.pros:
+                            continue
                         v = d.centre.params.get(a)
+                        if v is not None:
+                            pairs.append((a, v))
+                    for a, v in pairs:
                         for e in live():
                             if e is not d and not space._same(space.specs[a], e.centre.params.get(a), v):
                                 e.queue("share", {a: v})
@@ -1249,7 +1268,10 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 say("reductions: %s t+%.1fm", learned, elapsed() / 60)
             rr = o.result
             fp = (rr.region_fp / rr.n_targets) if (rr and not failed and rr.n_targets) else None
-            ranker.add(o.config, rr.core if (rr and not failed) else None, fp, failed)
+            core = rr.core if (rr and not failed and rr.core is not None) else None
+            if core is not None:
+                core_of[o.config.key] = core
+            ranker.add(o.config, core, fp, failed)
             if fp is not None:
                 fp_of[o.config.key] = fp
             if not failed and rr is not None and rr.core is not None and fp is not None:
@@ -1306,10 +1328,16 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             d = domains.get(unit.domain) if unit.domain is not None else None
             if d is None or unit.move is None or status[d.id] == "retired":
                 return
-            if d.consider(unit.move, is_head, o.config, score, failed, now, fp):
+            if d.consider(unit.move, is_head, o.config, score, failed, now, fp, core):
                 say("domain %d -> %.4f via %s %s t+%.1fm", d.id, d.best, unit.move.kind,
                          ",".join(unit.move.axes), elapsed() / 60)
                 cancel_behind(d.id)                        # a new centre: children of the old one are dropped
+            fresh = d.take_pros()
+            if fresh:
+                handed = d.hand(fresh, [e for e in live() if e is not d])
+                if handed:
+                    say("domain %d keeps %s from a config it did not take; %d basins try it t+%.1fm",
+                        d.id, ",".join(a for a, _ in fresh), handed, elapsed() / 60)
 
         def maybe_fit() -> None:
             if ranker.stale() and (fitting[0] is None or fitting[0].done()):
@@ -1367,7 +1395,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.18", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.19", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),
