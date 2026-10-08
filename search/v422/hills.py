@@ -9,8 +9,8 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from common.types import Config
-from search.axes import far_axes
-from search.space import Space
+from search.v422.axes import far_axes
+from search.v422.space import Space
 
 MIN_FAR = 4
 

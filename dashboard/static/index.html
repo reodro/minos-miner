@@ -6,9 +6,9 @@
 <title>Minos dashboard</title>
 <script src="/static/theme.js?v=17"></script>
 <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
-<link rel="stylesheet" href="/static/app.css?v=33">
+<link rel="stylesheet" href="/static/app.css?v=34">
 <script src="/static/vendor/uPlot.iife.min.js" defer></script>
-<script src="/static/app.js?v=33" defer></script>
+<script src="/static/app.js?v=34" defer></script>
 </head>
 <body>
 <header class="top">
@@ -39,32 +39,32 @@
   </section>
 
   <section class="panel" aria-labelledby="h-tree">
-    <h2 id="h-tree">Domain tree <span class="sub">each row is a domain over time; merges join their parents</span></h2>
+    <h2 id="h-tree">Climbers <span class="sub">each row is a climber over time; dots are moves of its centre; a Step C short climb hangs off its peak</span></h2>
     <div class="lineage" id="lineage"></div>
     <div class="legend" id="lineage-legend">
-      <span><i class="live"></i>climbing</span><span><i class="perturb"></i>perturbing</span>
-      <span><i class="merging"></i>merging</span><span><i class="final"></i>final</span>
-      <span><i class="retired"></i>retired</span><span><i class="find"></i>founded from a scout find</span>
+      <span><i class="live"></i>climbing</span><span><i class="final"></i>at its peak</span>
+      <span><i class="stopped"></i>stopped by the clock</span><span><i class="landed"></i>Step C short climb</span>
+      <span><i class="retired"></i>joined another</span><span><i class="find"></i>a Step C find</span><span><i class="jump"></i>a random jump</span>
     </div>
   </section>
 
-  <section class="panel" aria-labelledby="h-domains">
-    <h2 id="h-domains">Live domains <span class="sub" id="domains-sub"></span></h2>
-    <div class="cards" id="domains"></div>
+  <section class="panel" aria-labelledby="h-climbers">
+    <h2 id="h-climbers">Step B: climbers <span class="sub" id="climbers-sub"></span></h2>
+    <div class="cards" id="climbers"></div>
   </section>
 
   <div class="grid3">
-    <section class="panel" aria-labelledby="h-merges">
-      <h2 id="h-merges">Merges in progress</h2>
-      <div class="rows" id="merges"></div>
-    </section>
-    <section class="panel" aria-labelledby="h-opening">
-      <h2 id="h-opening">Opening</h2>
+    <section class="panel" aria-labelledby="h-stepa">
+      <h2 id="h-stepa">Step A: candidates</h2>
       <div class="rows" id="waves"></div>
     </section>
-    <section class="panel" aria-labelledby="h-scout">
-      <h2 id="h-scout">Scout and pick</h2>
-      <div class="rows" id="scout"></div>
+    <section class="panel" aria-labelledby="h-stepc">
+      <h2 id="h-stepc">Step C: around the peaks</h2>
+      <div class="rows" id="stepc"></div>
+    </section>
+    <section class="panel" aria-labelledby="h-pick">
+      <h2 id="h-pick">Pick and best</h2>
+      <div class="rows" id="pick"></div>
     </section>
   </div>
 

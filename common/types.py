@@ -146,6 +146,7 @@ class CallSet:
     score: Optional["ScoreResult"] = None   # set when the machine that ran it also scored it (fleet nodes); then
                                             # nobody else needs the VCF, which stays on that machine
     haplotype_cap: Optional[int] = None     # smallest max_num_haplotypes_in_population that reproduces this assembly
+    sketch: Optional[dict] = None           # evaluator.sketch.callset_sketch: per-class bottom-k MinHash of the calls
 
 
 @dataclass
