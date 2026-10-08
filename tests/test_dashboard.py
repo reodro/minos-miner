@@ -76,7 +76,7 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(r.status_code, 422)
         self.assertEqual([x["name"] for x in r.json()["rejected"]], ["scout.share"])
         self.assertEqual(read_overrides(self.tuning)[0], {"domains.max": 4, "scout.share": 0.2})   # unchanged
-        r = self.c.put("/api/settings", json={"reset": ["scout.share"], "set": {"domains.max": 12}}, headers=W)
+        r = self.c.put("/api/settings", json={"reset": ["scout.share"], "set": {"domains.max": 24}}, headers=W)
         self.assertEqual(read_overrides(self.tuning)[0], {})                # a default needs no override
         self.assertEqual(r.json()["overrides"], {})
         self.assertEqual(self.c.put("/api/settings", json={"set": {"pick.band": 0.1}}).status_code, 400)

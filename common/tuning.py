@@ -97,6 +97,7 @@ GROUPS = {
     "pick": "Pick: the config main submits",
     "evaluator": "Evaluator: batches and routing on the fleet",
     "main": "Main: submissions",
+    "answer_set": "Answer set: the targets the local score divides by",
 }
 
 KNOBS_LIST: List[Knob] = [
@@ -221,6 +222,9 @@ KNOBS_LIST: List[Knob] = [
     Knob("main.resubmit_interval_s", 300.0, 0.0, 3600.0, ROUND, "s", "Least time between two submissions."),
     Knob("main.resubmit_margin", 0.0, 0.0, 5.0, ROUND, "score", "A new best must gain this much to be resubmitted."),
     Knob("main.stop_before_deadline_s", 60.0, 10.0, 900.0, ROUND, "s", "The search stops this long before the deadline."),
+    Knob("answer_set.n", 548, 50, 2000, ROUND, "count",
+         "How many targets the next round's answer set writes. The local score divides false calls by this. "
+         "A change made during a round waits for the next round."),
 ]
 KNOBS: Dict[str, Knob] = {k.name: k for k in KNOBS_LIST}
 assert len(KNOBS) == len(KNOBS_LIST) and all(k.group in GROUPS for k in KNOBS_LIST)

@@ -74,7 +74,7 @@ def read_output(round: Round, out: Path) -> AnswerSet:
     notes = {"source": "k2", "truth_vcf": str(out / "truth.vcf.gz"), "mutations_vcf": mutations,
              "scores_tsv": str(out / "scores.tsv.gz"), "region": round.region, "reference": round.reference,
              "model": report.get("model"), "threshold": report.get("threshold"), "mode": report["mode"],
-             "n_targets_source": "platform" if round.n_targets else "builder (median)", "report": report,
+             "n_targets_source": "platform" if round.n_targets else "setting answer_set.n", "report": report,
              "warnings": warnings_of(report)}
     return AnswerSet(round.round_id, 1, regime, donor, germline, synthetic, round.n_targets or n_file, notes)
 
