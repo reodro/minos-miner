@@ -262,7 +262,10 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .feed .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
 .feed .msg { overflow-wrap: anywhere; }
 .chart { min-height: 280px; }
-.chart .u-legend { font-size: 12px; color: var(--muted); }
+.chart .u-legend, .hist-plot .u-legend { font-size: 12px; color: var(--muted); }
+.hist-charts { display: grid; gap: 22px; }
+.hist-chart h2 { margin: 0 0 8px; font-size: 15px; }
+.hist-plot { min-height: 200px; }
 
 /* settings */
 .settings-bar { position: sticky; top: var(--top-h, 58px); z-index: 4; align-self: start; display: flex; flex-wrap: wrap;

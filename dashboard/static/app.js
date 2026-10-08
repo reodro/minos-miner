@@ -114,6 +114,7 @@ function showThemeButton() {
 function themeChanged() {
   showThemeButton();
   if (last) render();                           // the chart takes its colors from the theme when it is drawn
+  if (!$("view-history").hidden) renderHistoryCharts();
 }
 $("theme").addEventListener("click", () => {
   const next = effectiveTheme() === "dark" ? "light" : "dark";
@@ -568,7 +569,13 @@ function renderChart(S, subs) {
     chart.setData(data);
   }
 }
-window.addEventListener("resize", () => { sizeChart(); if (last) renderLineage((last.search || {}).engine); });
+function sizeHistCharts() {
+  for (const plot of Object.values(histCharts)) {
+    const el = plot && plot.root && plot.root.parentElement;
+    if (plot && el && el.clientWidth) plot.setSize({width: el.clientWidth, height: 200});
+  }
+}
+window.addEventListener("resize", () => { sizeChart(); sizeHistCharts(); if (last) renderLineage((last.search || {}).engine); });
 
 function renderNodes(X, finished) {
   const box = $("nodes");
@@ -741,6 +748,7 @@ $("save").addEventListener("click", async () => {
 // ---- history: finished runs from rounds.jsonl. Loaded when the tab opens, not on the live poll. ----
 let historyRuns = [];
 let historySelected = null;
+const histCharts = {};
 
 function when(ts) {
   if (ts == null) return "";
@@ -779,8 +787,63 @@ async function loadHistory() {
     historyRuns = body.runs || [];
     if (historySelected && !historyRuns.some((x) => x.run_id === historySelected)) historySelected = null;
     $("history-state").textContent = historyRuns.length ? `${historyRuns.length} finished runs` : "No finished runs yet.";
+    renderHistoryCharts();
     renderHistory();
   } catch (e) { /* a 401 already sent the browser to the login page */ }
+}
+
+function historyStamp(tag) {
+  return tag && tag.length >= 15 ? `${tag.slice(6, 8)} ${tag.slice(9, 11)}:${tag.slice(11, 13)}` : "";
+}
+
+function mountHist(id, runs, series, kind) {
+  const el = $(id);
+  if (typeof uPlot === "undefined") return null;
+  const cols = series.map((s) => runs.map(s.get));
+  if (!cols.some((c) => c.some((v) => v != null))) {
+    el.replaceChildren(h("div", {class: "empty", text: "Nothing reviewed yet."}));
+    return null;
+  }
+  el.replaceChildren();
+  const axis = {stroke: css("--muted"), grid: {stroke: css("--line"), width: 1}, ticks: {stroke: css("--line")}};
+  const yText = kind === "rho" ? (x) => x.toFixed(3) : kind === "n" ? (x) => String(Math.round(x)) : (x) => x.toFixed(2);
+  return new uPlot({
+    width: el.clientWidth || 320, height: 200,
+    scales: {
+      x: {time: false, range: (u, lo, hi) => hi - lo < 1 ? [lo - 0.6, hi + 0.6] : [lo - 0.4, hi + 0.4]},
+      y: {range: (u, lo, hi) => { const span = hi - lo || Math.abs(hi) || 1; return [lo - span * 0.08, hi + span * 0.08]; }},
+    },
+    axes: [
+      {...axis, values: (u, splits) => splits.map((v) => {
+        const i = Math.round(v);
+        if (Math.abs(v - i) > 0.05 || !runs[i]) return "";
+        return historyStamp(runs[i].tag);
+      })},
+      {...axis, size: 48, values: (u, v) => v.map(yText)},
+    ],
+    series: [{label: "round"}, ...series.map((s) => ({label: s.label, stroke: css(s.color), width: 2, spanGaps: false,
+      points: {show: true, size: 5, fill: css(s.color), stroke: css(s.color)}}))],
+  }, [runs.map((_, i) => i), ...cols], el);
+}
+
+function renderHistoryCharts() {
+  for (const plot of Object.values(histCharts)) if (plot) plot.destroy();
+  const runs = [...historyRuns].reverse();                          // oldest on the left
+  const gapOf = (r) => {
+    if (r.gap_to_best != null) return r.gap_to_best;
+    const t = r.true_score != null ? r.true_score : r.final_true;
+    return r.field_best != null && t != null ? r.field_best - t : null;
+  };
+  histCharts.score = mountHist("hist-score", runs, [
+    {label: "gap", color: "--accent", get: gapOf},
+  ], "score");
+  histCharts.n = mountHist("hist-n", runs, [
+    {label: "ours", color: "--accent", get: (r) => r.n_ours},
+    {label: "truth", color: "--scout", get: (r) => r.n_truth},
+  ], "n");
+  histCharts.rho = mountHist("hist-rho", runs, [
+    {label: "Spearman", color: "--final", get: (r) => r.spearman},
+  ], "rho");
 }
 
 function renderHistory() {

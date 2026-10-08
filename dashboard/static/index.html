@@ -6,9 +6,9 @@
 <title>Minos dashboard</title>
 <script src="/static/theme.js?v=17"></script>
 <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
-<link rel="stylesheet" href="/static/app.css?v=32">
+<link rel="stylesheet" href="/static/app.css?v=33">
 <script src="/static/vendor/uPlot.iife.min.js" defer></script>
-<script src="/static/app.js?v=32" defer></script>
+<script src="/static/app.js?v=33" defer></script>
 </head>
 <body>
 <header class="top">
@@ -91,6 +91,20 @@
     <div class="spacer"></div>
     <button class="btn" id="history-refresh" type="button">Refresh</button>
   </div>
+  <section class="panel hist-charts" aria-label="History across rounds">
+    <div class="hist-chart">
+      <h2>Score <span class="sub">field best minus TRUE</span></h2>
+      <div class="hist-plot" id="hist-score"></div>
+    </div>
+    <div class="hist-chart">
+      <h2>N <span class="sub">our targets and the truth's</span></h2>
+      <div class="hist-plot" id="hist-n"></div>
+    </div>
+    <div class="hist-chart">
+      <h2>Spearman <span class="sub">local versus true order</span></h2>
+      <div class="hist-plot" id="hist-rho"></div>
+    </div>
+  </section>
   <section class="panel">
     <div class="muted">Finished runs, newest first. Select one to see its scores, the search, and the answer set.</div>
     <div class="hist" id="history-list"></div>
