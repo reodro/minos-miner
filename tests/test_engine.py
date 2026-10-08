@@ -155,6 +155,22 @@ class ClimberTest(unittest.TestCase):
         self.assertEqual(d.mode, "fine")
         self.assertNotIn("wide", {m.kind for m in nxt})
 
+    def test_a_higher_score_with_more_false_positives_is_not_a_move(self):
+        space, d, live = self.make()
+        d.best_fp = 2.0
+        moves = d.refill(live, random.Random(0), 20)
+        m = next(x for x in moves if x.kind == "n1")
+        d.take()
+        centre = d.centre.key
+        self.assertFalse(d.consider(m, True, m.config, 90.0, False, 1.0, fp=2.4))
+        self.assertEqual(d.centre.key, centre)
+        self.assertEqual(d.best, 88.0)
+        self.assertFalse(d.consider(m, True, m.config, 87.0, False, 1.0, fp=1.2))   # cleaner, but the score fell
+        self.assertEqual(d.best, 88.0)
+        self.assertTrue(d.consider(m, True, m.config, 88.2, False, 1.0, fp=1.6))
+        self.assertEqual(d.best, 88.2)
+        self.assertEqual(d.best_fp, 1.6)
+
     def test_a_new_domain_scans_every_setting_over_its_range(self):
         space, book, names = setup()
         geno = [a for a in GENOTYPING_PARAMS if a in space.names]

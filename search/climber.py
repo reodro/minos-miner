@@ -14,8 +14,9 @@ notes for the dashboard's event feed (`events`).
                and never doubled again, settings whose step changed nothing are left out until the centre moves,
                triples join the pairs, and each exhausted fine sweep halves the scale once more
   acceptance   the centre moves to the best result of the sweep once most of it is back (a decisive gain at once); the
-               sweep's other winners are re-applied on the new centre first. An exact tie is never a move: identical
-               scores mean identical calls (the setting changed nothing here)
+               sweep's other winners are re-applied on the new centre first. A higher score moves the centre only when
+               it does not add false positives: a cleaner call of the variants already found. An exact tie is never a
+               move: identical scores mean identical calls (the setting changed nothing here)
   perturbation when a fine sweep is exhausted at every setting's smallest step: shake K settings of the centre (K =
                climb.shake_k in turn), then one local round around the best shaken point; the result replaces the
                centre if it is better OR EQUAL (ParamILS's acceptance). Round after round - it never gives up
@@ -116,7 +117,8 @@ class Climber:
         self.wide_next = self.wide_done = False            # the wide round of this centre: queued / done
         self.eager_wide = False                            # set by the engine: few domains, so wide with the first sweep
         self.sweep_sent = self.sweep_back = 0
-        self.winners: List[Tuple[Move, Config, float]] = []
+        self.winners: List[Tuple[Move, Config, float, Optional[float]]] = []
+        self.best_fp: Optional[float] = None           # false positives per target at the centre; a move may not raise it
         self.flat: Set[str] = set()
         self.recent: List[str] = []                        # settings of accepted moves, most recent last
         self.axis_gain: Dict[str, float] = {}
@@ -579,15 +581,25 @@ class Climber:
         return bool(self.sweep_is_scan and self.sweep_sent
                     and self.sweep_back < tune("climb.back_frac") * self.sweep_sent)
 
-    def offer(self, config: Config, score: float, now: float) -> bool:
+    def _worth(self, score: Optional[float], fp: Optional[float]) -> bool:
+        """A result is a move when the score rises and the call is not dirtier. A higher score bought with more
+        false positives is not progress: the truth score charges that rate more than the extra calls return."""
+        if score is None or score <= self.best + tune("climb.accept_min"):
+            return False
+        if fp is None or self.best_fp is None:
+            return True
+        return fp <= self.best_fp
+
+    def offer(self, config: Config, score: float, now: float, fp: Optional[float] = None) -> bool:
         """A point the registry puts on this hill. A gain of climb.decisive moves the centre at once and the scan
         runs again. A smaller gain does not interrupt a scan, and does not move a peak whose scan already came
-        back flat. Not counted as the domain's own progress."""
-        if config.key == self.centre.key or score <= self.best + tune("climb.accept_min"):
+        back flat. A gain that adds false positives does not move the centre. Not counted as the domain's own
+        progress."""
+        if config.key == self.centre.key or not self._worth(score, fp):
             return False
         if self.scan_open() and score < self.best + tune("climb.decisive"):
             return False                                       # a small gain does not abort a scan that is still out
-        self._recentre(config, score, now, (), own=False)
+        self._recentre(config, score, now, (), own=False, fp=fp)
         return True
 
     def start_final(self) -> None:
@@ -619,7 +631,7 @@ class Climber:
 
     # ---- results --------------------------------------------------------------------------------------------------------
     def consider(self, move: Move, is_head: bool, config: Config, score: Optional[float], failed: bool,
-                 now: float) -> bool:
+                 now: float, fp: Optional[float] = None) -> bool:
         """A result for this domain (a move or one of its siblings). True when the centre moved."""
         bad = failed or score is None or score <= 0
         current = move.centre_key == self.centre.key
@@ -630,7 +642,10 @@ class Climber:
             if move.kind in ("shake", "local") and move.cycle == self.cycle and self.state == "perturb":
                 self.cycle_back += 1
             if move.kind in ("n1", "local", "final") and len(move.axes) == 1:
-                self._learn(move.axes[0], config, move, score, bad, now)
+                learned = score
+                if not bad and score is not None and not self._worth(score, fp) and score > self.best:
+                    learned = self.best - 1.0          # a dirtier higher score is a step away from the score
+                self._learn(move.axes[0], config, move, learned, bad, now)
             if move.kind in CHAIN_KINDS:
                 self._chain_result(move, config, None if bad else score)
         if bad:
@@ -638,20 +653,20 @@ class Climber:
         if move.kind in ("shake", "local") and self.state == "perturb" and move.cycle == self.cycle:
             if self.cycle_best is None or score > self.cycle_best[1]:
                 self.cycle_best = (config, score)
-        if score > self.best + tune("climb.decisive"):                  # decisive: at once, whatever produced it
+        if self._worth(score, fp) and score > self.best + tune("climb.decisive"):
             self._credit(move, score)
-            self._recentre(config, score, now, move.axes if current else (), own=True)
+            self._recentre(config, score, now, move.axes if current else (), own=True, fp=fp)
             return True
-        if score > self.best + tune("climb.accept_min") and move.kind in CHAIN_KINDS:
+        if self._worth(score, fp) and move.kind in CHAIN_KINDS:
             if self.scan_open() and score < self.best + tune("climb.decisive"):
                 return False                                    # a chain under 0.05 does not abort a scan still out
             self._credit(move, score)                                   # a chain beat the domain: its centre moves
             self.note(f"a chain found {score:.4f}")
-            self._recentre(config, score, now, (), own=True)
+            self._recentre(config, score, now, (), own=True, fp=fp)
             return True
-        if score > self.best + tune("climb.accept_min") and move.kind in SWEEP_KINDS and self.state in ("climb", "final"):
+        if self._worth(score, fp) and move.kind in SWEEP_KINDS and self.state in ("climb", "final"):
             self._credit(move, score)
-            self.winners.append((move, config, score))
+            self.winners.append((move, config, score, fp))
         return self._maybe_recentre(now)
 
     def _record_first_scan(self, score: float, key: str, held: bool) -> None:
@@ -680,10 +695,10 @@ class Climber:
             if picked is not None and picked[2] > self.best + tune("climb.decisive"):
                 self.sweep_is_scan = False
                 return False                            # a decisive gain already moved the centre and restarts the scan
-            if picked is not None and picked[2] > self.best + tune("climb.accept_min"):
-                move, config, score = picked
+            if picked is not None and self._worth(picked[2], picked[3]):
+                move, config, score, fp = picked
                 gain = score - self.best
-                self._recentre(config, score, now, move.axes if move.centre_key == self.centre.key else (), own=True)
+                self._recentre(config, score, now, move.axes if move.centre_key == self.centre.key else (), own=True, fp=fp)
                 self.note(f"scan back, gain {gain:.4f}: centre moved")
                 return True                             # above the answer set's resolution: keep it, do not rescan
             score = picked[2] if picked is not None else self.best
@@ -695,9 +710,9 @@ class Climber:
             return False
         if not self.winners or self.sweep_back < tune("climb.back_frac") * max(1, self.sweep_sent):
             return False
-        move, config, score = max(self.winners, key=lambda t: t[2])
-        others = [(m, c, s) for m, c, s in self.winners if c.key != config.key and m.centre_key == move.centre_key]
-        self._recentre(config, score, now, move.axes if move.centre_key == self.centre.key else (), own=True)
+        move, config, score, fp = max(self.winners, key=lambda t: t[2])
+        others = [(m, c, s) for m, c, s, _fp in self.winners if c.key != config.key and m.centre_key == move.centre_key]
+        self._recentre(config, score, now, move.axes if move.centre_key == self.centre.key else (), own=True, fp=fp)
         changes: List[Dict[str, object]] = []
         for m, c, s in sorted(others, key=lambda t: -t[2])[:8]:        # re-apply the sweep's other winners
             ch = {a: c.params.get(a) for a in m.axes
@@ -731,7 +746,8 @@ class Climber:
         elif delta is not None and delta < 0:
             self.steps[axis] = max(self._floor(axis), self.steps[axis] * 0.5)
 
-    def _recentre(self, config: Config, score: float, now: float, axes: Sequence[str], own: bool) -> None:
+    def _recentre(self, config: Config, score: float, now: float, axes: Sequence[str], own: bool,
+                  fp: Optional[float] = None) -> None:
         was_scan = self.sweep_is_scan
         gain = score - self.best
         if was_scan:
@@ -742,6 +758,8 @@ class Climber:
             self.rounds = 0
         self.cycle, self.cycle_sent, self.cycle_best = 0, 0, None   # a new centre: the next perturbation starts at K=2
         self.centre, self.best = config, score
+        if fp is not None:
+            self.best_fp = fp
         self.tried.add(config.key)
         self.pool = [m for m in self.pool if m.kind in CHAIN_KINDS]  # the chains walk on; the centre's sweep restarts
         self.winners = []

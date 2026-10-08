@@ -3,7 +3,9 @@ Owner: search.
 
 v4.13 keeps v4.12. All twelve centres climb until the cut. A basin that has stopped gaining keeps its seat until
 then, so the ranking still sees it. The basins the cut keeps start their stall clock over, so that ranking is not
-undone in the next minutes. After the cut, a stall retires the basin and does not birth another domain.
+undone in the next minutes. After the cut, a stall retires the basin and does not birth another domain. A higher
+score moves a centre only when it does not add false positives: the climb keeps a cleaner call of the variants it
+already finds, and a gain bought with more false positives is not a move.
 
 The search engine (v4.12): twelve basins climb, then the moving six keep the workers.
 Owner: search.
@@ -268,6 +270,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         behind: Dict[int, List[Tuple[str, Config, int]]] = {}
         ids = [0, 0]                                 # next domain id, next merge id
         candidates: Dict[str, Tuple[Config, float]] = {}
+        fp_of: Dict[str, float] = {}                     # config key -> false positives per target, when measured
         island_of: Dict[str, int] = {}               # opening.islands: config key -> island
         was_centre: Set[str] = set()
         wave_heads: List[int] = []                   # heads sent per wave (0 = hypercube, 1.. = generations)
@@ -594,6 +597,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if st["final"]:
                 d.start_final()                              # born from a merge during the final: it stays final
             was_centre.add(c.key)
+            if c.key in fp_of:
+                d.best_fp = fp_of[c.key]
             say("domain %d born at %.4f (%s) t+%.1fm", d.id, s, why, elapsed() / 60)
             return d
 
@@ -642,7 +647,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             n = 0
             if guest is not None:
                 old = keep.centre
-                if keep.offer(guest[0], guest[1], clock()):
+                if keep.offer(guest[0], guest[1], clock(), fp_of.get(guest[0].key)):
                     n += keep.transplant(old, names())
                 else:
                     n += keep.transplant(guest[0], names())
@@ -692,7 +697,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             for g in list(deferred):                         # points that arrived on the merging hill
                 if hills.same(g[0], d.centre):
                     deferred.remove(g)
-                    if d.offer(g[0], g[1], clock()):
+                    if d.offer(g[0], g[1], clock(), fp_of.get(g[0].key)):
                         say("domain %d -> %.4f, a point that arrived during merge %d t+%.1fm", d.id, g[1], mj.id,
                             elapsed() / 60)
             return d
@@ -722,7 +727,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 return
             if existing:
                 cancel_behind(d.id, ("findmerge",))
-            if d.offer(c, s, clock()):
+            if d.offer(c, s, clock(), fp_of.get(c.key)):
                 say("domain %d -> %.4f, an off-hill find merged in t+%.1fm", d.id, s, elapsed() / 60)
             fm = FindMerge(ids[1], d.id, (c, s))
             ids[1] += 1
@@ -797,7 +802,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     birth(c, s, f"a scout find, {valley}, replacing domain {weak.id}")
                     return
                 merge_find(c, s)                               # no slot: into the nearest domain
-            elif d is not None and status[d.id] == "live" and d.offer(c, s, clock()):
+            elif d is not None and status[d.id] == "live" and d.offer(c, s, clock(), fp_of.get(c.key)):
                 say("domain %d -> %.4f, a scout find on its hill (midpoint %.4f) t+%.1fm", d.id, s,
                          mid_score, elapsed() / 60)
 
@@ -1113,8 +1118,10 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if learned:
                 say("reductions: %s t+%.1fm", learned, elapsed() / 60)
             rr = o.result
-            ranker.add(o.config, rr.core if (rr and not failed) else None,
-                       (rr.region_fp / rr.n_targets) if (rr and not failed and rr.n_targets) else None, failed)
+            fp = (rr.region_fp / rr.n_targets) if (rr and not failed and rr.n_targets) else None
+            ranker.add(o.config, rr.core if (rr and not failed) else None, fp, failed)
+            if fp is not None:
+                fp_of[o.config.key] = fp
             if not failed:
                 k = o.config.key
                 if k not in candidates or score > candidates[k][1]:
@@ -1130,7 +1137,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                         st["scouts"] = max(0, st["scouts"] - 1)
                 if st["founded"] and not failed:
                     i = owner_of(o.config)
-                    if i is not None and domains[i].offer(o.config, score, now):
+                    if i is not None and domains[i].offer(o.config, score, now, fp):
                         say("domain %d -> %.4f, a global point on its hill t+%.1fm", i, score, elapsed() / 60)
                     elif i is None:
                         j = hills.owner(o.config, centres(standing()))
@@ -1152,7 +1159,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     if fm.back >= fm.sent and not queued:
                         find_merges.pop(fm.id, None)
                 d = domains.get(unit.domain) if unit.domain is not None else None
-                if not failed and d is not None and status.get(d.id) == "live" and d.offer(o.config, score, now):
+                if not failed and d is not None and status.get(d.id) == "live" and d.offer(o.config, score, now, fp):
                     say("domain %d -> %.4f, a recombination child t+%.1fm", d.id, score, elapsed() / 60)
                     cancel_behind(d.id)                    # the centre moved: the rest were built for the old one
                 return
@@ -1166,7 +1173,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             d = domains.get(unit.domain) if unit.domain is not None else None
             if d is None or unit.move is None or status[d.id] == "retired":
                 return
-            if d.consider(unit.move, is_head, o.config, score, failed, now):
+            if d.consider(unit.move, is_head, o.config, score, failed, now, fp):
                 say("domain %d -> %.4f via %s %s t+%.1fm", d.id, d.best, unit.move.kind,
                          ",".join(unit.move.axes), elapsed() / 60)
                 cancel_behind(d.id)                        # a new centre: children of the old one are dropped
