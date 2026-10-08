@@ -60,13 +60,14 @@ public abstract class BaseGraph<V extends BaseVertex, E extends BaseEdge> extend
             for (final V vertex : vertexSet()) {
                 for (final E edge : super.outgoingEdgesOf(vertex)) {
                     minosOut.get(vertex).add(edge);
-                    final V target = super.getEdgeTarget(edge);
                     minosFrom.put(edge, vertex);
-                    minosTo.put(edge, target);
-                    final ArrayList<E> incoming = minosIn.get(target);
-                    if (incoming != null) {
-                        incoming.add(edge);
-                    }
+                    minosTo.put(edge, super.getEdgeTarget(edge));
+                }
+                // GATK's incoming list is the order edges were added. Collecting them from each
+                // source's outgoing list follows vertex-set order instead, and a copied graph
+                // would then break equal-multiplicity ties differently.
+                for (final E edge : super.incomingEdgesOf(vertex)) {
+                    minosIn.get(vertex).add(edge);
                 }
             }
         } finally {
