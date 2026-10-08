@@ -674,6 +674,15 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
      */
     @Override
     public ActivityProfileState isActive(final AlignmentContext context, final ReferenceContext ref, final FeatureContext features) {
+        try {
+            return minosIsActiveChecked(context, ref, features);
+        } catch (final RuntimeException | Error e) {
+            minosTraversalFailed = true;   // minos: shutdown() must not offer this JVM as a warm session
+            throw e;
+        }
+    }
+
+    private ActivityProfileState minosIsActiveChecked(final AlignmentContext context, final ReferenceContext ref, final FeatureContext features) {
         MinimalGenotypingEngine localActiveGenotypingEngine = getLocalActiveGenotyper(ref);
 
         if (forceCallingAllelesPresent && features.getValues(hcArgs.alleles, ref).stream().anyMatch(vc -> hcArgs.forceCallFiltered || vc.isNotFiltered())) {
@@ -746,6 +755,15 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
      * @return List of variants discovered in the region (may be empty)
      */
     public List<VariantContext> callRegion(final AssemblyRegion region, final FeatureContext features, final ReferenceContext referenceContext) {
+        try {
+            return minosCallRegionChecked(region, features, referenceContext);
+        } catch (final RuntimeException | Error e) {
+            minosTraversalFailed = true;   // minos: shutdown() must not offer this JVM as a warm session
+            throw e;
+        }
+    }
+
+    private List<VariantContext> minosCallRegionChecked(final AssemblyRegion region, final FeatureContext features, final ReferenceContext referenceContext) {
         if (minosRepairLog != null) {
             return minosRepairRegion(region, features, referenceContext);
         }
@@ -1950,6 +1968,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
     // ---------------------------------------------------------------------------------------------------------------
     private java.nio.file.Path minosWarmDir;
     private boolean minosWarmActive;
+    // minos: set when an exception left callRegion or isActive. GATK still calls shutdown() after a failed traversal,
+    // and a warm session offered then would hand the runner the partial VCF as a finished run.
+    private boolean minosTraversalFailed;
     private String minosWarmKey;
     private org.broadinstitute.hellbender.utils.MinosRecordingRandom minosWarmBaseRandom;
     private org.broadinstitute.hellbender.utils.MinosRecordingWell minosWarmBaseWell;
@@ -2037,8 +2058,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         }
         try {
             Files.createDirectories(minosWarmDir);
-            if (!minosWarmActive || minosWarmRegions.isEmpty() || minosSequenceDictionary == null) {
-                logger.info("minos warm: not keeping this JVM, regions=" + minosWarmRegions.size());
+            if (minosTraversalFailed || !minosWarmActive || minosWarmRegions.isEmpty() || minosSequenceDictionary == null) {
+                logger.info("minos warm: not keeping this JVM, regions=" + minosWarmRegions.size()
+                        + (minosTraversalFailed ? " (the traversal failed)" : ""));
                 Files.writeString(minosWarmDir.resolve("ready"), "no\n");
                 return;
             }
