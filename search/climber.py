@@ -14,9 +14,11 @@ notes for the dashboard's event feed (`events`).
                and never doubled again, settings whose step changed nothing are left out until the centre moves,
                triples join the pairs, and each exhausted fine sweep halves the scale once more
   acceptance   the centre moves to the best result of the sweep once most of it is back (a decisive gain at once); the
-               sweep's other winners are re-applied on the new centre first. A higher score moves the centre only when
-               it does not add false positives: a cleaner call of the variants already found. An exact tie is never a
-               move: identical scores mean identical calls (the setting changed nothing here)
+               sweep's other winners are re-applied on the new centre first. The full-range scan does the same with
+               one config: every other scan winner that raised the score without adding false positives is applied
+               together, and that config goes out before the neighbourhood walk. A higher score moves the centre only
+               when it does not add false positives. An exact tie is never a move: identical scores mean identical
+               calls (the setting changed nothing here)
   perturbation when a fine sweep is exhausted at every setting's smallest step: shake K settings of the centre (K =
                climb.shake_k in turn), then one local round around the best shaken point; the result replaces the
                centre if it is better OR EQUAL (ParamILS's acceptance). Round after round - it never gives up
@@ -123,6 +125,7 @@ class Climber:
         self.recent: List[str] = []                        # settings of accepted moves, most recent last
         self.axis_gain: Dict[str, float] = {}
         self.queued: List[Tuple[str, Dict[str, object]]] = []    # (kind, changes) to try on the next sweep first
+        self.stack_first = False                           # the next sweep is only the scan's stacked winners
         self.cycle = 0                                     # index into climb.shake_k
         self.cycle_stage = "points"                        # points | local
         self.cycle_sent = self.cycle_back = 0
@@ -332,10 +335,14 @@ class Climber:
     # ---- the main line ---------------------------------------------------------------------------------------------
     def _sweep(self, live: Sequence[str], rng: random.Random) -> List[Move]:
         out: List[Move] = []
+        stack = self.stack_first and bool(self.queued)
         for kind, ch in self.queued:                       # re-applied winners and settings shared by other domains
             self._add(kind, self.centre, self.best, ch, out)
         self.queued = []
+        self.stack_first = False
         self.sweep_is_scan = False
+        if stack and out:                                  # the scan's joint call, before the neighbourhood
+            return out
         if self.state == "final":
             out += self.singles(self.centre, self.best, live, "final", self.scale)
             out += self.pairs(live, rng, self.scale, kind="final")
@@ -691,6 +698,7 @@ class Climber:
             for item in self.winners:
                 if picked is None or item[2] > picked[2]:
                     picked = item
+            others = [item for item in self.winners if item is not picked]
             self.winners = []
             if picked is not None and picked[2] > self.best + tune("climb.decisive"):
                 self.sweep_is_scan = False
@@ -699,6 +707,7 @@ class Climber:
                 move, config, score, fp = picked
                 gain = score - self.best
                 self._recentre(config, score, now, move.axes if move.centre_key == self.centre.key else (), own=True, fp=fp)
+                self._queue_scan_stack(others)
                 self.note(f"scan back, gain {gain:.4f}: centre moved")
                 return True                             # above the answer set's resolution: keep it, do not rescan
             score = picked[2] if picked is not None else self.best
@@ -729,6 +738,22 @@ class Climber:
                 if len(changes) > 2:                                    # with two, the pair is the running sum
                     self.queued.append(("reapply", {**a, **b}))
         return True
+
+    def _queue_scan_stack(self, others: Sequence[Tuple[Move, Config, float, Optional[float]]]) -> None:
+        """One config carrying every other scan winner that already raised the score without adding false positives.
+        It is the next thing sent, before the neighbourhood walk, and it is kept only if that joint call is worth it."""
+        changes: Dict[str, object] = {}
+        for move, config, _score, _fp in sorted(others, key=lambda t: -t[2]):
+            for axis in move.axes:
+                if axis in changes or axis not in self.space.specs:
+                    continue
+                value = config.params.get(axis)
+                if self.space._same(self.space.specs[axis], self.centre.params.get(axis), value):
+                    continue
+                changes[axis] = value
+        if changes:
+            self.queued.append(("reapply", changes))
+            self.stack_first = True
 
     def _learn(self, axis: str, config: Config, move: Move, score: Optional[float], bad: bool, now: float) -> None:
         s = self.space.specs[axis]

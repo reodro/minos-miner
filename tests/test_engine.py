@@ -261,6 +261,38 @@ class ClimberTest(unittest.TestCase):
         self.assertTrue(nxt)
         self.assertNotIn("scan", {m.kind for m in nxt})
 
+    def test_a_scan_stacks_its_other_winners_before_the_neighbourhood(self):
+        space, book, names = setup()
+        geno = [a for a in GENOTYPING_PARAMS if a in space.names]
+        live = book.live(0.0) + geno
+        d = Climber(0, space, book, space._assemble({}), 88.0, 0.0, extra_axes=geno, scan=True)
+        moves = d.refill(live, random.Random(0), 500)
+        by_axis = {}
+        for m in moves:
+            if len(m.axes) == 1 and m.axes[0] not in by_axis:
+                by_axis[m.axes[0]] = m
+        first, second = by_axis["min_pruning"], by_axis["assembly_region_padding"]
+        scored = {id(first): (88.0 + 4 * ACCEPT_MIN, 1.5), id(second): (88.0 + 2 * ACCEPT_MIN, 1.4)}
+        for m in (first, second, *(m for m in moves if m is not first and m is not second)):
+            d.take()
+            score, fp = scored.get(id(m), (88.0, 2.0))
+            d.consider(m, True, m.config, score, False, 1.0, fp=fp)
+        self.assertEqual(d.centre.key, first.config.key)
+        self.assertEqual(d.best_fp, 1.5)
+        nxt = d.refill(live, random.Random(1), 50)
+        self.assertEqual(len(nxt), 1)
+        self.assertEqual(nxt[0].kind, "reapply")
+        self.assertEqual(nxt[0].axes, ("assembly_region_padding",))
+        self.assertEqual(nxt[0].config.params["min_pruning"], first.config.params["min_pruning"])
+        self.assertEqual(nxt[0].config.params["assembly_region_padding"], second.config.params["assembly_region_padding"])
+        d.take()
+        self.assertFalse(d.consider(nxt[0], True, nxt[0].config, 88.0 + 4 * ACCEPT_MIN, False, 2.0, fp=1.8))
+        self.assertEqual(d.centre.key, first.config.key)                        # the joint call added false positives
+        neighbourhood = d.refill(live, random.Random(2), 50)
+        self.assertTrue(neighbourhood)
+        self.assertNotIn("reapply", {m.kind for m in neighbourhood})
+        self.assertNotIn("scan", {m.kind for m in neighbourhood})
+
     def test_a_scan_under_the_answer_set_resolution_holds_the_peak(self):
         space, book, names = setup()
         geno = [a for a in GENOTYPING_PARAMS if a in space.names]

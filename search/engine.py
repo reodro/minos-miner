@@ -1,4 +1,12 @@
-"""The search engine (v4.13): a stall waits for the cut.
+"""The search engine (v4.14): the first scan's winners are tried together.
+Owner: search.
+
+v4.14 keeps v4.13. When a basin's first scan comes back, the centre still moves to the best point that raises
+the score without adding false positives. The scan's other winners that passed that test are applied together
+as one config, and that config goes out before the neighbourhood walk. It is kept only when its own score rises
+and its false positives do not.
+
+The search engine (v4.13): a stall waits for the cut.
 Owner: search.
 
 v4.13 keeps v4.12. All twelve centres climb until the cut. A basin that has stopped gaining keeps its seat until
@@ -1234,7 +1242,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.13", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.14", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),
