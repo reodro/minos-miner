@@ -10,6 +10,8 @@ from search.space import GENOTYPING_PARAMS, Space
 from search import genetic
 from common.tuning import tune
 from search.climber import Climber
+from search.engine import core_from_score, core_seat
+from common.scoring import score_from_parts
 from search.reductions import MNH, Reductions
 from search.hills import Hills
 import search.engine as engine
@@ -170,6 +172,42 @@ class ClimberTest(unittest.TestCase):
         self.assertTrue(d.consider(m, True, m.config, 88.2, False, 1.0, fp=1.6))
         self.assertEqual(d.best, 88.2)
         self.assertEqual(d.best_fp, 1.6)
+
+    def test_the_core_seat_keeps_a_higher_score_when_false_positives_rise(self):
+        space, d, live = self.make()
+        d.allow_fp = True
+        d.best_fp = 2.0
+        moves = d.refill(live, random.Random(0), 20)
+        m = next(x for x in moves if x.kind == "n1")
+        d.take()
+        self.assertTrue(d.consider(m, True, m.config, 88.2, False, 1.0, fp=2.4))
+        self.assertEqual(d.best, 88.2)
+        self.assertEqual(d.best_fp, 2.4)
+        self.assertFalse(d.consider(m, True, m.config, 88.0, False, 2.0, fp=1.0))   # the score did not rise
+
+    def test_the_core_seat_is_the_highest_core_outside_the_clump(self):
+        space, book, names = setup()
+        hills = Hills(space, lambda: names)
+        anchor = space._assemble({})
+        higher_score = space._assemble({
+            "min_pruning": 8, "assembly_region_padding": 400, "min_mapping_quality_score": 10,
+            "pcr_indel_model": "NONE", "max_assembly_region_size": 700, "heterozygosity": 0.01,
+            "active_probability_threshold": 0.02,
+        })
+        higher_core = space._assemble({
+            "min_pruning": 3, "assembly_region_padding": 250, "min_mapping_quality_score": 60,
+            "pcr_indel_model": "HOSTILE", "max_assembly_region_size": 500, "heterozygosity": 0.005,
+            "base_quality_score_threshold": 10,
+        })
+        self.assertGreaterEqual(hills.distance(anchor, higher_score), 6)
+        self.assertGreaterEqual(hills.distance(anchor, higher_core), 6)
+        ranked = [(anchor, 90.0), (higher_score, 86.0), (higher_core, 82.0)]
+        fp = {anchor.key: 1.2, higher_score.key: 1.2, higher_core.key: 4.0}
+        self.assertGreater(core_from_score(82.0, 4.0), core_from_score(86.0, 1.2))
+        self.assertAlmostEqual(score_from_parts(core_from_score(82.0, 4.0), 4.0), 82.0, places=6)
+        seat = core_seat(ranked, [(anchor, 90.0)], fp, hills, 6)
+        self.assertEqual(seat[2].key, higher_core.key)
+        self.assertIsNone(core_seat(ranked, [(anchor, 90.0)], {}, hills, 6))
 
     def test_a_new_domain_scans_every_setting_over_its_range(self):
         space, book, names = setup()

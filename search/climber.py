@@ -17,8 +17,9 @@ notes for the dashboard's event feed (`events`).
                sweep's other winners are re-applied on the new centre first. The full-range scan does the same with
                one config: every other scan winner that raised the score without adding false positives is applied
                together, and that config goes out before the neighbourhood walk. A higher score moves the centre only
-               when it does not add false positives. An exact tie is never a move: identical scores mean identical
-               calls (the setting changed nothing here)
+               when it does not add false positives, except the founding seat born to chase core: there the score
+               rising is enough, and a small rise in false positives stays. An exact tie is never a move: identical
+               scores mean identical calls (the setting changed nothing here)
   perturbation when a fine sweep is exhausted at every setting's smallest step: shake K settings of the centre (K =
                climb.shake_k in turn), then one local round around the best shaken point; the result replaces the
                centre if it is better OR EQUAL (ParamILS's acceptance). Round after round - it never gives up
@@ -92,7 +93,7 @@ class Chain:
 class Climber:
     def __init__(self, id: int, space: Space, book: AxisBook, centre: Config, score: float, now: float,
                  owner: Optional[Callable[[Config], Optional[int]]] = None, extra_axes: Sequence[str] = (),
-                 scan: bool = False):
+                 scan: bool = False, allow_fp: bool = False):
         self.id, self.space, self.book = id, space, book
         self.centre, self.best = centre, score
         self.birth_score = score
@@ -121,6 +122,7 @@ class Climber:
         self.sweep_sent = self.sweep_back = 0
         self.winners: List[Tuple[Move, Config, float, Optional[float]]] = []
         self.best_fp: Optional[float] = None           # false positives per target at the centre; a move may not raise it
+        self.allow_fp = allow_fp                       # the core seat: a higher score is kept when false positives rise
         self.flat: Set[str] = set()
         self.recent: List[str] = []                        # settings of accepted moves, most recent last
         self.axis_gain: Dict[str, float] = {}
@@ -593,6 +595,8 @@ class Climber:
         false positives is not progress: the truth score charges that rate more than the extra calls return."""
         if score is None or score <= self.best + tune("climb.accept_min"):
             return False
+        if self.allow_fp:
+            return True
         if fp is None or self.best_fp is None:
             return True
         return fp <= self.best_fp

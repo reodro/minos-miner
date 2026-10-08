@@ -1,4 +1,13 @@
-"""The search engine (v4.14): the first scan's winners are tried together.
+"""The search engine (v4.15): one founding seat chases the variants the clump missed.
+Owner: search.
+
+v4.15 keeps v4.14. Eleven seats are still the highest centres far enough apart. The twelfth is the scored
+opening config at least domains.found_min_far settings from those eleven with the highest measured core, and
+its blended score may sit below the clump. That seat keeps a move when the score rises, including when false
+positives rise. The other seats still refuse a higher score that adds false positives. The midpoint cut is
+unchanged, so a seat whose score never moves loses its workers.
+
+The search engine (v4.14): the first scan's winners are tried together.
 Owner: search.
 
 v4.14 keeps v4.13. When a basin's first scan comes back, the centre still moves to the best point that raises
@@ -140,6 +149,7 @@ import asyncio
 import collections
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -147,6 +157,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from common.params import ParamRanges
+from common.scoring import GERMLINE_FP_SCALE, V2_CORE_WEIGHT, V2_GERMLINE_WEIGHT
 from common.tuning import tune
 from common.types import FULL, Config
 from search.axes import AxisBook, latin_hypercube
@@ -162,6 +173,34 @@ from search.climber import Climber, Move
 from search.hills import MIN_FAR, Hills
 
 log = logging.getLogger(__name__)
+
+def core_from_score(score: float, fp_per_target: float) -> float:
+    """The core implied by a v2 score and an FP rate: the inverse of score_from_parts."""
+    germline = math.exp(-float(fp_per_target) / GERMLINE_FP_SCALE)
+    return (float(score) / 100.0 - V2_GERMLINE_WEIGHT * germline) / V2_CORE_WEIGHT
+
+
+def core_seat(ranked: Sequence[Tuple[Config, float]], anchors: Sequence[Tuple[Config, float]],
+              fp_of: Dict[str, float], hills: Hills, min_far: int):
+    """The scored config at least `min_far` settings from every anchor with the highest measured core.
+
+    Its blended score may sit below the anchors: a call that found more variants and paid for them with false
+    positives is the seat the score ranking skips. None when no such config has a measured FP rate."""
+    anchor_keys = {c.key for c, _ in anchors}
+    best = None
+    for c, s in ranked:
+        if c.key in anchor_keys:
+            continue
+        fp = fp_of.get(c.key)
+        if fp is None:
+            continue
+        if any(hills.distance(c, a) < min_far for a, _ in anchors):
+            continue
+        core = core_from_score(s, fp)
+        if best is None or core > best[0] or (core == best[0] and s > best[1]):
+            best = (core, s, c, fp)
+    return best
+
 
 ROUND_S = 72 * 60                    # the schedule below is written for this much search time; it scales with it
 TICK_S = 2.0
@@ -561,40 +600,53 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 picked += hills.take(ranked, n_domains - len(picked), min_far, best - 5.0, [c for c, _ in picked])
             near_keys = {c.key for c, _ in near}
             far_key = None
-            if len(picked) >= 2:                              # the last seat is the farthest config, if one is farther
-                anchors = picked[:-1]
-                anchor_keys = {c.key for c, _ in anchors}
-                current = picked[-1]
-                cur_dist = min(hills.distance(current[0], a) for a, _ in anchors)
-                best_far = None
-                best_dist = cur_dist
-                for c, s in ranked:
-                    if c.key in anchor_keys or s < best - 5.0:
-                        continue
-                    dist = min(hills.distance(c, a) for a, _ in anchors)
-                    if dist <= cur_dist:
-                        continue
-                    if best_far is None or dist > best_dist or (dist == best_dist and s > best_far[1]):
-                        best_dist = dist
-                        best_far = (c, s)
-                if best_far is not None and best_far[0].key != current[0].key:
-                    picked = anchors + [best_far]
-                    far_key = best_far[0].key
+            core_key = None
+            if n_domains >= 2 and picked:
+                anchors = picked[:n_domains - 1] if len(picked) >= n_domains else list(picked)
+                seat = core_seat(ranked, anchors, fp_of, hills, min_far) if anchors else None
+                if seat is not None:
+                    core, s, c, fp = seat
+                    picked = list(anchors) + [(c, s)]
+                    core_key = c.key
+                    say("core seat %.4f core, fp %.3f, score %.4f, %d settings from the clump",
+                        core, fp, s, min(hills.distance(c, a) for a, _ in anchors))
+                elif len(picked) >= 2:                    # no measured core outside: the farthest config within 5 points
+                    anchors = picked[:-1]
+                    anchor_keys = {c.key for c, _ in anchors}
+                    current = picked[-1]
+                    cur_dist = min(hills.distance(current[0], a) for a, _ in anchors)
+                    best_far = None
+                    best_dist = cur_dist
+                    for c, s in ranked:
+                        if c.key in anchor_keys or s < best - 5.0:
+                            continue
+                        dist = min(hills.distance(c, a) for a, _ in anchors)
+                        if dist <= cur_dist:
+                            continue
+                        if best_far is None or dist > best_dist or (dist == best_dist and s > best_far[1]):
+                            best_dist = dist
+                            best_far = (c, s)
+                    if best_far is not None and best_far[0].key != current[0].key:
+                        picked = anchors + [best_far]
+                        far_key = best_far[0].key
             for c, s in picked:
-                if c.key == far_key:
+                if c.key == core_key:
+                    why = "the opening, core outside the clump"
+                elif c.key == far_key:
                     why = "the opening, far from the clump"
                 elif c.key in near_keys:
                     why = "the opening"
                 else:
                     why = "the opening, past the band"
-                birth(c, s, why)
+                birth(c, s, why, allow_fp=c.key == core_key)
             st["founded_at"] = elapsed()
             say("founding at t+%.1fm: %d domains, %d held (%d within %.2f of the best) from %d scored configs (waves %s)",
                 elapsed() / 60, len(live()), len(reserve), len(near), band, len(candidates),
                 " ".join(f"{b}/{h}" for b, h in zip(wave_back, wave_heads)))
 
-        def birth(c: Config, s: float, why: str, parents: Sequence[Climber] = ()) -> Climber:
-            d = Climber(ids[0], space, book, c, s, clock(), owner_of, extra_axes=genotyping, scan=not parents)
+        def birth(c: Config, s: float, why: str, parents: Sequence[Climber] = (), allow_fp: bool = False) -> Climber:
+            d = Climber(ids[0], space, book, c, s, clock(), owner_of, extra_axes=genotyping, scan=not parents,
+                        allow_fp=allow_fp)
             ids[0] += 1
             for p in parents:
                 d.inherit(p.tried, p.steps, p.axis_gain)
@@ -1242,7 +1294,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.14", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.15", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),
