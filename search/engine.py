@@ -2,7 +2,8 @@
 Owner: search.
 
 v4.13 keeps v4.12. All twelve centres climb until the cut. A basin that has stopped gaining keeps its seat until
-then, so the ranking still sees it. After the cut, a stall retires the basin and does not birth another domain.
+then, so the ranking still sees it. The basins the cut keeps start their stall clock over, so that ranking is not
+undone in the next minutes. After the cut, a stall retires the basin and does not birth another domain.
 
 The search engine (v4.12): twelve basins climb, then the moving six keep the workers.
 Owner: search.
@@ -854,6 +855,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ranked_d = sorted(climbing, key=lambda d: (2 * d.best - d.first_scan_score, d.best), reverse=True)
                     keep, drop = ranked_d[:6], ranked_d[6:]
                     st["cut"] = True
+                    for d in keep:
+                        d.history.append((clock(), d.best, "cut"))   # the stall clock starts over for the basins that stay
                     for d in drop:
                         gain = d.best - d.first_scan_score
                         say("domain %d retired at %.4f (cut, gain %.4f) t+%.1fm", d.id, d.best, gain, elapsed() / 60)
