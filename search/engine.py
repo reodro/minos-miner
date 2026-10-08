@@ -4,7 +4,8 @@ Owner: search.
 v4.16 keeps v4.15. Generations 1 and 2 each split in half. One half is children of the highest measured core,
 the other half children of the highest false-positive rate. Generation 3 crosses one parent from each group.
 The portfolio keeps the same three kinds of config from a reviewed run: near-best score, high core, and high
-false positives, and wave 0 draws from all three.
+false positives, and wave 0 draws from all three. After the cut, a stall still retires a basin that has
+stopped gaining, but never the live basin with the highest score: its workers stay until the final.
 
 The search engine (v4.15): one founding seat chases the variants the clump missed.
 Owner: search.
@@ -1002,11 +1003,15 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                             st["owed"], elapsed() / 60)
             # A basin that has stopped moving gives its workers to the next candidate, or, in the last minutes of
             # the climb, to the basins already climbing. The clock starts at the last
-            # time its best changed, and only after the first scan has come back.
+            # time its best changed, and only after the first scan has come back. The highest live basin
+            # keeps its workers through a stall; the final still includes it.
             if not st["final"] and st["founded"]:
                 limit = T(60 * tune("domains.stall_min"))
-                stalled = [d for d in live() if d.state != "final" and d.first_scan_score is not None
-                           and not d.scan_open() and now - d.history[-1][0] >= limit]
+                lv = live()
+                lead = max((d.best for d in lv), default=None)
+                stalled = [d for d in lv if d.state != "final" and d.first_scan_score is not None
+                           and not d.scan_open() and now - d.history[-1][0] >= limit
+                           and lead is not None and d.best < lead]
                 for d in stalled:
                     if not st["cut"]:
                         continue                               # the cut ranks every basin; a stall waits for it
