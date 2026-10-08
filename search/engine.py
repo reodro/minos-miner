@@ -1,11 +1,17 @@
-"""The search engine (v4.12): twelve basins climb, then the moving six keep the workers.
+"""The search engine (v4.13): a stall waits for the cut.
+Owner: search.
+
+v4.13 keeps v4.12. All twelve centres climb until the cut. A basin that has stopped gaining keeps its seat until
+then, so the ranking still sees it. After the cut, a stall retires the basin and does not birth another domain.
+
+The search engine (v4.12): twelve basins climb, then the moving six keep the workers.
 Owner: search.
 
 v4.12 keeps v4.11's one scan per basin. The opening births every centre it found, up to twelve, and one of them
 is the scored config farthest from the others, down to 5 points below the opening best. Halfway from founding to
 the final, once every first scan is back, the six with the highest score-plus-gain keep climbing. The rest retire
-and their workers join those six. A stall after that cut does not birth another domain. A coarse sweep that
-finishes goes on to the fine neighbourhood and does not launch the wide all-pairs round.
+and their workers join those six. A coarse sweep that finishes goes on to the fine neighbourhood and does not
+launch the wide all-pairs round.
 
 The search engine (v4.11): one full-range scan per basin.
 Owner: search.
@@ -886,6 +892,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 stalled = [d for d in live() if d.state != "final" and d.first_scan_score is not None
                            and not d.scan_open() and now - d.history[-1][0] >= limit]
                 for d in stalled:
+                    if not st["cut"]:
+                        continue                               # the cut ranks every basin; a stall waits for it
                     if (no_new or st["cut"]) and not any(x is not d for x in live()):
                         continue                               # the last basin keeps its workers
                     say("domain %d retired at %.4f (no gain for %.0f min) t+%.1fm", d.id, d.best,
@@ -1216,7 +1224,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.12", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.13", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),
