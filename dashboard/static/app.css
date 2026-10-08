@@ -198,6 +198,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .schedule .seg { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; padding: 0 8px; font-size: 12px;
   font-weight: 600; white-space: nowrap; overflow: hidden; border-right: 1px solid var(--panel); }
 .seg.opening { background: var(--open); color: var(--on-strong); }
+.seg.generations { background: var(--scout); color: var(--on-strong); }
 .seg.climb { background: var(--accent); color: var(--on-strong); }
 .seg.perturb { background: var(--warn); color: var(--on-strong); }
 .seg.merge { background: var(--merge); color: var(--on-strong); }
@@ -227,7 +228,8 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .lineage svg { display: block; }
 .lineage text { fill: var(--muted); font-size: 11px; font-family: var(--sans); }
 .lineage text.score { fill: var(--ink); font-variant-numeric: tabular-nums; }
-.lineage .band.opening { fill: var(--open-soft); } .lineage .band.merge { fill: var(--merge-soft); }
+.lineage .band.opening { fill: var(--open-soft); } .lineage .band.generations { fill: var(--scout-soft); }
+.lineage .band.merge { fill: var(--merge-soft); }
 .lineage .band.final { fill: var(--final-soft); } .lineage .band.climb { fill: var(--panel); }
 .lineage .band.perturb { fill: var(--warn-soft); }
 .lineage .row { fill: var(--accent); } .lineage .row.perturb { fill: var(--warn); }

@@ -332,6 +332,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         wave_heads: List[int] = []                   # heads sent per wave (0 = hypercube, 1.. = generations)
         wave_back: List[int] = []
         wave_best: List[float] = []                  # best score seen when each wave launched
+        wave_started: List[float] = []               # seconds into the search when each wave was launched
         reserve: List[Tuple[Config, float]] = []
         st = {"founded": False, "founded_at": 0.0, "cut": False, "gens_done": False, "r3": False, "r3_done": False,
               "replaced": False, "r1": False,
@@ -509,7 +510,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
 
         def launch_wave(configs: Sequence[Config], riders: int, label: str) -> None:
             w = len(wave_heads)
-            wave_heads.append(0); wave_back.append(0); wave_best.append(top())
+            wave_heads.append(0); wave_back.append(0); wave_best.append(top()); wave_started.append(elapsed())
             for c in configs:
                 if send_global(c, "wave", riders, 5 if w == 0 else 4, wave=w):
                     wave_heads[w] += 1
@@ -1355,7 +1356,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                              "final_by_s": round(min(at("reduce_to_1_by"), length - at("final")), 1),
                              "pick_s": round(length - tune("schedule.pick_s"), 1)},
                 "capacity": cap, "max_domains": n_domains,
-                "waves": [{"wave": w, "sent": h, "back": b, "best_at_launch": round(x, 4)}
+                "waves": [{"wave": w, "sent": h, "back": b, "best_at_launch": round(x, 4),
+                           "started_s": round(wave_started[w], 1)}
                           for w, (h, b, x) in enumerate(zip(wave_heads, wave_back, wave_best))],
                 "domains": [{"id": d.id, "status": status[d.id], "state": d.state, "mode": d.mode,
                              "best": round(d.best, 4), "centre": d.centre.key, "inflight": d.inflight,

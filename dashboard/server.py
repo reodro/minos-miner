@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -217,6 +218,7 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
             live = None
         except (OSError, ValueError):
             live = None                                   # main is replacing it right now: the next poll gets it
+        fill_wave_starts(live)
         return {"now": time.time(), "live": live, "result": result_of(live)}
 
     @app.get("/api/history")
@@ -224,6 +226,41 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
         if user_of(request) is None:
             return denied()
         return {"runs": history_of(history_file)}
+
+    _wave_at = re.compile(r"engine: wave (\d+) \([^)]*\) at t\+([0-9.]+)m")
+    _wave_cache: dict = {}
+
+    def fill_wave_starts(live: Optional[dict]) -> None:
+        """The running search publishes each wave's start. An older process does not, so take it from that round's log."""
+        try:
+            waves = live["search"]["engine"].get("waves") or []
+            tag = (live.get("round") or {}).get("tag") or ""
+        except (AttributeError, KeyError, TypeError):
+            return
+        if not waves or not tag or all(w.get("started_s") is not None for w in waves):
+            return
+        log_dir = Path(__file__).resolve().parents[1] / "test" / "runs"
+        logs = sorted(log_dir.glob(f"replay_{tag}_*.log"))
+        if not logs:
+            return
+        path = logs[-1]
+        try:
+            stamp = path.stat().st_mtime
+        except OSError:
+            return
+        key = (str(path), stamp)
+        found = _wave_cache.get(key)
+        if found is None:
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                return
+            found = {int(m.group(1)): round(float(m.group(2)) * 60, 1) for m in _wave_at.finditer(text)}
+            _wave_cache.clear()
+            _wave_cache[key] = found
+        for w in waves:
+            if w.get("started_s") is None and w.get("wave") in found:
+                w["started_s"] = found[w["wave"]]
 
     def result_of(live: Optional[dict]) -> Optional[dict]:
         """The round, review and rank rows main appended for the run on screen (rounds.jsonl), newest of each."""

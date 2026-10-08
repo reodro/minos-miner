@@ -12,7 +12,7 @@ behind a login. The History tab lists finished runs from `status/rounds.jsonl`.
 
 ## What it shows
 
-- **Live tab**: round, phase, time left, best local score, submissions, configs scored, busy workers, and the answer set. The schedule is the current engine: opening, twelve climbing basins, then the six still moving, then one merge at the final. A domain card shows the score it opened at and its first scan. The scout sampler is shown as off. Scores, fleet nodes, and the event feed are unchanged.
+- **Live tab**: round, phase, time left, best local score, submissions, configs scored, busy workers, and the answer set. The schedule is the current engine: opening, the three generations, twelve climbing basins, then the six still moving, then one merge at the final. A domain card shows the score it opened at and its first scan. The scout sampler is shown as off. The score chart keeps every range, and gives 70–100 most of the height so a small gain there is visible. Fleet nodes and the event feed are unchanged.
 - **Themes**: "clean white" for light and "midnight" for dark. The page follows the system setting until the
   Light/Dark button in the top bar is used; the choice is remembered in that browser.
 - **History tab**: one block per finished run, newest first. Select a run and three groups open under it. Score: TRUE, local at submit, rank, field best, gap. Search: GATK workers (saved from the next round on; older runs have none), configs evaluated, how long the search ran. Answer set: donor, its score against the released truth (the same core the live Result panel shows), germline exact match, N, build time.

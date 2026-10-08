@@ -215,20 +215,38 @@ function renderKpis(L, R, S, E, X, finished) {
   );
 }
 
+function segText(cls, label, share) {
+  // The opening and the generations sit in the first few minutes, so the full words do not fit in the band.
+  if (share >= 0.12) return label;
+  if (cls === "opening") return "Open";
+  if (cls === "generations") return "Gens";
+  return label;
+}
+
 function segments(E) {
-  // v4.12: twelve basins climb from founding. Halfway to the final, the six still moving keep the workers.
+  // Opening is wave 0. The three generations are their own step, from the first of them until founding.
+  // Twelve basins climb from founding. Halfway to the final, the six still moving keep the workers.
   const sc = E.schedule;
   const founded = E.domains.length ? Math.min(...E.domains.map((d) => d.born_s)) : null;
   const planned = Math.min(sc.opening_max_s, sc.final_by_s);
   const openEnd = founded != null ? founded : Math.max(E.elapsed_s, planned);
+  const gens = (E.waves || []).filter((w) => w.wave > 0 && w.started_s != null);
+  const genStart = gens.length ? Math.min(...gens.map((w) => w.started_s)) : null;
   const cutAt = openEnd + 0.5 * Math.max(0, sc.final_by_s - openEnd);
   const span = (a, b) => [Math.max(0, a), Math.max(Math.max(0, a), Math.min(sc.length_s, b))];
-  return [
-    ["opening", "Opening", ...span(0, openEnd)],
+  const parts = [];
+  if (genStart != null && genStart > 1 && openEnd - genStart > 1) {
+    parts.push(["opening", "Opening", ...span(0, genStart)]);
+    parts.push(["generations", "Generations", ...span(genStart, openEnd)]);
+  } else {
+    parts.push(["opening", "Opening", ...span(0, openEnd)]);
+  }
+  parts.push(
     ["climb", "Twelve basins", ...span(openEnd, cutAt)],
     ["perturb", "Six basins", ...span(cutAt, sc.final_by_s)],
     ["final", "Final", ...span(sc.final_by_s, sc.length_s)],
-  ].filter((g) => g[3] - g[2] > 1);
+  );
+  return parts.filter((g) => g[3] - g[2] > 1);
 }
 
 function roundAxis(E) {
@@ -280,7 +298,8 @@ function renderSchedule(E, finished) {
   const segs = segments(E).map(([cls, label, a, b]) => [cls, label, a + o, b + o]);
   segs.push(["submit", "submit", ax.searchEnd, L]);
   const els = segs.filter((g) => g[3] > g[2]).map(([cls, label, a, b]) => h("div", {class: `seg ${cls}`,
-    style: {left: x(a), width: `${(100 * (b - a)) / L}%`}, title: `${label}: ${mins(a)} to ${mins(b)}`}, label));
+    style: {left: x(a), width: `${(100 * (b - a)) / L}%`}, title: `${label}: ${mins(a)} to ${mins(b)}`},
+    segText(cls, label, (b - a) / L)));
   const t = finished ? L : E.elapsed_s + o;
   els.push(h("div", {class: "done", style: {width: x(t)}}));
   els.push(h("div", {class: "pick", style: {left: x(E.schedule.pick_s + o)}, title: "the highest local score is named"}));
@@ -294,7 +313,7 @@ function renderSchedule(E, finished) {
     if (marks.length && m - marks[marks.length - 1] < 2) marks[marks.length - 1] = m; else marks.push(m);
   }
   ticks.replaceChildren(...marks.map((m) => h("span", {style: {left: x(m * 60)}, text: `${m}`})));
-  $("schedule-sub").textContent = `${E.version || "search"} · twelve basins, then the six still moving, one merge at the final · stages scaled ×${E.schedule.scale.toFixed(2)}`;
+  $("schedule-sub").textContent = `${E.version || "search"} · opening, three generations, twelve basins, then the six still moving, one merge at the final · stages scaled ×${E.schedule.scale.toFixed(2)}`;
 }
 
 function rowClass(d) {
@@ -319,8 +338,9 @@ function renderLineage(E) {
   const y = (i) => top + i * rh + rh / 2;
   const svg = s("svg", {width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Domain tree over the round"});
   for (const [cls, label, a, b] of segments(E)) {
-    svg.append(s("rect", {class: `band ${cls}`, x: x(a), y: 0, width: Math.max(0, x(b) - x(a)), height: H}));
-    svg.append(s("text", {x: x(a) + 4, y: 13}, label));
+    const w = Math.max(0, x(b) - x(a));
+    svg.append(s("rect", {class: `band ${cls}`, x: x(a), y: 0, width: w, height: H}));
+    svg.append(s("text", {x: x(a) + 4, y: 13}, segText(cls, label, w / W)));
   }
   const tNow = E.elapsed_s;
   for (const d of doms) {
@@ -457,6 +477,22 @@ function renderScout(E, S, finished) {
 }
 
 // ---- chart ----------------------------------------------------------------------------------------------------------
+// Scores below 70 stay on the chart, in a short band. 70–100 takes the rest of the height, still linear inside
+// that band, so a gain of a few tenths is a visible step instead of a pixel on a 0–100 axis.
+const FOCUS_LO = 70, FOCUS_HI = 100, FOCUS_SHARE = 0.84;
+const CHART_H = 440;
+function toFocus(v) {
+  if (v == null || !isFinite(v)) return null;
+  const low = 1 - FOCUS_SHARE;
+  if (v <= 0) return 0;
+  if (v < FOCUS_LO) return low * (v / FOCUS_LO);
+  return low + FOCUS_SHARE * ((v - FOCUS_LO) / (FOCUS_HI - FOCUS_LO));
+}
+function fromFocus(a) {
+  const low = 1 - FOCUS_SHARE;
+  if (a <= low) return FOCUS_LO * (a / Math.max(low, 1e-9));
+  return FOCUS_LO + (FOCUS_HI - FOCUS_LO) * ((a - low) / FOCUS_SHARE);
+}
 function chartData(S, subs) {
   const pts = (S.points || []).filter((p) => p[1] > 0);
   const best = S.best_timeline || [];
@@ -466,38 +502,58 @@ function chartData(S, subs) {
   for (const [t, v] of best) put(t, 1, v);
   for (const [t, , v] of subs) put(t, 2, v);
   const xs = [...map.keys()].sort((a, b) => a - b);
-  return [xs, xs.map((t) => map.get(t)[0]), xs.map((t) => map.get(t)[1]), xs.map((t) => map.get(t)[2])];
+  const col = (i) => xs.map((t) => toFocus(map.get(t)[i]));
+  return [xs, col(0), col(1), col(2)];
 }
 function sizeChart() {
   const el = $("chart");
-  if (chart && el.clientWidth) chart.setSize({width: el.clientWidth, height: 300});
+  if (chart && el.clientWidth) chart.setSize({width: el.clientWidth, height: CHART_H});
 }
 function renderChart(S, subs) {
   const el = $("chart");
   if (typeof uPlot === "undefined") return;
   const data = chartData(S, subs);
   if (!data[0].length) { if (chart) { chart.destroy(); chart = null; } el.replaceChildren(h("div", {class: "empty", text: "No scores yet."})); return; }
-  const best = Math.max(...data[2].filter((v) => v != null), ...data[1].filter((v) => v != null));
   const theme = effectiveTheme();
   if (!chart || chartKey !== theme) {
     if (chart) chart.destroy();
     el.replaceChildren();
     chartKey = theme;
     const axis = {stroke: css("--muted"), grid: {stroke: css("--line"), width: 1}, ticks: {stroke: css("--line")}};
+    const scoreOf = (u, v) => (v == null ? "" : fromFocus(v).toFixed(3));
+    const ticks = [0, 35, 70, 75, 80, 85, 90, 95, 100];
     chart = new uPlot({
-      width: el.clientWidth || 800, height: 300,
+      width: el.clientWidth || 800, height: CHART_H,
       scales: {x: {time: true, range: (u, lo, hi) => (hi - lo < 120 ? [lo - 60, hi + 60] : [lo, hi])},
-               y: {range: (u, lo, hi) => {
-        const top = Math.max(hi, best);
-        return [Math.max(lo, top - 3), top + 0.15];
-      }}},
-      axes: [{...axis}, {...axis, size: 60, values: (u, v) => v.map((x) => x.toFixed(2))}],
+               y: {range: (u, lo, hi) => [0, Math.max(1, hi)]}},
+      axes: [
+        {...axis},
+        {...axis, size: 46, splits: () => ticks.map(toFocus),
+         values: (u, v) => v.map((x) => String(Math.round(fromFocus(x))))},
+      ],
       series: [
         {},
-        {label: "scored config", stroke: css("--faint"), paths: () => null, points: {show: true, size: 3, fill: css("--faint"), stroke: css("--faint")}},
-        {label: "best so far", stroke: css("--accent"), width: 2, spanGaps: true, points: {show: false}, paths: uPlot.paths.stepped({align: 1})},
-        {label: "submitted", stroke: css("--final"), paths: () => null, points: {show: true, size: 9, fill: css("--final"), stroke: css("--final")}},
+        {label: "scored config", stroke: css("--faint"), paths: () => null, points: {show: true, size: 3, fill: css("--faint"), stroke: css("--faint")}, value: scoreOf},
+        {label: "best so far", stroke: css("--accent"), width: 2, spanGaps: true, points: {show: false}, paths: uPlot.paths.stepped({align: 1}), value: scoreOf},
+        {label: "submitted", stroke: css("--final"), paths: () => null, points: {show: true, size: 9, fill: css("--final"), stroke: css("--final")}, value: scoreOf},
       ],
+      hooks: {draw: [(u) => {
+        const y70 = u.valToPos(toFocus(FOCUS_LO), "y", true);
+        const yTop = u.valToPos(u.scales.y.max, "y", true);
+        const ctx = u.ctx;
+        ctx.save();
+        ctx.fillStyle = css("--accent");
+        ctx.globalAlpha = 0.07;
+        ctx.fillRect(u.bbox.left, Math.min(y70, yTop), u.bbox.width, Math.abs(y70 - yTop));
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = css("--warn");
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(u.bbox.left, y70);
+        ctx.lineTo(u.bbox.left + u.bbox.width, y70);
+        ctx.stroke();
+        ctx.restore();
+      }]},
     }, data, el);
   } else {
     chart.setData(data);
