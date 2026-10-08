@@ -205,7 +205,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .schedule .done { position: absolute; top: 0; bottom: 0; left: 0; background: var(--bg); opacity: .45; pointer-events: none; }
 .schedule .now { position: absolute; top: -1px; bottom: -1px; width: 2px; background: var(--ink); }
 .schedule .pick { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--final); }
-.schedule .replace { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--open); }
+.schedule .cut { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--warn); }
 .ticks { position: relative; height: 16px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
 

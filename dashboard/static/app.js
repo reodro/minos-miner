@@ -216,21 +216,18 @@ function renderKpis(L, R, S, E, X, finished) {
 }
 
 function segments(E) {
-  // v4.9: six basins climb until one merge at the final. Minute 34 replaces a flat first scan.
-  // The last five minutes before the final (scaled) start no new basin.
+  // v4.12: twelve basins climb from founding. Halfway to the final, the six still moving keep the workers.
   const sc = E.schedule;
   const founded = E.domains.length ? Math.min(...E.domains.map((d) => d.born_s)) : null;
-  const openEnd = founded != null ? founded : Math.max(E.elapsed_s, Math.min(sc.opening_max_s, sc.reduce_to_3_start_s));
-  const vals = (last && last.settings && last.settings.values) || {};
-  const noNewMin = vals["schedule.no_new_before_final_min"] != null ? vals["schedule.no_new_before_final_min"] : 5;
-  const scale = sc.scale || 1;
-  const noNew = Math.max(openEnd, sc.final_by_s - noNewMin * 60 * scale);
-  const cut = (a, b) => [Math.max(0, a), Math.max(Math.max(0, a), Math.min(sc.length_s, b))];
+  const planned = Math.min(sc.opening_max_s, sc.final_by_s);
+  const openEnd = founded != null ? founded : Math.max(E.elapsed_s, planned);
+  const cutAt = openEnd + 0.5 * Math.max(0, sc.final_by_s - openEnd);
+  const span = (a, b) => [Math.max(0, a), Math.max(Math.max(0, a), Math.min(sc.length_s, b))];
   return [
-    ["opening", "Opening", ...cut(0, openEnd)],
-    ["climb", "Six basins", ...cut(openEnd, noNew)],
-    ["perturb", "No new basin", ...cut(noNew, sc.final_by_s)],
-    ["final", "Final", ...cut(sc.final_by_s, sc.length_s)],
+    ["opening", "Opening", ...span(0, openEnd)],
+    ["climb", "Twelve basins", ...span(openEnd, cutAt)],
+    ["perturb", "Six basins", ...span(cutAt, sc.final_by_s)],
+    ["final", "Final", ...span(sc.final_by_s, sc.length_s)],
   ].filter((g) => g[3] - g[2] > 1);
 }
 
@@ -287,7 +284,8 @@ function renderSchedule(E, finished) {
   const t = finished ? L : E.elapsed_s + o;
   els.push(h("div", {class: "done", style: {width: x(t)}}));
   els.push(h("div", {class: "pick", style: {left: x(E.schedule.pick_s + o)}, title: "the highest local score is named"}));
-  els.push(h("div", {class: "replace", style: {left: x(E.schedule.reduce_to_3_start_s + o)}, title: "a first scan that gained under 0.05 is replaced"}));
+  const twelve = segs.find((g) => g[0] === "climb");
+  if (twelve) els.push(h("div", {class: "cut", style: {left: x(twelve[3])}, title: "the six still moving keep the workers"}));
   if (!finished) els.push(h("div", {class: "now", style: {left: x(t)}, title: `now: ${mins(t)}`}));
   box.replaceChildren(...els);
   const all = [...new Set([0, ...segs.map((g) => Math.round(g[3] / 60))])].sort((a, b) => a - b);
@@ -296,7 +294,7 @@ function renderSchedule(E, finished) {
     if (marks.length && m - marks[marks.length - 1] < 2) marks[marks.length - 1] = m; else marks.push(m);
   }
   ticks.replaceChildren(...marks.map((m) => h("span", {style: {left: x(m * 60)}, text: `${m}`})));
-  $("schedule-sub").textContent = `${E.version || "search"} · six basins climb, six wait, one merge at the final · stages scaled ×${E.schedule.scale.toFixed(2)}`;
+  $("schedule-sub").textContent = `${E.version || "search"} · twelve basins, then the six still moving, one merge at the final · stages scaled ×${E.schedule.scale.toFixed(2)}`;
 }
 
 function rowClass(d) {
@@ -431,7 +429,7 @@ function renderWaves(E, R) {
         h("span", {class: "num muted", text: `${int(w.back)} / ${int(w.sent)} back`})),
       bar(w.sent ? w.back / w.sent : 0, "open", null),
       gain != null ? h("div", {class: "muted", text: `the next wave started ${gain >= 0 ? "+" : ""}${fix(gain)} higher`}) : null);
-  }), h("div", {class: "muted", text: E.phase === "opening" ? "Six basins start when the opening ends. Six more wait." : `${E.domains.filter((d) => d.origin === "the opening").length} opened · ${int(E.pending)} waiting`}));
+  }), h("div", {class: "muted", text: E.phase === "opening" ? "Twelve basins start when the opening ends." : `${E.domains.filter((d) => d.origin === "the opening").length} opened · ${int(E.pending)} waiting`}));
 }
 
 function renderScout(E, S, finished) {
