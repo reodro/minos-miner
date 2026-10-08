@@ -253,6 +253,26 @@ class ClimberTest(unittest.TestCase):
         self.assertEqual(d3.centre.key, centre)                                # fewer false positives, core given up
         self.assertEqual(d3.pros[down.axes[0]], down.config.params[down.axes[0]])
 
+    def test_a_score_increase_keeps_the_setting_for_the_final_merge(self):
+        space, d, live = self.make()
+        moves = [m for m in d.refill(live, random.Random(0), 40) if m.kind == "n1"]
+        first, second = moves[0], moves[1]
+        d.take()
+        self.assertTrue(d.consider(first, True, first.config, 88.2, False, 1.0))
+        a = first.axes[0]
+        self.assertIn((a, first.config.params[a]), d.raised)
+        alt = second.config.params.get(a)
+        if alt is not None and not space._same(space.specs[a], d.centre.params.get(a), alt):
+            nxt = space._assemble({**d.centre.params, a: alt})
+            self.assertIsNotNone(nxt)
+            d._recentre(nxt, 88.5, 2.0, (a,), own=True)
+            self.assertIn((a, first.config.params[a]), d.raised)
+            self.assertIn((a, alt), d.raised)
+        other = Climber(1, space, d.book, space._assemble({}), 80.0, 0.0)
+        n = d.hand(d.raised, [other])
+        self.assertGreaterEqual(n, 1)
+        self.assertTrue(any(ch.get(a) == first.config.params[a] for _, ch in other.queued))
+
     def test_the_core_seat_is_the_highest_core_outside_the_clump(self):
         space, book, names = setup()
         hills = Hills(space, lambda: names)
@@ -468,14 +488,17 @@ class EngineRoundTest(unittest.TestCase):
         pick = [l for l in logs.output if "engine: pick " in l][0].split("pick ")[1].split(" ")[0]
         self.assertEqual(out.submissions[-1][1], pick)                         # main submitted the search's pick
         still_separate = False
-        for l in logs.output:                                                   # the basins are still separate at minute 51-61
+        for l in logs.output:                                                   # the basins are still separate until the final at minute 56
             if " domains " in l and "t+" in l:
                 t = float(l.split("t+")[1].split("m")[0])
-                if 51 <= t < 61:
+                if 48 <= t < 55:
                     doms = l.split("domains ")[1].split(" | ")[0].split()
                     if len([x for x in doms if not x.endswith("/m")]) > 1:
                         still_separate = True
         self.assertTrue(still_separate)
+        final_at = float([l for l in logs.output if "engine: final at " in l][0].split("t+")[1].split("m")[0])
+        self.assertGreaterEqual(final_at, 54.0)
+        self.assertLess(final_at, 57.0)
 
     def test_small_fleet(self):
         with self.assertLogs("search.engine", level="INFO") as logs:

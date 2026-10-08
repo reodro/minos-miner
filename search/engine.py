@@ -1,4 +1,11 @@
-"""The search engine (v4.20): a move keeps core and the false-positive count together.
+"""The search engine (v4.21): the final starts at minute 56 and takes the steps that raised the other basins.
+Owner: search.
+
+v4.21 keeps v4.20. The final starts at minute 56. The strongest of the six basins keeps the seat. Each of the
+other five hands it every setting value that was in place when that basin's score rose, one setting at a time,
+including a value it later replaced.
+
+The search engine (v4.20): a move keeps core and the false-positive count together.
 Owner: search.
 
 v4.20 keeps v4.19. The opening still breeds high core and high false positives apart, then crosses them.
@@ -801,6 +808,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                 retire(p)
                 keep.inherit(p.tried, p.steps, p.axis_gain)
                 n += keep.transplant(p.centre, names())
+                n += keep.hand(p.raised, [keep])          # every value that raised this basin, including earlier steps
             if rest:
                 st["runner_up"] = rest[0].centre
             pool: List[Tuple[Config, float]] = []
@@ -1404,7 +1412,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.20", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.21", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),

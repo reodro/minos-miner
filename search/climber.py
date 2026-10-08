@@ -134,6 +134,7 @@ class Climber:
         self.flat: Set[str] = set()
         self.recent: List[str] = []                        # settings of accepted moves, most recent last
         self.axis_gain: Dict[str, float] = {}
+        self.raised: List[Tuple[str, object]] = []     # each value that was set when this basin's score rose
         self.queued: List[Tuple[str, Dict[str, object]]] = []    # (kind, changes) to try on the next sweep first
         self.stack_first = False                           # the next sweep is only the scan's stacked winners
         self.cycle = 0                                     # index into climb.shake_k
@@ -476,7 +477,9 @@ class Climber:
                 (own or self.equal_accepts < tune("climb.equal_accepts")):
             if not own:
                 self.equal_accepts += 1
-            self._recentre(cfg, sc, self.history[-1][0], (), own=own, fp=fp, core=core)
+            axes = [a for a in self.space.names
+                    if not self.space._same(self.space.specs[a], self.centre.params.get(a), cfg.params.get(a))]
+            self._recentre(cfg, sc, self.history[-1][0], axes, own=own, fp=fp, core=core)
             self.state, self.scale, self.fresh = "climb", 1.0, True
             self.note(f"perturbation accepted at {sc:.4f}")
             return self._main(live, rng, room)
@@ -763,7 +766,7 @@ class Climber:
                 return False                                    # a chain under 0.05 does not abort a scan still out
             self._credit(move, score)                                   # a chain beat the domain: its centre moves
             self.note(f"a chain found {score:.4f}")
-            self._recentre(config, score, now, (), own=True, fp=fp, core=core)
+            self._recentre(config, score, now, move.axes, own=True, fp=fp, core=core)
             return True
         if self._worth(score, fp, core) and move.kind in SWEEP_KINDS and self.state in ("climb", "final"):
             self._credit(move, score)
@@ -894,6 +897,15 @@ class Climber:
             self.gains.append((now, gain))
             self.equal_accepts = 0
             self.rounds = 0
+        if gain > tune("climb.accept_min"):
+            for a in axes:
+                spec = self.space.specs.get(a)
+                v = config.params.get(a)
+                if spec is None or v is None:
+                    continue
+                if any(ax == a and self.space._same(spec, old, v) for ax, old in self.raised):
+                    continue
+                self.raised.append((a, v))
         self.cycle, self.cycle_sent, self.cycle_best = 0, 0, None   # a new centre: the next perturbation starts at K=2
         self.centre, self.best = config, score
         if fp is not None:
