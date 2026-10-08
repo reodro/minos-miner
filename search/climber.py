@@ -17,9 +17,10 @@ notes for the dashboard's event feed (`events`).
                sweep's other winners are re-applied on the new centre first. The full-range scan does the same with
                one config: every other scan winner that raised the score without adding false positives is applied
                together, and that config goes out before the neighbourhood walk. A higher score moves the centre only
-               when it does not add false positives, except the founding seat born to chase core: there the score
-               rising is enough, and a small rise in false positives stays. A config the centre does not take still
-               keeps one setting that raised core, and that setting is tried on the other basins. An exact tie is
+               when either core rises and the false-positive count does not, or the false-positive count falls and
+               core holds. A higher score that adds false positives is not a move, and a cleaner score that gives up
+               core is not a move. A config the centre does not take still keeps the one setting that raised core or
+               lowered the false-positive count, and that setting is tried on the other basins. An exact tie is
                never a move: identical scores mean identical calls (the setting changed nothing here)
   perturbation when a fine sweep is exhausted at every setting's smallest step: shake K settings of the centre (K =
                climb.shake_k in turn), then one local round around the best shaken point; the result replaces the
@@ -129,7 +130,7 @@ class Climber:
         self.best_core: Optional[float] = None         # core at the centre, when the opening measured it
         self.pros: Dict[str, object] = {}              # a setting that raised core on a config the centre did not take
         self.fresh_pros: List[Tuple[str, object]] = []
-        self.allow_fp = allow_fp                       # the core seat: a higher score is kept when false positives rise
+        self.allow_fp = allow_fp                       # the core seat is still founded this way; its climb uses the same two-part rule
         self.flat: Set[str] = set()
         self.recent: List[str] = []                        # settings of accepted moves, most recent last
         self.axis_gain: Dict[str, float] = {}
@@ -138,7 +139,7 @@ class Climber:
         self.cycle = 0                                     # index into climb.shake_k
         self.cycle_stage = "points"                        # points | local
         self.cycle_sent = self.cycle_back = 0
-        self.cycle_best: Optional[Tuple[Config, float]] = None
+        self.cycle_best: Optional[Tuple[Config, float, Optional[float], Optional[float]]] = None
         self.rounds = 0                                    # full perturbation rounds without an acceptance
         self.equal_accepts = 0
         self.chains: Dict[int, Chain] = {}
@@ -451,7 +452,10 @@ class Climber:
             if self.cycle_best is None:
                 self.cycle, self.cycle_sent = self.cycle + 1, 0
                 return self._perturb(live, rng, room)
-            cfg, sc = self.cycle_best
+            cfg, sc, fp, core = self.cycle_best
+            if sc > self.best + tune("climb.accept_min") and not self._worth(sc, fp, core):
+                self.cycle, self.cycle_sent = self.cycle + 1, 0
+                return self._perturb(live, rng, room)          # a higher score that fails the parts is not climbed
             out = self.singles(cfg, sc, live, "local", 1.0, cycle=self.cycle)
             self.cycle_stage, self.cycle_sent, self.cycle_back = "local", len(out), 0
             if not out:
@@ -463,13 +467,16 @@ class Climber:
 
     def _judge(self, live: Sequence[str], rng: random.Random, room: int) -> List[Move]:
         """End of one perturbation step: better or equal replaces the centre (ParamILS), else the next K."""
-        cfg, sc = self.cycle_best if self.cycle_best else (None, None)
+        cfg, sc, fp, core = self.cycle_best if self.cycle_best else (None, None, None, None)
+        own = cfg is not None and sc > self.best + tune("climb.accept_min")
+        if own and not self._worth(sc, fp, core):
+            self.cycle, self.cycle_sent = self.cycle + 1, 0
+            return self._perturb(live, rng, room)
         if cfg is not None and sc >= self.best - EQUAL and cfg.key != self.centre.key and \
-                (sc > self.best + tune("climb.accept_min") or self.equal_accepts < tune("climb.equal_accepts")):
-            own = sc > self.best + tune("climb.accept_min")
+                (own or self.equal_accepts < tune("climb.equal_accepts")):
             if not own:
                 self.equal_accepts += 1
-            self._recentre(cfg, sc, self.history[-1][0], (), own=own)
+            self._recentre(cfg, sc, self.history[-1][0], (), own=own, fp=fp, core=core)
             self.state, self.scale, self.fresh = "climb", 1.0, True
             self.note(f"perturbation accepted at {sc:.4f}")
             return self._main(live, rng, room)
@@ -598,27 +605,31 @@ class Climber:
         return bool(self.sweep_is_scan and self.sweep_sent
                     and self.sweep_back < tune("climb.back_frac") * self.sweep_sent)
 
-    def _worth(self, score: Optional[float], fp: Optional[float]) -> bool:
-        """A result is a move when the score rises and the call is not dirtier. A higher score bought with more
-        false positives is not progress: the truth score charges that rate more than the extra calls return."""
+    def _worth(self, score: Optional[float], fp: Optional[float], core: Optional[float] = None) -> bool:
+        """A result is a move when the score rises in one of two ways: core rises and the false-positive count
+        does not, or the false-positive count falls and core holds. A higher score that adds false positives is
+        not a move. A cleaner score that gives up core is not a move either."""
         if score is None or score <= self.best + tune("climb.accept_min"):
             return False
-        if self.allow_fp:
-            return True
-        if fp is None or self.best_fp is None:
-            return True
-        return fp <= self.best_fp
+        if fp is None or self.best_fp is None or core is None or self.best_core is None:
+            if fp is None or self.best_fp is None:
+                return True
+            return fp <= self.best_fp
+        core_up, core_held = core > self.best_core, core >= self.best_core
+        fp_down, fp_held = fp < self.best_fp, fp <= self.best_fp
+        return (core_up and fp_held) or (fp_down and core_held)
 
-    def offer(self, config: Config, score: float, now: float, fp: Optional[float] = None) -> bool:
+    def offer(self, config: Config, score: float, now: float, fp: Optional[float] = None,
+              core: Optional[float] = None) -> bool:
         """A point the registry puts on this hill. A gain of climb.decisive moves the centre at once and the scan
         runs again. A smaller gain does not interrupt a scan, and does not move a peak whose scan already came
         back flat. A gain that adds false positives does not move the centre. Not counted as the domain's own
         progress."""
-        if config.key == self.centre.key or not self._worth(score, fp):
+        if config.key == self.centre.key or not self._worth(score, fp, core):
             return False
         if self.scan_open() and score < self.best + tune("climb.decisive"):
             return False                                       # a small gain does not abort a scan that is still out
-        self._recentre(config, score, now, (), own=False, fp=fp)
+        self._recentre(config, score, now, (), own=False, fp=fp, core=core)
         return True
 
     def start_final(self) -> None:
@@ -690,20 +701,31 @@ class Climber:
                 n += 1
         return n
 
-    def _keep_pro(self, move: Move, config: Config, core: Optional[float]) -> None:
-        """One setting that raised core, on a config the centre did not take, is kept. The rest of that config stays behind."""
-        if core is None or self.best_core is None or core <= self.best_core or len(move.axes) != 1:
+    def _keep_pro(self, move: Move, config: Config, core: Optional[float], fp: Optional[float]) -> None:
+        """One setting that raised core or lowered the false-positive count, on a config the centre did not take,
+        is kept. The rest of that config stays behind."""
+        if len(move.axes) != 1:
             return
         a = move.axes[0]
         spec = self.space.specs.get(a)
         v = config.params.get(a)
         if spec is None or v is None or self.space._same(spec, self.centre.params.get(a), v):
             return
+        core_pro = core is not None and self.best_core is not None and core > self.best_core
+        fp_pro = fp is not None and self.best_fp is not None and fp < self.best_fp
+        if not core_pro and not fp_pro:
+            return
         if a in self.pros and self.space._same(spec, self.pros[a], v):
             return
         self.pros[a] = v
         self.fresh_pros.append((a, v))
-        self.note("%s raised core to %.4f on a config the centre did not take" % (a, core))
+        if core_pro and fp_pro:
+            self.note("%s raised core to %.4f and lowered false positives to %.4f on a config the centre did not take"
+                      % (a, core, fp))
+        elif core_pro:
+            self.note("%s raised core to %.4f on a config the centre did not take" % (a, core))
+        else:
+            self.note("%s lowered false positives to %.4f on a config the centre did not take" % (a, fp))
 
     def consider(self, move: Move, is_head: bool, config: Config, score: Optional[float], failed: bool,
                  now: float, fp: Optional[float] = None, core: Optional[float] = None) -> bool:
@@ -722,8 +744,8 @@ class Climber:
                 self.cycle_back += 1
             if move.kind in ("n1", "local", "final") and len(move.axes) == 1:
                 learned = score
-                if not bad and score is not None and not self._worth(score, fp) and score > self.best:
-                    learned = self.best - 1.0          # a dirtier higher score is a step away from the score
+                if not bad and score is not None and not self._worth(score, fp, core) and score > self.best:
+                    learned = self.best - 1.0          # a higher score that fails the parts is a step away from it
                 self._learn(move.axes[0], config, move, learned, bad, now)
             if move.kind in CHAIN_KINDS:
                 self._chain_result(move, config, None if bad else score)
@@ -731,23 +753,23 @@ class Climber:
             return self._maybe_recentre(now)
         if move.kind in ("shake", "local") and self.state == "perturb" and move.cycle == self.cycle:
             if self.cycle_best is None or score > self.cycle_best[1]:
-                self.cycle_best = (config, score)
-        if self._worth(score, fp) and score > self.best + tune("climb.decisive"):
+                self.cycle_best = (config, score, fp, core)
+        if self._worth(score, fp, core) and score > self.best + tune("climb.decisive"):
             self._credit(move, score)
             self._recentre(config, score, now, move.axes if current else (), own=True, fp=fp, core=core)
             return True
-        if self._worth(score, fp) and move.kind in CHAIN_KINDS:
+        if self._worth(score, fp, core) and move.kind in CHAIN_KINDS:
             if self.scan_open() and score < self.best + tune("climb.decisive"):
                 return False                                    # a chain under 0.05 does not abort a scan still out
             self._credit(move, score)                                   # a chain beat the domain: its centre moves
             self.note(f"a chain found {score:.4f}")
             self._recentre(config, score, now, (), own=True, fp=fp, core=core)
             return True
-        if self._worth(score, fp) and move.kind in SWEEP_KINDS and self.state in ("climb", "final"):
+        if self._worth(score, fp, core) and move.kind in SWEEP_KINDS and self.state in ("climb", "final"):
             self._credit(move, score)
             self.winners.append((move, config, score, fp))
-        elif not self._worth(score, fp):
-            self._keep_pro(move, config, core)             # the config stays behind; the setting that raised core does not
+        elif not self._worth(score, fp, core):
+            self._keep_pro(move, config, core, fp)         # the config stays behind; the setting that helped does not
         return self._maybe_recentre(now)
 
     def _retry_failed_scan(self) -> None:

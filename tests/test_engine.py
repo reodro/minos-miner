@@ -214,16 +214,44 @@ class ClimberTest(unittest.TestCase):
         self.assertEqual(d.hand(d.gained(), [other]), 0)                        # already queued
 
     def test_the_core_seat_keeps_a_higher_score_when_false_positives_rise(self):
+        """The old core-seat bypass is gone: a higher score that adds false positives is refused."""
         space, d, live = self.make()
         d.allow_fp = True
         d.best_fp = 2.0
+        d.best_core = 0.89
         moves = d.refill(live, random.Random(0), 20)
         m = next(x for x in moves if x.kind == "n1")
         d.take()
-        self.assertTrue(d.consider(m, True, m.config, 88.2, False, 1.0, fp=2.4))
-        self.assertEqual(d.best, 88.2)
-        self.assertEqual(d.best_fp, 2.4)
-        self.assertFalse(d.consider(m, True, m.config, 88.0, False, 2.0, fp=1.0))   # the score did not rise
+        centre = d.centre.key
+        self.assertFalse(d.consider(m, True, m.config, 88.2, False, 1.0, fp=2.4, core=0.91))
+        self.assertEqual(d.centre.key, centre)
+        self.assertEqual(d.best, 88.0)
+
+    def test_a_move_is_kept_when_core_rises_or_false_positives_fall(self):
+        space, d, live = self.make()
+        d.best_fp = 2.0
+        d.best_core = 0.89
+        moves = [m for m in d.refill(live, random.Random(0), 40) if m.kind == "n1"]
+        up, down = moves[0], moves[1]
+        d.take()
+        self.assertTrue(d.consider(up, True, up.config, 88.2, False, 1.0, fp=2.0, core=0.91))
+        self.assertEqual(d.best_core, 0.91)                                    # core rose, false positives held
+        self.assertEqual(d.best_fp, 2.0)
+        d2 = self.make()[1]
+        d2.best_fp = 2.0
+        d2.best_core = 0.89
+        d2.take()
+        self.assertTrue(d2.consider(down, True, down.config, 88.2, False, 1.0, fp=1.6, core=0.89))
+        self.assertEqual(d2.best_fp, 1.6)                                      # false positives fell, core held
+        self.assertEqual(d2.best_core, 0.89)
+        d3 = self.make()[1]
+        d3.best_fp = 2.0
+        d3.best_core = 0.89
+        centre = d3.centre.key
+        d3.take()
+        self.assertFalse(d3.consider(down, True, down.config, 88.5, False, 1.0, fp=1.2, core=0.88))
+        self.assertEqual(d3.centre.key, centre)                                # fewer false positives, core given up
+        self.assertEqual(d3.pros[down.axes[0]], down.config.params[down.axes[0]])
 
     def test_the_core_seat_is_the_highest_core_outside_the_clump(self):
         space, book, names = setup()
