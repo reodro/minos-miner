@@ -1363,7 +1363,9 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                              "best": round(d.best, 4), "centre": d.centre.key, "inflight": d.inflight,
                              "allotted": round(alloc.get(d.id, 0.0), 1), "progress_per_min": round(d.progress(now), 4),
                              "chains": len(d.chains), "perturb_rounds": d.rounds,
-                             "tried": len(d.tried), "born_s": round(d.born - t0, 1), "ended_s": ended.get(d.id),
+                             "tried": len(d.tried), "born_s": round(d.born - t0, 1),
+                             "best_s": round(next((t for t, _s, why in reversed(d.history) if why != "cut"), d.born) - t0, 1),
+                             "ended_s": ended.get(d.id),
                              "origin": origin.get(d.id, ""), "parents": lineage.get(d.id, [])}
                             for d in domains.values()],
                 "merges": [{"id": m.id, "parents": list(m.parents), "why": m.why, "sent": m.sent, "back": m.back,

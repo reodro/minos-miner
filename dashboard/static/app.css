@@ -217,7 +217,10 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .card.final { border-top-color: var(--final); } .card.merging { border-top-color: var(--merge); }
 .card .head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .card .head b { font-size: 14px; margin-right: auto; }
-.card .big { font-size: 25px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.card .score-line { display: grid; gap: 0; }
+.card .best-label { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--label); }
+.card .big { font-size: 25px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.card .updated { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; font-size: 12.5px; }
 .kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }

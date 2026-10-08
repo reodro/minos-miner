@@ -228,16 +228,21 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
         return {"runs": history_of(history_file)}
 
     _wave_at = re.compile(r"engine: wave (\d+) \([^)]*\) at t\+([0-9.]+)m")
+    _dom_at = re.compile(r"domain (\d+) (?:-> [\d.]+|born at [\d.]+).*t\+([0-9.]+)m")
     _wave_cache: dict = {}
 
     def fill_wave_starts(live: Optional[dict]) -> None:
-        """The running search publishes each wave's start. An older process does not, so take it from that round's log."""
+        """An older search process does not publish wave starts or when a domain's best last moved. Take both from its log."""
         try:
-            waves = live["search"]["engine"].get("waves") or []
+            eng = live["search"]["engine"]
+            waves = eng.get("waves") or []
+            domains = eng.get("domains") or []
             tag = (live.get("round") or {}).get("tag") or ""
         except (AttributeError, KeyError, TypeError):
             return
-        if not waves or not tag or all(w.get("started_s") is not None for w in waves):
+        need_waves = any(w.get("started_s") is None for w in waves)
+        need_domains = any(d.get("best_s") is None for d in domains)
+        if not tag or not (need_waves or need_domains):
             return
         log_dir = Path(__file__).resolve().parents[1] / "test" / "runs"
         logs = sorted(log_dir.glob(f"replay_{tag}_*.log"))
@@ -255,12 +260,19 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
                 text = path.read_text(errors="replace")
             except OSError:
                 return
-            found = {int(m.group(1)): round(float(m.group(2)) * 60, 1) for m in _wave_at.finditer(text)}
+            wave_at = {int(m.group(1)): round(float(m.group(2)) * 60, 1) for m in _wave_at.finditer(text)}
+            dom_at: dict = {}
+            for m in _dom_at.finditer(text):
+                dom_at[int(m.group(1))] = round(float(m.group(2)) * 60, 1)
+            found = {"waves": wave_at, "domains": dom_at}
             _wave_cache.clear()
             _wave_cache[key] = found
         for w in waves:
-            if w.get("started_s") is None and w.get("wave") in found:
-                w["started_s"] = found[w["wave"]]
+            if w.get("started_s") is None and w.get("wave") in found["waves"]:
+                w["started_s"] = found["waves"][w["wave"]]
+        for d in domains:
+            if d.get("best_s") is None and d.get("id") in found["domains"]:
+                d["best_s"] = found["domains"][d["id"]]
 
     def result_of(live: Optional[dict]) -> Optional[dict]:
         """The round, review and rank rows main appended for the run on screen (rounds.jsonl), newest of each."""

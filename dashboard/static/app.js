@@ -397,6 +397,12 @@ function renderResult(res, finished) {
   );
 }
 
+function bestUpdated(d, E) {
+  if (d.best_s == null) return "updated –";
+  const ts = E.started_ts != null ? E.started_ts + d.best_s : null;
+  return ts != null ? `updated ${mins(d.best_s)} · ${ago(ts)}` : `updated ${mins(d.best_s)}`;
+}
+
 function renderDomains(E, finished) {
   const box = $("domains");
   if (!E) { box.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); $("domains-sub").textContent = ""; return; }
@@ -412,7 +418,10 @@ function renderDomains(E, finished) {
       h("div", {class: "head"}, h("b", {text: `Domain ${d.id}`}),
         finished ? chip("finished", "final") : chip(d.status === "merging" ? "merging" : d.state, d.status === "merging" ? "merging" : d.state),
         finished ? null : chip(d.mode)),
-      h("div", {class: "big", text: fix(d.best)}),
+      h("div", {class: "score-line"},
+        h("div", {class: "best-label", text: "best score"}),
+        h("div", {class: "big", text: fix(d.best)}),
+        h("div", {class: "updated", text: bestUpdated(d, E)})),
       bar(d.allotted ? d.inflight / Math.max(d.allotted, d.inflight) : 0, "", null),
       kv([
         led ? ["opened", fix(led.opened)] : null,
