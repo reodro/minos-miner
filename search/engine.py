@@ -1,4 +1,11 @@
-"""The search engine (v4.17): the opening generations actually breed core and false positives apart.
+"""The search engine (v4.18): a scan that failed is sent again.
+Owner: search.
+
+v4.18 keeps v4.17. A full-range scan whose every result failed (a full disk, a crash) is not a flat peak.
+The basin sends that scan again, up to two extra times, and only then holds the peak. A scan that scored
+and gained nothing still holds, as before.
+
+The search engine (v4.17): the opening generations actually breed core and false positives apart.
 Owner: search.
 
 v4.17 keeps v4.16. With islands on, which is the default, breed() returned the island children before the
@@ -1360,7 +1367,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.17", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.18", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),

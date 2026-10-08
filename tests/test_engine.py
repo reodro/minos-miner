@@ -357,6 +357,30 @@ class ClimberTest(unittest.TestCase):
         self.assertTrue(d.first_scan_held)
         self.assertEqual(d.refill(live, random.Random(1), 50), [])
 
+    def test_a_scan_whose_every_result_failed_is_sent_again(self):
+        space, book, names = setup()
+        geno = [a for a in GENOTYPING_PARAMS if a in space.names]
+        live = book.live(0.0) + geno
+        d = Climber(0, space, book, space._assemble({}), 88.0, 0.0, extra_axes=geno, scan=True)
+        moves = d.refill(live, random.Random(0), 500)
+        keys = {m.config.key for m in moves}
+        for m in moves:
+            d.take()
+            d.consider(m, True, m.config, None, True, 1.0)
+        self.assertFalse(d.scan_flat)
+        self.assertIsNone(d.first_scan_score)
+        self.assertTrue(d.scan_next)
+        again = d.refill(live, random.Random(1), 500)
+        self.assertTrue(again and all(m.kind == "scan" for m in again))
+        self.assertTrue(keys & {m.config.key for m in again})
+        d.scan_retries = 2
+        for m in again:
+            d.take()
+            d.consider(m, True, m.config, None, True, 2.0)
+        self.assertTrue(d.scan_flat)
+        self.assertTrue(d.first_scan_held)
+        self.assertEqual(d.refill(live, random.Random(2), 50), [])
+
     def test_siblings_are_one_genotyping_and_one_pairhmm_step(self):
         space, d, live = self.make()
         moves = d.refill(live, random.Random(0), 500)

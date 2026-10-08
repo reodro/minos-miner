@@ -58,6 +58,7 @@ SHAKE_SCALE = 0.3
 CHAIN_KS, CHAIN_SCALE = (2, 3), 0.15
 FINAL_CHAIN_KS, FINAL_CHAIN_SCALE = (1, 2), 0.06
 STEP_MAX = 0.5
+SCAN_FAIL_RETRIES = 2                      # a scan whose every result failed is sent again, this many extra times
 PROGRESS_WINDOW_S = 600.0
 CHEAP = tuple(GENOTYPING_PARAMS) + tuple(PAIRHMM_PARAMS)
 SWEEP_KINDS = ("scan", "n1", "n2", "n3", "wide", "reapply", "share", "transplant", "final", "pairing")
@@ -119,7 +120,9 @@ class Climber:
         self.scan_flat = False                             # the scan came back under climb.decisive: the peak is held
         self.wide_next = self.wide_done = False            # the wide round of this centre: queued / done
         self.eager_wide = False                            # set by the engine: few domains, so wide with the first sweep
-        self.sweep_sent = self.sweep_back = 0
+        self.sweep_sent = self.sweep_back = self.sweep_scored = 0
+        self.sweep_missed: List[str] = []              # scan configs that failed, so a retry can send them again
+        self.scan_retries = 0                          # failed full-range scans already sent again
         self.winners: List[Tuple[Move, Config, float, Optional[float]]] = []
         self.best_fp: Optional[float] = None           # false positives per target at the centre; a move may not raise it
         self.allow_fp = allow_fp                       # the core seat: a higher score is kept when false positives rise
@@ -389,7 +392,8 @@ class Climber:
         if self.fresh:
             self.fresh = False
             out = self._sweep(live, rng)
-            self.sweep_sent, self.sweep_back = len(out), 0
+            self.sweep_sent, self.sweep_back, self.sweep_scored = len(out), 0, 0
+            self.sweep_missed = []
             self.pool.extend(out)
             if out or self.state == "final":
                 return out
@@ -650,6 +654,10 @@ class Climber:
             self.inflight = max(0, self.inflight - 1)
             if move.kind in SWEEP_KINDS and current:
                 self.sweep_back += 1
+                if bad:
+                    self.sweep_missed.append(config.key)
+                else:
+                    self.sweep_scored += 1
             if move.kind in ("shake", "local") and move.cycle == self.cycle and self.state == "perturb":
                 self.cycle_back += 1
             if move.kind in ("n1", "local", "final") and len(move.axes) == 1:
@@ -680,6 +688,20 @@ class Climber:
             self.winners.append((move, config, score, fp))
         return self._maybe_recentre(now)
 
+    def _retry_failed_scan(self) -> None:
+        """Every result of the scan failed, so the peak was never measured. Send the same scan again."""
+        for k in self.sweep_missed:
+            self.tried.discard(k)
+        self.sweep_missed = []
+        self.scan_retries += 1
+        self.scan_next = True
+        self.sweep_is_scan = False
+        self.scan_flat = False
+        self.fresh = True
+        self.winners = []
+        self.sweep_sent = self.sweep_back = self.sweep_scored = 0
+        self.note("scan failed before it scored: sent again")
+
     def _record_first_scan(self, score: float, key: str, held: bool) -> None:
         """The first scan's best point, once. Later scans do not overwrite it."""
         if self.first_scan_score is not None:
@@ -696,6 +718,9 @@ class Climber:
         back = self.sweep_sent and self.sweep_back >= tune("climb.back_frac") * self.sweep_sent
         if self.scan_flat and not self.scan_next:
             self.winners = []                              # the rest of a flat scan does not move the centre
+            return False
+        if self.sweep_is_scan and back and self.sweep_scored == 0 and self.scan_retries < SCAN_FAIL_RETRIES:
+            self._retry_failed_scan()
             return False
         if self.sweep_is_scan and back:
             picked = None
@@ -795,7 +820,9 @@ class Climber:
         self.flat.clear()
         self.fresh = True
         self.wide_done = False
-        self.sweep_sent = self.sweep_back = 0
+        self.sweep_sent = self.sweep_back = self.sweep_scored = 0
+        self.sweep_missed = []
+        self.scan_retries = 0
         self.sweep_is_scan = False
         if gain > tune("climb.accept_min") and self.state != "final":
             self.scan_flat = False                     # a resolved gain is a new centre; the neighbourhood climb goes on
