@@ -174,6 +174,26 @@ def generation(space: Space, pool: Sequence[Tuple[Config, float]], rng: random.R
     return list(out.values())
 
 
+def cross_generation(space: Space, core: Sequence[Config], fp: Sequence[Config], rng: random.Random, n: int,
+                     names: Sequence[str]) -> List[Config]:
+    """`n` children, each taking settings from one high-core parent and one high-FP parent."""
+    if n <= 0 or not core or not fp:
+        return []
+    out: Dict[str, Config] = {}
+    tries = 0
+    while len(out) < n and tries < 6 * n:
+        tries += 1
+        a, b = rng.choice(list(core)), rng.choice(list(fp))
+        if a.key == b.key:
+            continue
+        c = (uniform_child if rng.random() < 0.5 else block_child)(space, a, b, rng, names)
+        if c is not None and rng.random() < MUTATE_FRAC:
+            c = mutate(space, c, rng, names) or c
+        if c is not None:
+            out.setdefault(c.key, c)
+    return list(out.values())
+
+
 def island_generation(space: Space, pool: Sequence[Tuple[Config, float]], island_of: Dict[str, int], islands: int,
                       rng: random.Random, n: int, hills: Hills, names: Sequence[str], min_far: int,
                       per_island: int = 15) -> List[Tuple[Config, int]]:

@@ -230,7 +230,9 @@ class StatusBoard:
             for (k, fid), res in client.latest.items():
                 cfg = client.configs.get(k)
                 if fid == "full" and cfg is not None:
-                    configs[k] = {"config": cfg.to_dict(), "local": res.score, "gate_passed": res.gate_passed}
+                    fp = (res.region_fp / res.n_targets) if res.n_targets else None
+                    configs[k] = {"config": cfg.to_dict(), "local": res.score, "gate_passed": res.gate_passed,
+                                  "core": res.core, "fp_per_target": None if fp is None else round(fp, 4)}
         if self._baseline and self._baseline not in configs and self._baseline_cfg:   # e.g. a static fallback
             configs[self._baseline] = {"config": self._baseline_cfg, "local": None, "gate_passed": None}
         failed = dict(getattr(out, "failed_configs", None) or {})

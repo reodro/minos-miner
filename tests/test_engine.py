@@ -76,6 +76,17 @@ class GeneticTest(unittest.TestCase):
         mutated = genetic.merge_children(space, a, b, random.Random(0), names, n_mutated=20)
         self.assertGreater(len(mutated), len(kids))
 
+    def test_a_third_generation_child_takes_from_a_core_parent_and_an_fp_parent(self):
+        space, book, names = setup()
+        core = space._assemble({"min_pruning": 2, "heterozygosity": 0.001})
+        fp = space._assemble({"min_pruning": 8, "heterozygosity": 0.01, "assembly_region_padding": 400,
+                              "min_mapping_quality_score": 10})
+        kids = genetic.cross_generation(space, [core], [fp], random.Random(0), 20, names)
+        self.assertTrue(kids)
+        for c in kids:
+            self.assertIn(c.params["min_pruning"], (2, 8))
+            self.assertIn(c.params["heterozygosity"], (0.001, 0.01))
+
     def test_merge_children_sample_when_many_settings_differ(self):
         space, book, names = setup()
         rng = random.Random(1)

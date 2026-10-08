@@ -59,6 +59,28 @@ class PortfolioTest(unittest.TestCase):
         self.assertTrue(all(r["src"] == "minos:20261002T092900Z" and r["profile"] == "B" for r in rows))
         self.assertEqual(portfolio.members(ours=self.ours)[0]["src"], "minos:20261002T092900Z")   # ours come first
         self.assertEqual(portfolio.add_run(self.space, configs, "20261002T092900Z", "B", path=self.ours), 0)
+        self.assertTrue(all(r["group"] == "score" for r in rows))
+
+    def test_a_reviewed_run_also_keeps_high_core_and_high_fp(self):
+        configs = {}
+        specs = [
+            (self.FAR1, 88.70, 0.80, 1.0),
+            (self.FAR2, 80.00, 0.95, 1.1),                                          # below the score window, highest core
+            ({"min_pruning": 9, "heterozygosity": 0.01, "assembly_region_padding": 400}, 79.00, 0.70, 6.0),
+        ]
+        for change, score, core, fp in specs:
+            c = Config("gatk", {**self.d, **change})
+            configs[c.key] = {"config": c.to_dict(), "local": score, "core": core, "fp_per_target": fp}
+        portfolio.add_run(self.space, configs, "20261002T092900Z", "B", path=self.ours)
+        rows = [json.loads(l) for l in self.ours.read_text().splitlines()]
+        groups = {r["group"] for r in rows}
+        self.assertIn("score", groups)
+        self.assertIn("core", groups)
+        self.assertIn("fp", groups)
+        self.assertEqual(next(r["local"] for r in rows if r["group"] == "core"), 80.00)
+        self.assertEqual(next(r["local"] for r in rows if r["group"] == "fp"), 79.00)
+        seeds = portfolio.pick(self.space, "B", 3, pool=rows)
+        self.assertEqual(len(seeds), 3)
 
     def test_no_bam_no_profile(self):
         self.assertIsNone(portfolio.bam_profile("/nonexistent.bam", "chr20", 1, 1000))

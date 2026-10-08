@@ -1,4 +1,12 @@
-"""The search engine (v4.15): one founding seat chases the variants the clump missed.
+"""The search engine (v4.16): the opening breeds core and false positives apart, then mixes them.
+Owner: search.
+
+v4.16 keeps v4.15. Generations 1 and 2 each split in half. One half is children of the highest measured core,
+the other half children of the highest false-positive rate. Generation 3 crosses one parent from each group.
+The portfolio keeps the same three kinds of config from a reviewed run: near-best score, high core, and high
+false positives, and wave 0 draws from all three.
+
+The search engine (v4.15): one founding seat chases the variants the clump missed.
 Owner: search.
 
 v4.15 keeps v4.14. Eleven seats are still the highest centres far enough apart. The twelfth is the scored
@@ -318,6 +326,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         ids = [0, 0]                                 # next domain id, next merge id
         candidates: Dict[str, Tuple[Config, float]] = {}
         fp_of: Dict[str, float] = {}                     # config key -> false positives per target, when measured
+        part_keep: Dict[str, List[Tuple[float, Config]]] = {"core": [], "fp": []}   # top measured core and FP rate
         island_of: Dict[str, int] = {}               # opening.islands: config key -> island
         was_centre: Set[str] = set()
         wave_heads: List[int] = []                   # heads sent per wave (0 = hypercube, 1.. = generations)
@@ -531,21 +540,59 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                         say("generations stop after %d (last gained %.3f) t+%.1fm", w, top() - wave_best[w],
                                  elapsed() / 60)
                     else:
-                        children = [c for c in breed(cap) if fresh(c)]
+                        children = [c for c in breed(cap, gen=w + 1) if fresh(c)]
                         launch_wave(children, tune("riders.global"), f"generation {w + 1}")
                         st["gens_done"] = len(wave_heads) - 1 >= tune("opening.generations")
                 return
             if back >= tune("opening.found_back") or not pending:
                 found()
 
-        def breed(n: int) -> List[Config]:
-            """`n` children of the scored configs: on islands (opening.islands) or with soft niching."""
+        def remember(kind: str, metric: float, config: Config) -> None:
+            board = part_keep[kind]
+            for i, (old, c) in enumerate(board):
+                if c.key == config.key:
+                    if metric > old:
+                        board[i] = (metric, config)
+                    return
+            board.append((metric, config))
+            board.sort(key=lambda t: -t[0])
+            del board[40:]
+
+        def breed_parts(n: int, gen: int) -> List[Config]:
+            """Half the children from the highest core, half from the highest false-positive rate."""
+            core = [(c, m) for m, c in part_keep["core"]]
+            fp = [(c, m) for m, c in part_keep["fp"]]
+            if len(core) < 2 or len(fp) < 2:
+                return genetic.generation(space, list(candidates.values()), rng, n, hills, names())
+            half = n // 2
+            a = genetic.generation(space, core, rng, half, hills, names())
+            b = genetic.generation(space, fp, rng, n - half, hills, names())
+            say("generation %d: %d children of the high core, %d of the high false positives", gen, len(a), len(b))
+            return a + b
+
+        def breed_cross(n: int) -> List[Config]:
+            """One child takes settings from a high-core parent and a high-FP parent."""
+            cores = [c for _, c in part_keep["core"]]
+            fps = [c for _, c in part_keep["fp"]]
+            kids = genetic.cross_generation(space, cores, fps, rng, n, names())
+            if len(kids) < 4:
+                return genetic.generation(space, list(candidates.values()), rng, n, hills, names())
+            say("generation 3: %d children of a core parent and an fp parent", len(kids))
+            return kids
+
+        def breed(n: int, gen: Optional[int] = None) -> List[Config]:
+            """`n` children of the scored configs: on islands (opening.islands) or with soft niching.
+            Generations 1 and 2 split core from false positives; generation 3 crosses the two."""
             if tune("opening.islands"):
                 kids = genetic.island_generation(space, list(candidates.values()), island_of, n_domains, rng, n, hills,
                                                  names(), tune("domains.found_min_far"))
                 for c, i in kids:
                     island_of[c.key] = i
                 return [c for c, _ in kids]
+            if gen in (1, 2):
+                return breed_parts(n, gen)
+            if gen == 3:
+                return breed_cross(n)
             return genetic.generation(space, list(candidates.values()), rng, n, hills, names())
 
         def breed_steady(idle: Optional[int]) -> None:
@@ -1182,6 +1229,9 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             ranker.add(o.config, rr.core if (rr and not failed) else None, fp, failed)
             if fp is not None:
                 fp_of[o.config.key] = fp
+            if not failed and rr is not None and rr.core is not None and fp is not None:
+                remember("core", rr.core, o.config)
+                remember("fp", fp, o.config)
             if not failed:
                 k = o.config.key
                 if k not in candidates or score > candidates[k][1]:
@@ -1294,7 +1344,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.15", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.16", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),
