@@ -1,4 +1,11 @@
-"""The search engine (v4.21): the final starts at minute 56 and takes the steps that raised the other basins.
+"""The search engine (v4.22): twenty-four centres, then twelve, then one.
+Owner: search.
+
+v4.22 keeps v4.21. The opening founds 24 centres. Halfway to the final, the 12 that have moved the most keep
+the workers. The final still starts at minute 56. The strongest of those twelve keeps the seat, and each of the
+others hands it every setting value that was in place when that basin's score rose.
+
+The search engine (v4.21): the final starts at minute 56 and takes the steps that raised the other basins.
 Owner: search.
 
 v4.21 keeps v4.20. The final starts at minute 56. The strongest of the six basins keeps the seat. Each of the
@@ -1004,15 +1011,15 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             until_final = (t_now - at("final")) if t_now is not None else 1e9
             until_by = at("reduce_to_1_by") - elapsed()
             no_new = min(until_final, until_by) <= T(60 * tune("schedule.no_new_before_final_min"))
-            # Halfway from founding to the final, once every first scan is back, the six that are highest
+            # Halfway from founding to the final, once every first scan is back, the twelve that are highest
             # after adding their gain since that scan keep the workers. The others retire.
             if not st["final"] and st["founded"] and not st["cut"]:
                 climbing = [d for d in live() if d.state != "final"]
                 final_at = (tl if tl is not None and tl > 0 else ROUND_S) - at("final")
                 half = st["founded_at"] + 0.5 * max(0.0, final_at - st["founded_at"])
-                if len(climbing) > 6 and elapsed() >= half and all(d.first_scan_score is not None for d in climbing):
+                if len(climbing) > 12 and elapsed() >= half and all(d.first_scan_score is not None for d in climbing):
                     ranked_d = sorted(climbing, key=lambda d: (2 * d.best - d.first_scan_score, d.best), reverse=True)
-                    keep, drop = ranked_d[:6], ranked_d[6:]
+                    keep, drop = ranked_d[:12], ranked_d[12:]
                     st["cut"] = True
                     for d in keep:
                         d.history.append((clock(), d.best, "cut"))   # the stall clock starts over for the basins that stay
@@ -1412,7 +1419,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.21", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.22", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),

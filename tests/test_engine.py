@@ -475,8 +475,9 @@ class EngineRoundTest(unittest.TestCase):
         for i in range(1, 4):
             self.assertIn(f"wave {i} ", text)                                 # three opening generations
         self.assertIn("founding at", text)
-        self.assertIn("12 domains, 0 held", text)                             # all twelve climb from founding
-        self.assertIn("cut at", text)                                         # halfway, the moving six keep the workers
+        self.assertIn("24 domains, 0 held", text)                             # all twenty-four climb from founding
+        cut = [l for l in logs.output if "cut at " in l][0]
+        self.assertEqual(len(cut.split("keeping ")[1].split()), 12)           # halfway, twelve keep the workers
         self.assertIn("merge (final)", text)                                  # one merge, at the final window
         self.assertNotIn("scheduled 3 to 1", text)
         self.assertNotIn("one hill", text)                                     # merges.on_evidence 0

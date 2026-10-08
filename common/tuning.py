@@ -121,9 +121,9 @@ KNOBS_LIST: List[Knob] = [
          "that many generations."),
     Knob("opening.portfolio_share", 0.4, 0.0, 1.0, ROUND, "share",
          "Share of wave 0 taken by portfolio seeds (the legacy portfolio, then ours); the rest is a hypercube."),
-    Knob("domains.max", 12, 1, 12, ROUND, "count",
-         "Candidate centres the opening identifies; a small fleet gets one per 8 workers at most. Six of them climb. "
-         "The rest are held and take a seat, one at a time, when a first scan gains under climb.decisive."),
+    Knob("domains.max", 24, 1, 24, ROUND, "count",
+         "Centres the opening founds; a small fleet gets one per 8 workers at most. Halfway to the final, twelve "
+         "keep climbing. The final merges those to one."),
     Knob("domains.stall_min", 10.0, 1.0, 40.0, LIVE, "min",
          "After its first scan, a basin whose best has not moved for this long is retired and the next candidate takes its seat."),
     Knob("domains.found_min_far", 6, 4, 12, LIVE, "count",

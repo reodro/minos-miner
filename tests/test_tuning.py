@@ -73,7 +73,7 @@ class TuningTest(unittest.TestCase):
         self.t.round_started()
         self.write({"domains.max": 4, "scout.share": 0.1})
         self.assertEqual(self.t.get("scout.share"), 0.1)     # live: now
-        self.assertEqual(self.t.get("domains.max"), 12)      # round: waits
+        self.assertEqual(self.t.get("domains.max"), 24)      # round: waits
         self.assertEqual(self.t.snapshot()["pending"], {"domains.max": 4})
         self.t.round_ended()
         self.assertEqual(self.t.get("domains.max"), 4)
