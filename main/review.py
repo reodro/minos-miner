@@ -270,12 +270,25 @@ class Reviewer:
         if true is None:
             return None
         scores = os.path.join(round_dir(m["tag"]), "scores.json")
-        if m.get("kind") != "replay" or not os.path.exists(scores):
-            if not self.platform().leaderboard(m["round_id"])["round"].get("is_finalized"):
-                return None
+        # fetch() writes scores.json when the round is downloaded, often before the field has filled.
+        # A replay then ranked that early file (2 of 4) and never looked again. Always take the live
+        # field when it is at least as large as the file on disk.
+        try:
+            live = self.platform().scores(m["round_id"])
+        except Exception:  # noqa: BLE001 - a platform blip keeps the file already on disk
+            live = None
+        live_n = 0
+        if isinstance(live, dict):
+            live_n = len({r.get("submission_id") for r in (live.get("scores") or [])
+                          if r.get("combined_final") is not None and r.get("submission_id")})
+        disk_n = len(field_scores(m["tag"])) if os.path.exists(scores) else 0
+        if live_n and live_n >= disk_n:
+            os.makedirs(os.path.dirname(scores), exist_ok=True)
             with open(scores + ".part", "w") as f:
-                json.dump(self.platform().scores(m["round_id"]), f)
+                json.dump(live, f)
             os.replace(scores + ".part", scores)
+        elif not os.path.exists(scores):
+            return None
         field = field_scores(m["tag"])
         # a replay was never submitted, so it joins the field; a live run is already one of its rows
         size = len(field) + (1 if m.get("kind") == "replay" else 0)
