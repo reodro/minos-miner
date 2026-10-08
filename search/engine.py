@@ -1,4 +1,11 @@
-"""The search engine (v4.16): the opening breeds core and false positives apart, then mixes them.
+"""The search engine (v4.17): the opening generations actually breed core and false positives apart.
+Owner: search.
+
+v4.17 keeps v4.16. With islands on, which is the default, breed() returned the island children before the
+core and false-positive split, so generations 1–3 never used it. Those three generations now take the split
+first. A breed with no generation number still uses islands.
+
+The search engine (v4.16): the opening breeds core and false positives apart, then mixes them.
 Owner: search.
 
 v4.16 keeps v4.15. Generations 1 and 2 each split in half. One half is children of the highest measured core,
@@ -565,6 +572,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             core = [(c, m) for m, c in part_keep["core"]]
             fp = [(c, m) for m, c in part_keep["fp"]]
             if len(core) < 2 or len(fp) < 2:
+                say("generation %d: blended, only %d core and %d false-positive parents", gen, len(core), len(fp))
                 return genetic.generation(space, list(candidates.values()), rng, n, hills, names())
             half = n // 2
             a = genetic.generation(space, core, rng, half, hills, names())
@@ -578,23 +586,25 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             fps = [c for _, c in part_keep["fp"]]
             kids = genetic.cross_generation(space, cores, fps, rng, n, names())
             if len(kids) < 4:
+                say("generation 3: blended, the cross made %d children", len(kids))
                 return genetic.generation(space, list(candidates.values()), rng, n, hills, names())
             say("generation 3: %d children of a core parent and an fp parent", len(kids))
             return kids
 
         def breed(n: int, gen: Optional[int] = None) -> List[Config]:
             """`n` children of the scored configs: on islands (opening.islands) or with soft niching.
-            Generations 1 and 2 split core from false positives; generation 3 crosses the two."""
+            Generations 1 and 2 split core from false positives; generation 3 crosses the two.
+            That split wins over islands, which otherwise breed every generation themselves."""
+            if gen in (1, 2):
+                return breed_parts(n, gen)
+            if gen == 3:
+                return breed_cross(n)
             if tune("opening.islands"):
                 kids = genetic.island_generation(space, list(candidates.values()), island_of, n_domains, rng, n, hills,
                                                  names(), tune("domains.found_min_far"))
                 for c, i in kids:
                     island_of[c.key] = i
                 return [c for c, _ in kids]
-            if gen in (1, 2):
-                return breed_parts(n, gen)
-            if gen == 3:
-                return breed_cross(n)
             return genetic.generation(space, list(candidates.values()), rng, n, hills, names())
 
         def breed_steady(idle: Optional[int]) -> None:
@@ -1350,7 +1360,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     ended[i] = round(e, 1)
             length = tl if tl is not None and tl > 0 else ROUND_S
             client.notes["engine"] = {
-                "version": "v4.16", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
+                "version": "v4.17", "phase": phase(), "started_ts": round(time.time() - e, 1), "elapsed_s": round(e, 1),
                 "basins": basin_rows(),
                 "schedule": {"length_s": round(length, 1), "scale": round(scale_t, 4),
                              "opening_max_s": round(T(60 * tune("opening.max_min")), 1),
