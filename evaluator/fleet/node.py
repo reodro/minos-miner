@@ -354,6 +354,8 @@ def main() -> None:
     ap.add_argument("--fake", action="store_true", help="tests only: FakeRunner/FakeScorer, no GATK, no self-test")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s node: %(message)s")
+    from common.limits import raise_open_files
+    raise_open_files()                        # hundreds of workers hold more files than the usual soft limit of 1024
     workers = a.workers or default_workers()
     prefix = f"minos-node-{uuid.uuid4().hex[:6]}"
     code = code_digest()

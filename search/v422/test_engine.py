@@ -5,16 +5,16 @@ import unittest
 from common.types import AnswerSet, Config, Regime, Round, Variant
 from evaluator import FakeRunner, FakeScorer, SimExecutor
 from main import DryRunSubmitter, LoopSettings, run_round
-from search.axes import AxisBook, latin_hypercube
-from search.space import GENOTYPING_PARAMS, Space
-from search import genetic
+from search.v422.axes import AxisBook, latin_hypercube
+from search.v422.space import GENOTYPING_PARAMS, Space
+from search.v422 import genetic
 from common.tuning import tune
-from search.climber import Climber
-from search.engine import core_from_score, core_seat
+from search.v422.climber import Climber
+from search.v422.engine import core_from_score, core_seat
 from common.scoring import score_from_parts
-from search.reductions import MNH, Reductions
-from search.hills import Hills
-import search.engine as engine
+from search.v422.reductions import MNH, Reductions
+from search.v422.hills import Hills
+import search.v422.engine as engine
 from tests.helpers import ranges
 
 ACCEPT_MIN, DECISIVE = tune("climb.accept_min"), tune("climb.decisive")

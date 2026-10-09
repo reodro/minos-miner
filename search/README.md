@@ -41,38 +41,40 @@ search. `emit_ref_confidence` is `NONE` because GVCF / BP_RESOLUTION output is r
 too. `adaptive_pruning_initial_error_rate` and `pruning_lod_threshold` stay at the GATK defaults because
 HaplotypeCaller does not read them unless `--adaptive-pruning` is on, and that switch is not a search parameter.
 
-## The engine (v4.8)
+## Engines
+
+`search.searcher()` runs **v10, RF_UCB** (`search/v10/`, design in `search/v10/DESIGN.md`) unless `MINOS_ENGINE=v9`
+selects **v9** (`search/v9/`, design in `search/v9/DESIGN.md`). v4.22 is a frozen backup in `search/v422/`.
+
+- **v10**: a short opening (15% portfolio, the rest a hypercube), then one asynchronous loop: a random forest of the
+  score, refitted every quarter-fleet of results, ranks the candidates of QGA, GA-crossover, local lines and
+  InjectDrain by UCB; QLock, Restart and Reinitialize as the kings' RF_UCB had them, calibrated on the legacy
+  project's measurements. The last 15 minutes are v9's grid climb with lines on the best two distinct configs.
+- **v9**: Step A candidates (portfolio + GA), Step B grid climb with single-setting lines, Step C around each peak.
+
+## v9 in detail
+
+Design and the evidence behind it: [DESIGN.md](DESIGN.md). Three steps, one after the other:
 
 | module | what it does |
 |---|---|
-| `hills.py` | the one rule for which hill a config is on (4+ settings more than 10% of range apart = another hill; once the ranker is fitted, only the settings it finds important count); ownership, adoption, the scout's exclusion zone, merging and founding all ask it |
-| `genetic.py` | recombination: niched genetic generations, and the merge operator - every combination of the settings where two centres differ (when 8 or fewer, else 256 random ones) plus mutated children |
-| `climber.py` | a domain's climb: a full-range scan of every setting first. A gain under 0.05 does not interrupt it. A gain of 0.05 moves the centre and the scan runs again. A scan that comes back under 0.05 holds the peak (no coarser sweep, no chains). It reports facts and never decides its own lifecycle |
-| `engine.py` | the opening and the controller. The opening identifies up to 12 centres and starts six. A basin whose first scan gains under 0.05 is retired, and the next held candidate takes its seat, one at a time. The basins stay separate until one merge at the final. The submission is the highest local score |
-| `axes.py` | per-setting steps, learned cliffs, parked settings, the distance between configs, the Latin hypercube |
-| `families.py` | genotyping riders for global points |
-| `portfolio.py` | the opening's seeds: the legacy pipeline's portfolio (`portfolio/legacy.json`, 749 configs from 79 rounds) and what our reviewed runs add (`$DATA_DIR/portfolio/ours.jsonl`), the round's read-length profile first, spaced apart, up to `opening.portfolio_share` of wave 0 |
-| `ranker.py` | the (core, FP) forests the scout ranks candidates with; their importances drive the hill rule |
-| `space.py` | the round's search space: published ranges, pinned settings, floors, BAM caps |
+| `engine.py` | runs A -> B -> C on a 72-minute schedule scaled to the round, then climbs again from the best config off every hill climbed so far until the pick (the highest local score, `far.pick_s` before the end); publishes `client.notes["engine"]` |
+| `candidates.py` | Step A: wave 0 (defaults, the official seed, up to 40% portfolio seeds, a Latin hypercube; 4 calling-threshold riders each), then 3 genetic generations bred from three groups of the scored configs (both: the Pareto front on core and false positives; core: highest core; fp: fewest false positives within 0.01 of the best core), 30% of children with 2 settings redrawn; then one candidate per 500 workers, far apart by callset distance |
+| `climb.py` | Step B: each candidate climbs to its peak. Every combination of 5 settings at -d, 0, +d (odd iterations the read-pass settings, even ones 5 of the 7 assembly/activity settings in turn); the cheap settings ride on every point at +-d, and in pairs on the centre's run; the best point is the new centre; a winning setting's step grows in the next grid (2d, 3d...) while it keeps winning; 20 random jumps at a stall |
+| `lines.py` | a setting's line through a config: the values already run with everything else equal, and the gaps and rungs beyond to try next (Step B's lines, Step C) |
+| `far.py` | Step C, on each climber as soon as it peaks: from every peak, one setting at a time, the rungs step growth jumped over and the rungs beyond the nearest tried value; a better point, or a second high point that wins its short climb, moves the peak and Step B climbs on |
+| `steps.py` | each setting's ladder: its values at the agreed resolution (d = one rung) |
+| `distance.py` | callset distance (class-weighted 1 - Jaccard from the sketches on every CallSet); setting distance when a sketch is missing |
+| `portfolio.py` | the opening's seeds: the legacy portfolio and our reviewed runs, the round's read-length profile first, never the replayed round's own |
+| `space.py`, `bamgroups.py` | the round's search space: published ranges, pinned settings, floors, BAM groups and caps |
+| `axes.py` | the Latin hypercube |
 | `client.py`, `base.py` | the EvalClient the search talks to; a random baseline strategy for tests |
-
-The round (times for a 72-minute search, from its start; they scale with the round's length):
-
-| minutes | stage |
-|---|---|
-| 0-15 | wave 0 (the defaults, the official seed, up to 40% portfolio seeds, the rest a Latin hypercube over every setting; 4 threshold riders) while the answer set is built, then 3 genetic generations, each launched once 60% of the previous is back or workers idle; stops early when a generation gains < 0.05; hard limit 15 |
-| ~15 | founding: up to 12 centres, at least 6 settings apart. Seats within 0.5 of the best are filled first; further seats may be up to 5 below it. Six of them start and scan every setting. The other six are held. Workers stay split evenly across the basins that are actually climbing |
-| 15-62 | a gain of 0.05 moves the centre and the scan runs again. A scan that comes back under 0.05 holds that peak. Once every first scan is back (or by minute 34), a basin with no such gain is retired and the next held candidate takes its seat. The one after that waits until the new scan is back. A basin whose best has not moved for 10 minutes is retired and its workers go to the next candidate. Winning settings are shared between domains every 5 min. The scout sampler is off. There is no merge in this stretch |
-| any time | an off-hill find is recombined with the nearest domain, one find at a time, and those children wait behind that domain's scan |
-| 62-72 | one merge: the strongest basin keeps the seat, the others retire, and it takes their differing settings plus one capped set of recombination children. Those children go out before the halved single steps and pairs. Then the pick: the highest local score |
-
-A scheduled merge retires the weaker domain. The survivor takes the differing settings as moves, plus one capped set
-of recombination children sent after its scan (small batches: one config per worker). Riders: 4 on wave 0, 2 on
-generation points; a climbing move carries 2 siblings (one genotyping, one PairHMM step).
+| `v422/` | the previous engine, a frozen backup (not selectable) |
 
 ## Engine versions
 
-How the engine got here, version by version, is [DEVELOPMENT.md](DEVELOPMENT.md). The table below is the measured record.
+How v4 got here, version by version, is [v422/DEVELOPMENT.md](v422/DEVELOPMENT.md). The table below is the measured
+record up to v4.8; v9 has no fleet run yet.
 
 All on round 2026-10-02 09:29 (field best 89.912, 66 rows), 72-minute fleet runs unless noted. TRUE = scored on the
 released truth; one run's noise is 0.04-0.08 TRUE.
@@ -99,24 +101,23 @@ What each step taught: riders inflate counts without information (v1); best-of-s
 centres (v2); random shakes on spare workers win nothing after the first 20 minutes (v3); fine steps pay late in the
 round (v3.1); scout finds all merged back into one hill - this round has one plateau entered from many sides (v3.2);
 waited-for moves packed into big batches ran one after another on one worker (found while building v4, hence
-the small/big batch setting). The v1-v3.2 code is in git history (last at 155b972); this package holds only v4.
+the small/big batch setting). The v1-v3.2 code is in git history (last at 155b972); v4.22 is in `v422/`.
 
 ## Settings
 
 Every tunable number of the engine (and the evaluator's batch limits and main's resubmission rules) is a setting in
-`common/tuning.py`, read with `tune("group.name")`: the opening, domains, schedule, merges, sharing, scout, riders,
-climb and pick. Defaults are in that file; `tuning.json` on main overrides them, and the dashboard's Settings tab
-edits it. A live setting takes effect at its next use, within about a second; a round setting (`domains.max`,
-`riders.wave0`, main's) waits for the next round. Tests and simulations never read the file. Each run's manifest
-records the settings at its start and every change made during it, so a hand-tuned run can be told apart later.
+`common/tuning.py`, read with `tune("group.name")`: `candidates` (Step A), `climb` (Step B) and `far` (Step C and
+the pick). Defaults are in that file; `tuning.json` on main overrides them, and the dashboard's Settings tab edits
+it. A live setting takes effect at its next use; a round setting waits for the next round. Tests and simulations
+never read the file.
 
-The engine publishes what the dashboard draws in `client.notes["engine"]` every 2 s: phase, scaled schedule, waves,
-every domain with its origin and parents, merges, scout, pick and the last 200 decisions.
+The engine publishes `client.notes["engine"]`: version, phase, the waves of Step A, one basin row per climber
+(opened, first, first_key, best, best_key, status, iterations, waves) and the last decisions.
 
 ## How to work on the search
 
 ```bash
-.venv/bin/python -m unittest tests.test_engine           # engine tests on the fake landscape (about a minute)
+.venv/bin/python -m unittest tests.test_engine           # engine tests on the fake landscape (about 100 s)
 .venv/bin/python -m main replay <tag> --minutes 60       # the real thing on a stored round, true score + rank
 ```
 

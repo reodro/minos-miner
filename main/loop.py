@@ -90,10 +90,14 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         pick = client.picked()                    # the search's own pick (a plateau centre) goes out as it is
         key = submitted[0]
         if pick is not None and pick.config_key != key:
+            if not force and clock() - last_refused[0] < 30.0:
+                return                        # a refused pick is not retried on every result and tick
             if submitter.submit(round, client.configs[pick.config_key]):
                 submitted[0] = pick.config_key
                 last_submit[0] = clock()
                 out.submissions.append((clock(), pick.config_key, pick.score))
+            else:
+                last_refused[0] = clock()
             return
         if pick is not None or best.config_key == key:
             return

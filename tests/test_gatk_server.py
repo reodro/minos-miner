@@ -112,6 +112,36 @@ class GatkServerTest(unittest.TestCase):
         self.assertEqual(self.runner._servers_idle, [])         # and it was dropped
         self.assertTrue((d / "stop").exists())
 
+    def _crashing(self, name):
+        d = self.work / "servers" / name
+        d.mkdir(parents=True)
+        srv = G._GatkServer(_FakeProc(), open(d / "jvm.log", "w"), d, f"minos-run-srv-{name}", 30)
+        self.runner._start_server = lambda: srv
+        _answer(d, ["error java.lang.IllegalStateException: Graph must have ref source and sink vertices"])
+        return d
+
+    def test_a_batch_that_crashes_in_gatk_is_not_rerun_cold(self):
+        self._crashing("s3")
+        spec = self.work / "R" / "variants_y.tsv"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("/data/output/R/v1_full.vcf.gz\t30.0\n")
+        cmd = ["docker", "run", "--name", "minos-run-T-1", "-v", f"{self.work}:/data/output", "img", "java",
+               "-Dminos.gt.variants=/data/output/R/variants_y.tsv", "-cp", "x", "org.broadinstitute.hellbender.Main",
+               "HaplotypeCaller", "-O", "/data/output/R/o.vcf.gz"]
+        p = self.runner._run_on_server(cmd)
+        self.assertIsNotNone(p)                                 # not None: no cold re-run of the batch
+        self.assertEqual(p.returncode, 3)                       # rc=3: the executor re-runs the head alone
+        self.assertIn("ref source and sink", G.gatk_error(p.stderr))
+        self.assertEqual(self.runner.server_stats["batch_crashes"], 1)
+        self.assertEqual(self.runner.server_stats["fallbacks"], 0)
+
+    def test_a_solo_job_that_crashes_still_runs_cold(self):
+        self._crashing("s4")
+        cmd = ["docker", "run", "--name", "minos-run-T-1", "-v", f"{self.work}:/data/output", "img", "java",
+               "-cp", "x", "org.broadinstitute.hellbender.Main", "HaplotypeCaller", "-O", "/data/output/R/o.vcf.gz"]
+        self.assertIsNone(self.runner._run_on_server(cmd))      # the solo run is the stock-equal check: cold re-run
+        self.assertEqual(self.runner.server_stats["fallbacks"], 1)
+
     def test_an_ended_round_runs_nothing_more_not_even_cold(self):
         d = self.work / "servers" / "s2"
         d.mkdir(parents=True)

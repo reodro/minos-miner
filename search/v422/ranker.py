@@ -13,7 +13,7 @@ import numpy as np
 
 from common.scoring import score_from_parts
 from common.types import Config
-from search.space import Space
+from search.v422.space import Space
 
 
 class Ranker:

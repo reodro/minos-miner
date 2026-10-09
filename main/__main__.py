@@ -131,6 +131,8 @@ def main() -> None:
                        help="run GATK and scoring on the sub-VPSs in the inventory (over ssh) instead of here")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from common.limits import raise_open_files
+    raise_open_files()                            # main's local workers and fleet sessions hold many files at once
     if args.cmd == "review":
         from main.review import find_run
         review_now(find_run(args.run)); return

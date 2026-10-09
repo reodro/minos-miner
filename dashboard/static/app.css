@@ -157,7 +157,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .kpi { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px;
   padding: 10px 14px; display: grid; gap: 2px; min-width: 0; }
-.kpi.k-time, .kpi.k-sub { border-left-color: var(--final); }
+.kpi.k-time, .kpi.k-sub, .kpi.k-rank { border-left-color: var(--final); }
 .kpi.k-configs, .kpi.k-answer { border-left-color: var(--open); }
 .kpi.k-workers { border-left-color: var(--good); }
 .kpi.k-domains { border-left-color: var(--merge); }
@@ -203,6 +203,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .seg.perturb { background: var(--warn); color: var(--on-strong); }
 .seg.merge { background: var(--merge); color: var(--on-strong); }
 .seg.final { background: var(--final); color: var(--on-strong); }
+.seg.stepc { background: var(--merge); color: var(--on-strong); }
 .schedule .done { position: absolute; top: 0; bottom: 0; left: 0; background: var(--bg); opacity: .45; pointer-events: none; }
 .schedule .now { position: absolute; top: -1px; bottom: -1px; width: 2px; background: var(--ink); }
 .schedule .pick { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--final); }
@@ -212,7 +213,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 
 /* domain cards */
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
-.card { border: 1px solid var(--line); border-top: 3px solid var(--accent); border-radius: 9px; padding: 10px 12px; display: grid;
+.card { border: 1px solid var(--line); border-top: 3px solid var(--accent); border-radius: 9px; padding: 10px 12px; display: grid; align-content: start;
   gap: 6px; background: var(--panel-2); min-width: 0; }
 .card.final { border-top-color: var(--final); } .card.merging { border-top-color: var(--merge); }
 .card .head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
@@ -225,6 +226,9 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
 .card .origin { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.card .wave-line { display: flex; justify-content: space-between; gap: 6px; font-size: 12.5px; }
+.card .names { font-size: 11.5px; color: var(--muted); line-height: 1.35; overflow-wrap: anywhere; }
+.card .names .label { color: var(--label); text-transform: uppercase; letter-spacing: .04em; font-size: 10.5px; }
 
 /* lineage */
 .lineage { overflow-x: auto; }
@@ -235,17 +239,25 @@ main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 48px; display: grid
 .lineage .band.merge { fill: var(--merge-soft); }
 .lineage .band.final { fill: var(--final-soft); } .lineage .band.climb { fill: var(--panel); }
 .lineage .band.perturb { fill: var(--warn-soft); }
+.lineage .band.stepc { fill: var(--merge-soft); }
 .lineage .row { fill: var(--accent); } .lineage .row.perturb { fill: var(--warn); }
 .lineage .row.exhausted { fill: var(--bad); } .lineage .row.final { fill: var(--final); }
 .lineage .row.merging { fill: var(--merge); } .lineage .row.retired { fill: var(--retired); }
 .lineage .link { stroke: var(--merge); stroke-width: 1.5; fill: none; }
 .lineage .nowline { stroke: var(--ink); stroke-width: 1.5; }
 .lineage .find { fill: var(--scout); }
+.lineage .row.stopped { fill: var(--warn); } .lineage .row.landed { fill: var(--open); }
+.lineage .move { fill: var(--panel); stroke: var(--ink); stroke-width: 1; }
+.lineage .move.c { fill: var(--merge); stroke: var(--panel); } .lineage .move.jump { fill: var(--scout); stroke: var(--panel); }
+.card.live { border-top-color: var(--accent); } .card.stopped { border-top-color: var(--warn); }
+.card.retired { border-top-color: var(--retired); }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); }
 .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 .legend i.live { background: var(--accent); } .legend i.merging { background: var(--merge); }
 .legend i.final { background: var(--final); } .legend i.retired { background: var(--retired); }
-.legend i.perturb { background: var(--warn); } .legend i.find { background: var(--scout); }
+.legend i.perturb { background: var(--warn); } .legend i.find { background: var(--merge); border-radius: 50%; }
+.legend i.stopped { background: var(--warn); } .legend i.landed { background: var(--open); }
+.legend i.jump { background: var(--scout); border-radius: 50%; }
 
 /* lists */
 .rows { display: grid; gap: 10px; }
@@ -322,3 +334,11 @@ table.stable { border-collapse: collapse; width: 100%; min-width: 760px; font-si
 .login input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); color: var(--ink); }
 .login .err { color: var(--bad); font-size: 13px; min-height: 1.2em; }
 @media (max-width: 560px) { .top, main { padding-left: 16px; padding-right: 16px; } }
+
+/* v10: the forest's calibration table */
+table.cal { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-bottom: 8px; }
+table.cal th { text-align: left; color: var(--label); font-weight: 600; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .03em; padding: 3px 4px; border-bottom: 1px solid var(--line); }
+table.cal td { padding: 4px; border-bottom: 1px solid var(--line); }
+table.cal .num { text-align: right; font-variant-numeric: tabular-nums; }
+table.cal td.bad { color: var(--bad); } table.cal td.good { color: var(--good); }

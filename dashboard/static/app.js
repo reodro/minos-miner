@@ -10,6 +10,7 @@ const SVG = "http://www.w3.org/2000/svg";
 let serverOffset = 0;          // server clock - browser clock, seconds
 let last = null;               // the last /api/status payload
 let lastResult = null;         // the run's round/review/rank rows (rounds.jsonl), once main has written them
+let lastRank = null;           // where the live best sits on the published field, refreshed with each poll
 let chart = null, chartKey = "";
 let settingsMeta = null;       // /api/settings
 const draft = {};              // setting name -> text typed but not saved
@@ -137,6 +138,7 @@ async function poll() {
     serverOffset = data.now - Date.now() / 1000;
     last = data.live;
     lastResult = data.result || null;
+    lastRank = data.rank || null;
     render();
   } catch (e) {
     if (e.message !== "logged out") $("updated").textContent = "server not answering";
@@ -162,7 +164,7 @@ function render() {
   const phase = finished ? "finished" : E ? E.phase : (R.mode || "starting");
   const pc = $("phase-chip");
   pc.textContent = phase;
-  pc.className = `chip ${phase.split(" ")[0]}`;
+  pc.className = `chip ${finished ? "finished" : phaseClass(phase)}`;
   const age = now() - (L.updated || 0);
   $("updated").textContent = `updated ${ago(L.updated || 0)}`;
   if (!finished && age > STALE_S) {
@@ -177,10 +179,11 @@ function render() {
   renderResult(lastResult, finished);
   renderSchedule(E, finished);
   renderLineage(E);
-  renderDomains(E, finished);
-  renderMerges(E);
-  renderWaves(E, R);
-  renderScout(E, S, finished);
+  renderClimbers(E, finished);
+  renderStepC(E);
+  renderStepA(E, R);
+  if (isRF(E)) renderRF(E);
+  renderPick(E, finished);
   renderChart(S, L.submissions || []);
   renderNodes(X, finished);
   renderFeed(L, E);
@@ -192,24 +195,52 @@ function kpi(label, value, note, cls) {
     note ? h("div", {class: "note", text: note}) : null);
 }
 
+function phaseClass(phase) {
+  // the chip's colour: the step the engine is in
+  if (!phase) return "";
+  if (phase.startsWith("A")) return "opening";
+  if (phase.startsWith("B")) return "climb";
+  if (phase.startsWith("C")) return "merge";
+  return phase.split(" ")[0];
+}
+
+function climbers(E) { return (E && E.basins) || []; }
+const isRF = (E) => !!(E && E.version === "v10");      // v10: RF_UCB; anything else: the v9 panels
+
+function rankKpi(rank) {
+  // The live best on the published field. A replay's score is the truth formula, so this is the rank during the test.
+  if (!rank) return kpi("Rank", "–", "", "k-rank");
+  if (rank.rank == null) return kpi("Rank", "–", rank.filling ? "field still filling" : "published field", "k-rank");
+  const gap = rank.gap_to_best == null ? "" : `gap ${fix(rank.gap_to_best)}`;
+  const best = rank.field_best == null ? "" : `best ${fix(rank.field_best)}`;
+  const note = [gap, best, rank.filling ? "field still filling" : ""].filter(Boolean).join(" · ");
+  return kpi("Rank", `${int(rank.rank)} / ${int(rank.field)}`, note, "k-rank");
+}
+
 function renderKpis(L, R, S, E, X, finished) {
   const subs = L.submissions || [];
   const lastSub = subs.length ? subs[subs.length - 1] : null;
   const left = R.deadline_ts ? R.deadline_ts - now() : null;
-  const live = E ? E.domains.filter((d) => d.status === "live").length : 0;
+  const cl = climbers(E);
+  const climbing = cl.filter((c) => c.status === "climbing").length;
+  const peaks = cl.filter((c) => c.status === "peak").length;
+  const short = cl.filter((c) => c.parent != null).length;
   const perRun = S.gatk_runs_done ? (S.delivered || 0) / S.gatk_runs_done : null;
   const A = L.answer_set;
   $("kpis").replaceChildren(
     kpi("Time left", finished ? "done" : left != null ? dur(left) : "–",
-      E ? `search ${dur(E.elapsed_s)} of ${dur(E.schedule.length_s)}` : (R.mode || ""), "k-time"),
+      E && E.schedule ? `search ${dur(E.elapsed_s)} of ${dur(E.schedule.length_s)}` : (R.mode || ""), "k-time"),
     kpi("Best local", fix(S.best), E && E.pick ? `pick ${fix(E.pick.score)}` : S.best_config ? `config ${S.best_config.slice(0, 8)}` : "", "k-best"),
+    rankKpi(lastRank),
     kpi("Submitted", lastSub ? fix(lastSub[2]) : "–", lastSub ? `${subs.length} so far · ${ago(lastSub[0])}` : "nothing yet", "k-sub"),
     kpi("Configs scored", int(S.scored), `${int(S.evaluated)} run · ${int(S.failed)} failed · ${int(S.zero)} scored 0`, "k-configs"),
     finished ? kpi("Workers busy", "–", "round over", "k-workers")
       : kpi("Workers busy", X ? int(X.running) : "–", X ? `of ${int(X.workers)} · ${int(X.queued)} queued · ${int(S.in_flight)} in flight` : "", "k-workers"),
-    finished ? kpi("Domains", E ? `${E.domains.filter((d) => d.status !== "retired").length}` : "–", E ? `at the end · ${E.domains.length} in the round` : "", "k-domains")
-      : kpi("Domains", E ? `${live} / ${E.max_domains}` : "–",
-        E ? `climbing · ${E.pending || 0} held · ${E.domains.length} founded` : "", "k-domains"),
+    isRF(E) && !cl.length
+      ? kpi("Forest refits", E.rf && E.rf.refits ? int(E.rf.refits) : "–",
+          E.rf && E.rf.refits ? `on ${int(E.rf.fit_on)} results · ${int(E.rf.restarts)} restarts · ${int(E.rf.reinits)} reinits` : "fitted when the opening is back", "k-domains")
+      : kpi("Climbers", E ? (cl.length ? `${climbing} / ${cl.length}` : "–") : "–",
+          E ? (cl.length ? `climbing · ${peaks} at the peak · ${short} short climb${short === 1 ? "" : "s"}` : isRF(E) ? "the endgame climbs the best 2" : "Step A picks them") : "", "k-domains"),
     kpi("GATK runs", int(S.gatk_runs), perRun ? `${perRun.toFixed(2)} configs per run` : "", "k-gatk"),
     kpi("Answer set", A ? int(A.germline) : "building",
       A ? `germline + ${int(A.synthetic)} synthetic · ${A.regime || ""} · donor ${A.donor || "?"} · ${int(A.n_targets)} targets` : "", "k-answer"),
@@ -217,49 +248,61 @@ function renderKpis(L, R, S, E, X, finished) {
 }
 
 function segText(cls, label, share) {
-  // The opening and the generations sit in the first few minutes, so the full words do not fit in the band.
-  if (share >= 0.12) return label;
-  if (cls === "opening") return "Open";
-  if (cls === "generations") return "Gens";
-  return label;
+  // Step A sits in the first few minutes, so the full words do not always fit in the band.
+  if (share >= 0.1) return label;
+  if (cls === "opening") return label === "Opening" ? "Open" : "W0";
+  if (cls === "generations") return "GA";
+  if (cls === "stepc") return "C";
+  return share >= 0.05 ? label : "";
+}
+
+function segmentsRF(E) {
+  // v10: the opening, the RF_UCB loop until the endgame (rf.endgame_min), the endgame climb, the pick.
+  const sc = E.schedule || {};
+  const aEnd = sc.a_done_s != null ? sc.a_done_s : Math.max(E.elapsed_s, 8 * 60 * (sc.scale || 1));
+  const bEnd = sc.b_done_s != null ? sc.b_done_s : Math.max(aEnd, sc.b_end_s || aEnd);
+  const pick = sc.pick_s != null ? sc.pick_s : sc.length_s;
+  const span = (a, b) => [Math.max(0, a), Math.max(Math.max(0, a), Math.min(sc.length_s, b))];
+  return [["opening", "Opening", ...span(0, aEnd)], ["climb", "RF_UCB", ...span(aEnd, bEnd)],
+          ["stepc", "Endgame climb", ...span(bEnd, pick)], ["final", "pick", ...span(pick, sc.length_s)]]
+    .filter((g) => g[3] - g[2] > 1);
 }
 
 function segments(E) {
-  // Opening is wave 0. The three generations are their own step, from the first of them until founding.
-  // Twelve basins climb from founding. Halfway to the final, the six still moving keep the workers.
-  const sc = E.schedule;
-  const founded = E.domains.length ? Math.min(...E.domains.map((d) => d.born_s)) : null;
-  const planned = Math.min(sc.opening_max_s, sc.final_by_s);
-  const openEnd = founded != null ? founded : Math.max(E.elapsed_s, planned);
+  if (isRF(E)) return segmentsRF(E);
+  // Step A: wave 0, then the genetic generations; Step B until it ends (climb.end_min or every climber at its peak);
+  // Step C from there to the pick. Planned ends until a step has really ended.
+  const sc = E.schedule || {};
+  const aEnd = sc.a_done_s != null ? sc.a_done_s : Math.max(E.elapsed_s, sc.a_max_s || 0);
+  const bEnd = sc.b_done_s != null ? sc.b_done_s : Math.max(aEnd, sc.b_end_s || aEnd);
+  const pick = sc.pick_s != null ? sc.pick_s : sc.length_s;
   const gens = (E.waves || []).filter((w) => w.wave > 0 && w.started_s != null);
   const genStart = gens.length ? Math.min(...gens.map((w) => w.started_s)) : null;
-  const cutAt = openEnd + 0.5 * Math.max(0, sc.final_by_s - openEnd);
   const span = (a, b) => [Math.max(0, a), Math.max(Math.max(0, a), Math.min(sc.length_s, b))];
   const parts = [];
-  if (genStart != null && genStart > 1 && openEnd - genStart > 1) {
-    parts.push(["opening", "Opening", ...span(0, genStart)]);
-    parts.push(["generations", "Generations", ...span(genStart, openEnd)]);
+  if (genStart != null && genStart > 1 && aEnd - genStart > 1) {
+    parts.push(["opening", "Wave 0", ...span(0, genStart)]);
+    parts.push(["generations", "Generations", ...span(genStart, aEnd)]);
   } else {
-    parts.push(["opening", "Opening", ...span(0, openEnd)]);
+    parts.push(["opening", "Step A", ...span(0, aEnd)]);
   }
-  parts.push(
-    ["climb", "Twelve basins", ...span(openEnd, cutAt)],
-    ["perturb", "Six basins", ...span(cutAt, sc.final_by_s)],
-    ["final", "Final", ...span(sc.final_by_s, sc.length_s)],
-  );
+  parts.push(["climb", "Step B: climb", ...span(aEnd, bEnd)]);
+  parts.push(["stepc", "Step C", ...span(bEnd, pick)]);
+  parts.push(["final", "pick", ...span(pick, sc.length_s)]);
   return parts.filter((g) => g[3] - g[2] > 1);
 }
 
 function roundAxis(E) {
-  // the round's time axis, shared by the schedule bar and the domain tree: from the round's start to its deadline.
+  // the round's time axis, shared by the schedule bar and the climber tree: from the round's start to its deadline.
   // The engine's times are seconds from its own start (`off` into the round); the search stops `margin` before
   // the deadline, which leaves main the time to submit.
   const R = (last && last.round) || {};
   const vals = (last && last.settings && last.settings.values) || {};
   const margin = vals["main.stop_before_deadline_s"] != null ? vals["main.stop_before_deadline_s"] : 60;
+  const sc = (E && E.schedule) || null;
   const off = E && R.started_ts && E.started_ts ? Math.max(0, E.started_ts - R.started_ts) : 0;
-  const total = R.started_ts && R.deadline_ts ? R.deadline_ts - R.started_ts : (E ? off + E.schedule.length_s + margin : 72 * 60);
-  const searchEnd = E ? Math.min(total, off + E.schedule.length_s) : total - margin;
+  const total = R.started_ts && R.deadline_ts ? R.deadline_ts - R.started_ts : (sc ? off + sc.length_s + margin : 72 * 60);
+  const searchEnd = sc ? Math.min(total, off + sc.length_s) : total - margin;
   return {total, off, searchEnd, start: R.started_ts};
 }
 
@@ -286,12 +329,13 @@ function renderSchedule(E, finished) {
   const box = $("schedule"), ticks = $("schedule-ticks");
   const ax = roundAxis(E);
   renderAnswerLane(ax, finished);
-  if (!E) {
+  if (!E || !E.schedule) {
     const R = (last && last.round) || {};
-    const what = R.mode === "building answer set" ? "building the answer set, then the opening" : "waiting for the fleet to settle, then the opening";
+    const what = E ? "this round's search engine publishes no schedule" : R.mode === "building answer set"
+      ? "building the answer set, then Step A" : "waiting for the fleet to settle, then Step A";
     box.replaceChildren(h("div", {class: "seg opening", style: {left: "0", width: "100%"}, text: what}));
     ticks.replaceChildren();
-    $("schedule-sub").textContent = "";
+    $("schedule-sub").textContent = E ? E.version || "" : "";
     return;
   }
   const L = ax.total, o = ax.off;
@@ -304,8 +348,8 @@ function renderSchedule(E, finished) {
   const t = finished ? L : E.elapsed_s + o;
   els.push(h("div", {class: "done", style: {width: x(t)}}));
   els.push(h("div", {class: "pick", style: {left: x(E.schedule.pick_s + o)}, title: "the highest local score is named"}));
-  const twelve = segs.find((g) => g[0] === "climb");
-  if (twelve) els.push(h("div", {class: "cut", style: {left: x(twelve[3])}, title: "the six still moving keep the workers"}));
+  if (E.schedule.b_done_s == null && E.schedule.b_end_s != null)
+    els.push(h("div", {class: "cut", style: {left: x(E.schedule.b_end_s + o)}, title: "Step B ends here at the latest (climb.end_min)"}));
   if (!finished) els.push(h("div", {class: "now", style: {left: x(t)}, title: `now: ${mins(t)}`}));
   box.replaceChildren(...els);
   const all = [...new Set([0, ...segs.map((g) => Math.round(g[3] / 60))])].sort((a, b) => a - b);
@@ -314,54 +358,65 @@ function renderSchedule(E, finished) {
     if (marks.length && m - marks[marks.length - 1] < 2) marks[marks.length - 1] = m; else marks.push(m);
   }
   ticks.replaceChildren(...marks.map((m) => h("span", {style: {left: x(m * 60)}, text: `${m}`})));
-  $("schedule-sub").textContent = `${E.version || "search"} · opening, three generations, twelve basins, then the six still moving, one merge at the final · stages scaled ×${E.schedule.scale.toFixed(2)}`;
+  $("schedule-sub").textContent = isRF(E)
+    ? `${E.version} RF_UCB · opening, the forest-guided loop, the endgame grid climb on the best 2, then the pick · stages scaled ×${E.schedule.scale.toFixed(2)}`
+    : `${E.version || "search"} · Step A candidates, Step B grid climb to each peak, Step C around the peaks, then the pick · stages scaled ×${E.schedule.scale.toFixed(2)}`;
 }
 
-function rowClass(d) {
-  if (d.status === "retired") return "retired";
-  if (d.status === "merging") return "merging";
-  return d.state === "climb" ? "live" : d.state;
+function climberClass(c) {
+  if (c.status === "climbing") return "live";
+  if (c.status === "peak") return "final";
+  if (c.status === "landed") return "landed";
+  if (c.status === "joined") return "retired";
+  return "stopped";
 }
+
+const STATUS_TEXT = {climbing: "climbing", peak: "at its peak", stopped: "stopped by the clock", joined: "joined another",
+  landed: "short climb done"};
 
 function renderLineage(E) {
   const box = $("lineage");
-  if (!E || !E.domains.length) {
-    box.replaceChildren(h("div", {class: "empty", text: E ? "No domains yet: they are founded when the opening ends." : "The engine has not started."}));
+  const cl = climbers(E);
+  if (!E || !E.schedule || !cl.length) {
+    box.replaceChildren(h("div", {class: "empty", text: !E ? "The engine has not started."
+      : isRF(E) ? `No climber yet: the endgame climbs the best 2 configs from ${E.schedule ? mins(E.schedule.b_end_s) : "minute 55"}.`
+      : "No climber yet: Step A picks the candidates."}));
     return;
   }
-  const doms = [...E.domains].sort((a, b) => a.born_s - b.born_s || a.id - b.id);
-  const row = new Map(doms.map((d, i) => [d.id, i]));
+  const rows = [...cl].sort((a, b) => a.born_s - b.born_s || a.id - b.id);
+  const row = new Map(rows.map((c, i) => [c.id, i]));
   const W = Math.max(520, box.clientWidth || 640), top = 22, rh = 22;
   const left = parseFloat(css("--axis-l")) || 46, right = parseFloat(css("--axis-r")) || 66;   // same axis as the schedule
-  const H = top + doms.length * rh + 8;
-  const ax = roundAxis(E), L = ax.total, o = ax.off;                   // the same axis as the schedule bar
+  const H = top + rows.length * rh + 8;
+  const ax = roundAxis(E), L = ax.total, o = ax.off;
   const x = (t) => left + ((W - left - right) * Math.max(0, Math.min(L, t + o))) / L;
   const y = (i) => top + i * rh + rh / 2;
-  const svg = s("svg", {width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Domain tree over the round"});
+  const svg = s("svg", {width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Climbers over the round"});
   for (const [cls, label, a, b] of segments(E)) {
     const w = Math.max(0, x(b) - x(a));
     svg.append(s("rect", {class: `band ${cls}`, x: x(a), y: 0, width: w, height: H}));
     svg.append(s("text", {x: x(a) + 4, y: 13}, segText(cls, label, w / W)));
   }
   const tNow = E.elapsed_s;
-  for (const d of doms) {
-    const i = row.get(d.id);
-    for (const p of d.parents) {
-      if (!row.has(p)) continue;
-      const xp = x(d.born_s);
-      svg.append(s("path", {class: "link", d: `M ${xp - 6} ${y(row.get(p))} L ${xp} ${y(row.get(p))} L ${xp} ${y(i)}`}));
-    }
+  for (const c of rows) {                                   // a Step C landing hangs off the peak it came from
+    if (c.parent == null || !row.has(c.parent)) continue;
+    const xp = x(c.born_s);
+    svg.append(s("path", {class: "link", d: `M ${xp} ${y(row.get(c.parent))} L ${xp} ${y(row.get(c.id))}`}));
   }
-  for (const d of doms) {
-    const i = row.get(d.id);
-    const end = d.ended_s != null ? d.ended_s : tNow;
-    const r = s("rect", {class: `row ${rowClass(d)}`, x: x(d.born_s), y: y(i) - 6, width: Math.max(3, x(end) - x(d.born_s)), height: 12, rx: 3});
-    r.append(s("title", {}, `Domain ${d.id}: best ${fix(d.best)}, ${d.status}, ${d.state}/${d.mode}; born at ${mins(d.born_s)} (${d.origin})` +
-      (d.ended_s != null ? `; retired at ${mins(d.ended_s)}` : "")));
+  for (const c of rows) {
+    const i = row.get(c.id);
+    const end = c.ended_s != null ? c.ended_s : tNow;
+    const r = s("rect", {class: `row ${climberClass(c)}`, x: x(c.born_s), y: y(i) - 6, width: Math.max(3, x(end) - x(c.born_s)), height: 12, rx: 3});
+    r.append(s("title", {}, `Climber ${c.id}: ${fix(c.opened)} → ${fix(c.best)}, ${STATUS_TEXT[c.status] || c.status}; ` +
+      `from ${c.origin} at ${mins(c.born_s)}; ${c.iterations} grids`));
     svg.append(r);
-    if (d.origin.startsWith("a scout find")) svg.append(s("circle", {class: "find", cx: x(d.born_s), cy: y(i), r: 4}));
-    svg.append(s("text", {x: 4, y: y(i) + 4}, `D${d.id}`));
-    svg.append(s("text", {class: "score", x: x(end) + 5, y: y(i) + 4}, fix(d.best, 3)));
+    for (const [t, sc, why] of c.history || []) {           // every move of the centre; Step C's finds stand out
+      const m = s("circle", {class: why.startsWith("C") ? "move c" : why === "jump" ? "move jump" : "move", cx: x(t), cy: y(i), r: why.startsWith("C") || why === "jump" ? 3.5 : 2});
+      m.append(s("title", {}, `${mins(t)}: ${fix(sc)} (${why})`));
+      svg.append(m);
+    }
+    svg.append(s("text", {x: 4, y: y(i) + 4}, `C${c.id}`));
+    svg.append(s("text", {class: "score", x: x(end) + 5, y: y(i) + 4}, fix(c.best, 3)));
   }
   if (tNow < L) svg.append(s("line", {class: "nowline", x1: x(tNow), x2: x(tNow), y1: 16, y2: H}));
   box.replaceChildren(svg);
@@ -398,91 +453,181 @@ function renderResult(res, finished) {
   );
 }
 
-function bestUpdated(d, E) {
-  if (d.best_s == null) return "updated –";
-  const ts = E.started_ts != null ? E.started_ts + d.best_s : null;
-  return ts != null ? `updated ${mins(d.best_s)} · ${ago(ts)}` : `updated ${mins(d.best_s)}`;
+function bestUpdated(c, E) {
+  if (c.best_s == null) return "updated –";
+  const ts = E.started_ts != null ? E.started_ts + c.best_s : null;
+  return ts != null ? `updated ${mins(c.best_s)} · ${ago(ts)}` : `updated ${mins(c.best_s)}`;
 }
 
-function renderDomains(E, finished) {
-  const box = $("domains");
-  if (!E) { box.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); $("domains-sub").textContent = ""; return; }
-  const live = E.domains.filter((d) => d.status !== "retired").sort((a, b) => a.id - b.id);   // stable order, as in the tree
-  $("h-domains").firstChild.textContent = finished ? "Final domains " : "Live domains ";
-  const gone = E.domains.filter((d) => d.status === "retired");
-  $("domains-sub").textContent = gone.length ? `${gone.length} retired` : "";
-  if (!live.length) { box.replaceChildren(h("div", {class: "empty", text: E.phase === "opening" ? "The opening is still running." : "No live domain."})); return; }
-  box.replaceChildren(...live.map((d) => {
-    const cls = d.status === "merging" ? "merging" : d.state === "final" ? "final" : "";
-    const led = (E.basins || []).find((b) => b.id === d.id);
-    return h("div", {class: `card ${cls}`},
-      h("div", {class: "head"}, h("b", {text: `Domain ${d.id}`}),
-        finished ? chip("finished", "final") : chip(d.status === "merging" ? "merging" : d.state, d.status === "merging" ? "merging" : d.state),
-        finished ? null : chip(d.mode)),
+function renderClimbers(E, finished) {
+  const box = $("climbers");
+  const cl = climbers(E);
+  if (!E) { box.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); $("climbers-sub").textContent = ""; return; }
+  const main = cl.filter((c) => c.parent == null).sort((a, b) => a.id - b.id);
+  const short = cl.filter((c) => c.parent != null);
+  $("climbers-sub").textContent = short.length ? `Step C's ${short.length} short climb${short.length === 1 ? " is" : "s are"} in the tree above and the Step C panel` : "";
+  $("h-climbers").firstChild.textContent = isRF(E) ? "Endgame climbers " : "Step B: climbers ";
+  box.closest("section").hidden = isRF(E) && !main.length;      // v10: no cards until the endgame starts
+  if (!main.length) { box.replaceChildren(h("div", {class: "empty", text: isRF(E) ? "The forest-guided loop is running; the endgame climbers start at its end." : (E.phase || "").startsWith("A") ? "Step A is still running." : "No climber."})); return; }
+  box.replaceChildren(...main.map((c) => {
+    const w = c.wave;
+    const growth = Object.entries(c.growth || {});
+    return h("div", {class: `card ${climberClass(c)}`},
+      h("div", {class: "head"}, h("b", {text: `Climber ${c.id}`}),
+        chip(finished && c.status === "climbing" ? "stopped" : STATUS_TEXT[c.status] || c.status, c.status === "climbing" && !finished ? "climbing" : c.status === "peak" ? "final" : "")),
       h("div", {class: "score-line"},
         h("div", {class: "best-label", text: "best score"}),
-        h("div", {class: "big", text: fix(d.best)}),
-        h("div", {class: "updated", text: bestUpdated(d, E)})),
-      bar(d.allotted ? d.inflight / Math.max(d.allotted, d.inflight) : 0, "", null),
+        h("div", {class: "big", text: fix(c.best)}),
+        h("div", {class: "updated", text: bestUpdated(c, E)})),
+      w ? h("div", {class: "wave-line"}, h("span", {text: w.kind === "jumps" ? "random jumps" : `${w.kind} grid`}),
+        h("span", {class: "num muted", text: `${int(w.back)} / ${int(w.sent)} back`})) : null,
+      w ? bar(w.sent ? w.back / w.sent : 0, "", null) : null,
+      w && w.group.length ? h("div", {class: "names", text: w.group.join(" · ")}) : null,
       kv([
-        led ? ["opened", fix(led.opened)] : null,
-        led ? ["first scan", led.first == null ? "pending" : fix(led.first)] : null,
-        ["climbing", `${d.progress_per_min >= 0 ? "+" : ""}${fix(d.progress_per_min)} / min`],
-        finished ? null : ["in flight", d.status === "merging" ? `${d.inflight}, merging` : `${d.inflight} of ${fix(d.allotted, 0)} allotted`],
-        ["configs tried", int(d.tried)],
-        ["born at", mins(d.born_s)],
-        d.parents.length ? ["merged from", d.parents.map((p) => `D${p}`).join(", ")] : null,
-        ["centre", h("span", {class: "mono", text: d.centre.slice(0, 12)})],
+        ["opened", fix(c.opened)],
+        ["after its first grid", c.first == null ? "pending" : fix(c.first)],
+        ["grids", int(c.iterations)],
+        ["settings flat", `${int(c.flat)} of ${int(c.expensive)}`],
+        ["configs sent", int(c.evaluated)],
+        ["started at", mins(c.born_s)],
+        ["centre", h("span", {class: "mono", text: c.best_key.slice(0, 12)})],
       ]),
-      h("div", {class: "origin", text: `From ${d.origin}.`}));
+      growth.length ? h("div", {class: "names"}, h("span", {class: "label", text: "growing steps "}),
+        growth.map(([n, k]) => `${n} ${k > 0 ? "+" : ""}${k}`).join(" · ")) : null,
+      h("div", {class: "origin", text: `From ${c.origin}.`}));
   }));
 }
 
-function renderMerges(E) {
-  const box = $("merges");
-  if (!E || !E.merges.length) { box.replaceChildren(h("div", {class: "empty", text: "No merge running."})); return; }
-  box.replaceChildren(...E.merges.map((m) => h("div", {class: "rowline"},
-    h("div", {class: "top-line"}, h("span", {}, h("b", {text: `Merge ${m.id}`}), " · ", m.parents.map((p) => `D${p}`).join(" + ")),
-      h("span", {class: "num muted", text: `${m.back} / ${m.sent} back`})),
-    bar(m.sent ? m.back / m.sent : 0, "merge", 0.8),
-    h("div", {class: "muted", text: `${m.why}; best so far ${fix(m.best)}; started at ${mins(m.started_s)}`}))));
+function renderStepC(E) {
+  if (isRF(E)) return;                                      // v10's calibration panel is renderRF
+  $("h-stepc").textContent = "Step C: around the peaks";
+  const box = $("stepc");
+  const log = (E && E.step_c) || [];
+  if (!E || !log.length) {
+    box.replaceChildren(h("div", {class: "empty", text: E && E.schedule ? `Step C starts when Step B ends (at ${mins(E.schedule.b_end_s)} at the latest).` : "Not started."}));
+    return;
+  }
+  const byId = new Map(climbers(E).map((c) => [c.id, c]));
+  const OUT = {running: "running", moved: "found a better point: Step B climbs on", "second highs": "second high points: short climbs",
+    "landing won": "a short climb won: Step B climbs on", final: "the peak is final"};
+  box.replaceChildren(...log.map((e) => {
+    const shorts = (e.landings || []).map((id) => byId.get(id)).filter(Boolean);
+    return h("div", {class: "rowline"},
+      h("div", {class: "top-line"}, h("b", {text: `C${e.peak} · pass ${e.pass}`}),
+        h("span", {class: "num muted", text: `${int(e.points)} points · ${int(e.gaps)} gaps · ${mins(e.started_s)}`})),
+      h("div", {}, chip(OUT[e.outcome] || e.outcome, e.outcome === "moved" || e.outcome === "landing won" ? "good" : e.outcome === "running" ? "climbing" : "")),
+      h("div", {class: "muted", text: `from ${fix(e.from)}${e.detail && !(shorts.length && e.detail.startsWith("short climbs")) ? ` · ${e.detail}` : ""}`}),
+      shorts.length ? h("div", {class: "muted", text: `short climbs: ${shorts.map((d) => `C${d.id} ${fix(d.opened)} → ${fix(d.best)}`).join(", ")}`}) : null);
+  }));
 }
 
-function renderWaves(E, R) {
+const SOURCES = ["opening", "qga", "ga", "local", "mutate", "sweep", "inject"];
+const RECENT_S = 300;                 // the "recent" window of the picks panel
+let pickHistory = [];                 // [engine seconds, picks by source] from each poll, for the recent window
+
+function recentPicks(E) {
+  // The totals are since the round's start; the recent counts are the change over the last RECENT_S of the engine's
+  // clock, from the dashboard's own polls (no engine change needed).
+  const rf = E.rf || {}, t = E.elapsed_s;
+  if (!rf.picks || t == null) return null;
+  if (!pickHistory.length || t < pickHistory[pickHistory.length - 1][0]) pickHistory = [];   // a new run
+  if (!pickHistory.length || t - pickHistory[pickHistory.length - 1][0] >= 5) pickHistory.push([t, {...rf.picks}]);
+  while (pickHistory.length > 2 && t - pickHistory[1][0] >= RECENT_S) pickHistory.shift();
+  const [t0, old] = pickHistory[0];
+  if (t - t0 < 30) return null;                                  // not enough history yet
+  const out = {};
+  for (const [k, v] of Object.entries(rf.picks)) out[k] = Math.max(0, v - (old[k] || 0));
+  return {span: t - t0, picks: out};
+}
+const SOURCE_TEXT = {opening: "opening", qga: "QGA", ga: "GA", local: "Local", mutate: "mutations", sweep: "sweep", inject: "Inject"};
+
+function renderRF(E) {
+  // v10: what the RF_UCB loop has done, and how well the forest predicts each source's picks
+  $("h-stepa").textContent = "RF_UCB loop";
+  $("h-stepc").textContent = "Forest predictions";
+  const rf = E.rf || {};
+  const loopBox = $("waves");
+  if (!rf.refits) {
+    loopBox.replaceChildren(h("div", {class: "empty", text: (E.phase || "").startsWith("A") ? "Opening: the forest is fitted once 80% is back." : "No refit yet."}));
+  } else {
+    const picks = rf.picks || {}, wins = rf.new_bests || {};
+    const total = Object.values(picks).reduce((a, b) => a + b, 0) || 1;
+    const recent = recentPicks(E);
+    const rTotal = recent ? Object.values(recent.picks).reduce((a, b) => a + b, 0) || 1 : 1;
+    loopBox.replaceChildren(
+      kv([["refits", `${int(rf.refits)} · last on ${int(rf.fit_on)} results`],
+          ["fit / whole refit", `${fix(rf.fit_s, 1)} s / ${fix(rf.refit_s, 1)} s`],
+          ["controller", `${fix(rf.loop_ms_per_result, 2)} ms per result`],
+          ["pool", int(rf.pool)],
+          ["restarts / reinits", `${int(rf.restarts)} / ${int(rf.reinits)}`],
+          ["frozen (QLock)", (rf.frozen || []).length ? rf.frozen.join(", ") : "none"],
+          ["best", fix(rf.best)]]),
+      h("div", {class: "rowline"}, h("b", {text: recent ? `Picks by source: last ${Math.round(recent.span / 60)} min, and since the start` : "Picks by source since the start"}),
+        h("div", {class: "muted", text: recent ? "the bar is the recent share; the totals include the opening and any burst" : "the recent share appears after a few polls"}),
+        ...SOURCES.filter((src) => picks[src]).map((src) => {
+          const r = recent ? recent.picks[src] || 0 : null;
+          const share = recent ? r / rTotal : picks[src] / total;
+          return h("div", {class: "rowline"},
+            h("div", {class: "top-line"}, h("span", {text: SOURCE_TEXT[src]}),
+              h("span", {class: "num muted", text: (recent ? `${int(r)} recent (${Math.round(100 * share)}%) · ` : "") +
+                `${int(picks[src])} total · ${int(wins[src] || 0)} new bests`})),
+            bar(share, src === "inject" || src === "opening" ? "open" : src === "sweep" || src === "local" ? "merge" : "", null));
+        })));
+  }
+  const cal = rf.calibration || {};
+  const calBox = $("stepc");
+  const rows = SOURCES.filter((src) => cal[src]);
+  if (!rows.length) { calBox.replaceChildren(h("div", {class: "empty", text: "Filled as picks come back: what the forest predicted next to what each scored."})); return; }
+  const cell = (tag, text, cls) => h(tag, {class: cls || "", text});
+  calBox.replaceChildren(
+    h("table", {class: "cal"},
+      h("thead", {}, h("tr", {}, cell("th", "source"), cell("th", "back", "num"), cell("th", "actual − predicted", "num"),
+        cell("th", "Spearman", "num"), cell("th", "distance", "num"))),
+      h("tbody", {}, ...rows.map((src) => {
+        const c = cal[src];
+        return h("tr", {}, cell("td", SOURCE_TEXT[src]), cell("td", int(c.n), "num"),
+          cell("td", `${c.bias >= 0 ? "+" : ""}${fix(c.bias, 3)}`, `num ${c.bias < -0.1 ? "bad" : c.bias > 0.1 ? "good" : ""}`),
+          cell("td", c.spearman == null ? "–" : fix(c.spearman, 2), "num"), cell("td", fix(c.novelty_median, 3), "num"));
+      }))),
+    h("div", {class: "muted", text: "actual − predicted: negative means the forest overrated that source's picks. Spearman: how well it ordered them. Distance: median distance from configs already scored; only far picks explore new regions."}));
+}
+
+function renderStepA(E, R) {
+  if (isRF(E)) return;                                      // v10's loop panel is renderRF
+  $("h-stepa").textContent = "Step A: candidates";
   const box = $("waves");
-  if (!E || !E.waves.length) { box.replaceChildren(h("div", {class: "empty", text: R && R.mode ? R.mode : "Not started."})); return; }
-  box.replaceChildren(...E.waves.map((w, i) => {
+  if (!E || !(E.waves || []).length) { box.replaceChildren(h("div", {class: "empty", text: R && R.mode ? R.mode : "Not started."})); return; }
+  const waves = E.waves.map((w, i) => {
     const next = E.waves[i + 1];
-    const gain = next && w.best_at_launch > 0 ? next.best_at_launch - w.best_at_launch : null;
+    const gain = next && w.best_at_launch != null && next.best_at_launch != null ? next.best_at_launch - w.best_at_launch : null;
     return h("div", {class: "rowline"},
-      h("div", {class: "top-line"}, h("b", {text: w.wave === 0 ? "Wave 0: seeds + hypercube" : `Generation ${w.wave}`}),
+      h("div", {class: "top-line"}, h("b", {text: w.wave === 0 ? "Wave 0: seeds, portfolio, hypercube" : `Generation ${w.wave}`}),
         h("span", {class: "num muted", text: `${int(w.back)} / ${int(w.sent)} back`})),
       bar(w.sent ? w.back / w.sent : 0, "open", null),
       gain != null ? h("div", {class: "muted", text: `the next wave started ${gain >= 0 ? "+" : ""}${fix(gain)} higher`}) : null);
-  }), h("div", {class: "muted", text: E.phase === "opening" ? "Twelve basins start when the opening ends." : `${E.domains.filter((d) => d.origin === "the opening").length} opened · ${int(E.pending)} waiting`}));
+  });
+  const cands = E.candidates || [];
+  box.replaceChildren(...waves,
+    cands.length ? h("div", {class: "rowline"}, h("b", {text: `Candidates (${cands.length})`}),
+      kv(cands.map((c, i) => [`C${i} · ${c.group}`, `${fix(c.score)} · core ${fix(c.core)} · FP ${int(c.fp)}`])))
+      : h("div", {class: "muted", text: "One candidate per 500 workers is picked when the last generation is back."}));
 }
 
-function renderScout(E, S, finished) {
-  const box = $("scout");
+function renderPick(E, finished) {
+  const box = $("pick");
   if (!E) { box.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); return; }
-  const scoutOff = !E.scout.share;
-  const target = Math.max(1, Math.floor(E.capacity * (E.scout.share || 0)));
+  const cl = climbers(E);
+  const best = cl.length ? cl.reduce((a, b) => (b.best > a.best ? b : a)) : null;
   box.replaceChildren(
-    h("div", {class: "rowline"},
-      h("div", {class: "top-line"}, h("b", {text: "Scout"}),
-        h("span", {class: "num muted", text: scoutOff ? "off" : finished ? "stopped" : `${int(E.scout.in_flight)} / ${int(target)} in flight`})),
-      scoutOff ? h("div", {class: "muted", text: "A find is recombined with the nearest basin. It does not found a domain."})
-        : bar(finished ? 0 : E.scout.in_flight / target, "scout", null)),
-    kv([
-      ["finds tested", int(E.scout.finds_tested)],
-      ["finds being tested", int(E.scout.finds_testing)],
-      ["held candidates", int(E.pending)],
-      ["scored candidates kept", int(E.candidates)],
-    ]),
-    h("div", {class: "rowline"}, h("b", {text: "Pick"}),
+    h("div", {class: "rowline"}, h("b", {text: "Named pick"}),
       E.pick ? kv([["config", h("span", {class: "mono", text: E.pick.key.slice(0, 12)})], ["its score", fix(E.pick.score)],
-        ["best score", fix(E.pick.best)], ["neighbour mean", fix(E.pick.neighbour_mean)]])
-        : h("div", {class: "muted", text: "the highest local score, named before the search ends"})),
+        ["named at", mins(E.pick.at_s)]])
+        : h("div", {class: "muted", text: `the highest local score, named at ${E.schedule ? mins(E.schedule.pick_s) : "the end"}`})),
+    h("div", {class: "rowline"}, h("b", {text: "Best climber"}),
+      best ? kv([["climber", `C${best.id}`], ["score", fix(best.best)], ["from", best.origin],
+        ["gain over its start", `${best.best - best.opened >= 0 ? "+" : ""}${fix(best.best - best.opened)}`]])
+        : h("div", {class: "muted", text: "none yet"})),
+    kv([["best of everything scored", fix(E.best)], ["workers", int(E.capacity)]]),
   );
 }
 

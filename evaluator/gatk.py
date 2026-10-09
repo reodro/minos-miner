@@ -19,7 +19,8 @@ Verified (2026-09-28; 3 rounds x 3 configs against the validator-identical basel
              job. Server vs cold, same job sequence (batch with genotyping/assembly/activity variants, deep-spot
              downsampling, contamination, dangling 20, repeats): 15/15 outputs identical on the self-test slice.
              Every SERVER_VERIFY_EVERY-th solo server run is re-run cold; a difference turns servers off.
-             A failing server is replaced and its job runs cold. MINOS_GATK_SERVER=0 turns them off.
+             A failing server is replaced and its job runs cold - except a batch that dies in GATK's own
+             assembly (BATCH_CRASH_NO_COLD): its head runs alone next anyway. MINOS_GATK_SERVER=0 turns them off.
   rejected - GVCF re-genotyping (heterozygosity changes calls; QUAL shifts flip stand_call_conf thresholds in ~13%
              of cases), QUAL projection (1e-4..1e-3 off), native java outside the image (different calls and slower:
              GKL PairHMM missing), interval restriction (~2%), scatter-gather (x0.49 throughput).
@@ -103,6 +104,13 @@ MAX_WARM = 2                     # JVMs kept after a run so a later genotyping v
 MAX_SERVER_JOBS = 200            # a GATK server (MinosServer) is replaced after this many jobs
 SERVER_IDLE_S = 600              # ... and leaves by itself after this long without a job
 SERVER_VERIFY_EVERY = int(os.environ.get("MINOS_SERVER_VERIFY", "40"))   # every Nth solo server run is re-run cold
+# A batch (a head with genotyping variants) that dies on a server with one of these GATK errors is not re-run cold. The
+# plain batch path dies the same way on such heads every time ("6 of 6", run_batch), so a cold batch re-run only crashes
+# again; the executor then re-runs the head alone (evaluator/local.py), and that solo run keeps its own cold re-run, so
+# every config still gets a result equal to stock GATK. On 20261008T175300Z the fleet made 3,363 cold re-runs, most of
+# them of crashed batches. MINOS_COLD_AFTER_BATCH_CRASH=1 restores the cold re-run of a crashed batch.
+BATCH_CRASH_NO_COLD = ("Graph must have ref source and sink vertices",)
+COLD_AFTER_BATCH_CRASH = os.environ.get("MINOS_COLD_AFTER_BATCH_CRASH") == "1"
 # Both caches are off unless explicitly enabled. The activity cache reuses a skeleton's per-locus states;
 # the assembly cache writes one file per region (1.6 M files, 6.5 GB in one 60-min round).
 ACTIVITY_CACHE = os.environ.get("MINOS_ACTIVITY_CACHE", "0") == "1"
@@ -361,7 +369,7 @@ class GatkRunner:
         self._servers_idle: List[_GatkServer] = []
         self._servers_busy: List[_GatkServer] = []
         self._server_jobs = 0
-        self.server_stats = {"jobs": 0, "fallbacks": 0, "verified": 0, "started": 0}
+        self.server_stats = {"jobs": 0, "fallbacks": 0, "verified": 0, "started": 0, "batch_crashes": 0}
 
     def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path, jvm_props: Optional[dict] = None) -> list:
         from templates.tool_params import validate_and_build_flags   # upstream
@@ -868,6 +876,12 @@ class GatkRunner:
             return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {self.timeout_s}s")
         if state != "ok" and self._round_ended(name):   # kill_round stopped the server: no cold rerun for an ended round
             return subprocess.CompletedProcess(cmd, 137, "", "round ended")
+        if (state == "error" and not COLD_AFTER_BATCH_CRASH and "minos.gt.variants" in props
+                and any(e in detail for e in BATCH_CRASH_NO_COLD)):
+            # a batch's own GATK crash: no cold re-run of the batch; the executor runs its head alone next
+            with self._server_lock:
+                self.server_stats["batch_crashes"] += 1
+            return subprocess.CompletedProcess(cmd, 3, "", detail)
         if state != "ok":                            # never trust a failing server: the job runs cold
             with self._server_lock:
                 self.server_stats["fallbacks"] += 1
@@ -1016,9 +1030,15 @@ class GatkRunner:
         return self._success(round.round_id, config, out, dt, fidelity)
 
     def _success(self, round_id: str, config: Config, out: Path, dt: float, fidelity: str) -> CallSet:
-        """A finished VCF, plus the haplotype cap the assembly actually needed (None when a search hit its cap)."""
+        """A finished VCF, plus the haplotype cap the assembly actually needed (None when a search hit its cap) and the
+        callset's sketch (evaluator.sketch; None if it cannot be read - the run itself still counts)."""
+        from evaluator.sketch import callset_sketch
+        try:
+            sketch = callset_sketch(str(out))
+        except Exception:  # noqa: BLE001 - a sketch is extra information, never a reason to fail a run
+            sketch = None
         return CallSet(round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity,
-                       haplotype_cap=self.kbest_needed(round_id, config.key, fidelity))
+                       haplotype_cap=self.kbest_needed(round_id, config.key, fidelity), sketch=sketch)
 
 class HappyScorer:
     """Exact: upstream HappyScorer.score_vcf + parse_happy_vcf, counts through common.scoring.finalize.

@@ -214,17 +214,17 @@ from common.params import ParamRanges
 from common.scoring import GERMLINE_FP_SCALE, V2_CORE_WEIGHT, V2_GERMLINE_WEIGHT
 from common.tuning import tune
 from common.types import FULL, Config
-from search.axes import AxisBook, latin_hypercube
-from search.base import Strategy
-from search.client import EvalClient, Outcome
-from search.families import genotyping_riders
-from search.ranker import Ranker
-from search.reductions import Reductions
-from search.bamgroups import bam_bounds
-from search.space import GENOTYPING_PARAMS, Space, bam_caps
-from search import genetic, portfolio
-from search.climber import Climber, Move
-from search.hills import MIN_FAR, Hills
+from search.v422.axes import AxisBook, latin_hypercube
+from search.v422.base import Strategy
+from search.v422.client import EvalClient, Outcome
+from search.v422.families import genotyping_riders
+from search.v422.ranker import Ranker
+from search.v422.reductions import Reductions
+from search.v422.bamgroups import bam_bounds
+from search.v422.space import GENOTYPING_PARAMS, Space, bam_caps
+from search.v422 import genetic, portfolio
+from search.v422.climber import Climber, Move
+from search.v422.hills import MIN_FAR, Hills
 
 log = logging.getLogger(__name__)
 

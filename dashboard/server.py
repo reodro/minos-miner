@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from common.settings import SETTINGS
 from common.tuning import DEFAULTS, GROUPS, TUNING_FILE, describe, read_overrides, validate, write_overrides
 from dashboard.auth import AUTH_FILE, SESSION_S, Auth
+from dashboard.field import FieldCache, live_rank, published_scores
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
@@ -123,11 +124,13 @@ def history_of(path: Path) -> list:
 
 
 def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = None, auth_file: Optional[Path] = None,
-               secure_cookie: bool = True, fail_delay_s: float = 1.0) -> FastAPI:
+               secure_cookie: bool = True, fail_delay_s: float = 1.0,
+               field_cache: Optional[FieldCache] = None) -> FastAPI:
     status_file = Path(status_dir or SETTINGS.status_dir) / "live.json"
     history_file = status_file.with_name("rounds.jsonl")
     tuning_path = Path(tuning_file or TUNING_FILE)
     auth = Auth(Path(auth_file or AUTH_FILE))
+    ranks = field_cache if field_cache is not None else FieldCache(published_scores)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     write_lock = asyncio.Lock()
@@ -219,7 +222,8 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
         except (OSError, ValueError):
             live = None                                   # main is replacing it right now: the next poll gets it
         fill_wave_starts(live)
-        return {"now": time.time(), "live": live, "result": result_of(live)}
+        rank = await asyncio.to_thread(live_rank, live, ranks)
+        return {"now": time.time(), "live": live, "result": result_of(live), "rank": rank}
 
     @app.get("/api/history")
     async def history(request: Request):
