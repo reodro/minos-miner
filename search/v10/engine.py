@@ -188,7 +188,10 @@ class Loop:
         mc, ms = float(tune("candidates.min_distance")), float(tune("candidates.min_setting_distance"))
         out: List[Config] = []
         for c, _ in proposers.trade_off_ends(pts, float(tune("rf.ends_window"))):
-            if len(out) < n and all(self.ctx.dist.far(c, o, mc, ms) for o in out):
+            # the ends always take their slots, unless the same config: they are different trade-offs even when most
+            # of their calls agree (second fleet replay: the best-core config, core 0.8745 like the kings, was
+            # dropped as "near" the best score by callset distance)
+            if len(out) < n and all(c.key != o.key for o in out):
                 out.append(c)
         ranked = sorted(((c, s) for c, s, _, _ in pts), key=lambda t: -t[1])
         for c, _ in ranked:
@@ -206,14 +209,13 @@ class Loop:
         if len(pts) < 8:
             return out
         # Configs that crashed for good (after the evaluator's own solo and cold retries: stock GATK crashes too) or
-        # scored nothing are real outcomes on the validator. Without them the forest is blind to crash zones and kept
-        # proposing next to them (first fleet replay: 6,246 final failures, 7,790 zero scores). They are taught at a
-        # floor: rf.bad_floor_pct-th percentile of the scored configs, minus 1.
-        good = [p[1] for p in pts]
-        floor = float(np.percentile(good, float(tune("rf.bad_floor_pct")))) - 1.0
+        # scored nothing are real outcomes on the validator (first fleet replay: 6,246 final failures, 7,790 zero
+        # scores). A separate classifier learns them (forest.fit_bad) and UCB sinks likely ones; the score forest is
+        # fitted on scored configs only.
         have = {p[0].key for p in pts}
         extra = [c for c in bad if c.key not in have]
-        self.forest.fit([p[0] for p in pts] + extra, good + [floor] * len(extra), float(tune("rf.density_radius")))
+        self.forest.fit([p[0] for p in pts], [p[1] for p in pts], float(tune("rf.density_radius")))
+        self.forest.fit_bad([p[0] for p in pts], extra)
         out.fit_s = time.time() - t0
         self.refits += 1
         best_c, best_s = max(((c, s) for c, s, _, _ in pts), key=lambda t: t[1])
@@ -501,7 +503,35 @@ def riders(ctx: RFContext, c: Config, k: int) -> List[Config]:
     return out
 
 
-def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int = 0) -> Strategy:
+class Convergence:
+    """The loop has converged: no gain of `gain` for `window` seconds, after `after` seconds. The loop has reached its
+    summit (second fleet replay: from minute ~30, 82% of picks polished it for +0.009), so the endgame climbs start
+    then instead of at rf.endgame_min. Counted in time, not results: riders make a fleet's worth of results about 40 s
+    (a first try at that fired at minute 23 of a simulated round whose earlier runs still gained about 5 after it).
+    Simulated rounds gain 0.02 at most 12 minutes apart.
+
+    A restart starts a new window: on 175300Z (2026-10-09) a restart at minute 40 was cut off by convergence 1.2 minutes
+    later, so it never had the chance to find another hill."""
+
+    def __init__(self):
+        self.mark, self.at, self.restarts = float("-inf"), 0.0, 0
+
+    def check(self, best: float, restarts: int, now: float, after: float, window: float, gain: float) -> bool:
+        if best >= self.mark + gain:
+            self.mark, self.at = best, now
+            return False
+        if restarts != self.restarts:
+            self.restarts, self.at = restarts, now
+            return False
+        return now >= after and now - self.at >= window
+
+
+def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: Optional[int] = None) -> Strategy:
+    # A seed per run (second fleet replay: both runs of one round used the same 972 opening configs, so they were not
+    # independent tests); MINOS_SEED=<n> repeats a run.
+    import os
+    if seed is None:
+        seed = int(os.environ.get("MINOS_SEED") or (time.time_ns() % 1_000_000_007))
     rng = random.Random(seed)
 
     async def run(client: EvalClient) -> None:
@@ -515,8 +545,8 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         ctx = RFContext(client, space, rng, profile)
         ctx.cap = await settled_capacity(client, workers)
         virtual = hasattr(client.executor, "now")
-        ctx.say("%s RF_UCB: %d workers, %d settings searched, a %d-minute round (schedule x%.2f)", VERSION, ctx.cap,
-                len(space.names), round(ctx.length / 60), ctx.scale)
+        ctx.say("%s RF_UCB: %d workers, %d settings searched, a %d-minute round (schedule x%.2f), seed %d", VERSION,
+                ctx.cap, len(space.names), round(ctx.length / 60), ctx.scale, seed)
         loop = Loop(ctx)
         if not virtual:                                # every pick's prediction next to its result, for the review
             from pathlib import Path
@@ -590,6 +620,13 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
 
         # ---- RF_UCB ---------------------------------------------------------------------------------------------------
         ctx.phase = "B: RF_UCB"
+        conv = Convergence()
+
+        def converged() -> bool:
+            return conv.check(loop.best, loop.restarts, ctx.elapsed(),
+                              ctx.T(60 * float(tune("rf.converge_after_min"))), ctx.T(60 * float(tune("rf.converge_min"))),
+                              float(tune("rf.converge_gain")))
+
         def refit_n() -> int:                          # live, as the setting says
             return max(8, ctx.cap // int(tune("rf.refit_per_fleet")))
         since = refit_n()
@@ -639,6 +676,10 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             got = await drain(TICK_S)
             since += got
             loop.stall += got
+            if converged():
+                ctx.say("RF_UCB converged at t+%.1fm: no gain of %.3f since t+%.1fm (best %.4f); the endgame starts now",
+                        ctx.elapsed() / 60, float(tune("rf.converge_gain")), conv.at / 60, loop.best)
+                break
         task = None                                    # a refit still running is left to finish unused: no waiting
         ctx.marks["b"] = ctx.elapsed()
         ctx.rf.update(loop.stats())
@@ -651,12 +692,18 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         # took 15 minutes behind them, including a Reinitialize's 972 random picks).
         ctx.priority = int(tune("rf.endgame_priority"))
         loop.reinit_left = 0
+        # The loop's picks no worker has started are dropped: they would only delay the endgame's waves on a busy
+        # fleet. Running ones finish and still count.
+        dropped = client.drop_queued({"opening", "qga", "ga", "local", "mutate", "sweep", "inject"})
+        if dropped:
+            ctx.say("endgame: %d of the loop's queued picks dropped; %d jobs still in flight", dropped, client.in_flight)
         pts = loop.points()
         hills = loop.pick_centres(pts, int(tune("rf.endgame_hills")))      # best score, best core, best FP
         ends = {c.key: label for c, label in proposers.trade_off_ends(pts, float(tune("rf.ends_window")))}
         for c in hills:
-            ctx.climbers.append(Climber(ctx, len(ctx.climbers), c, ctx.score(c) or 0.0,
-                                        origin=f"RF_UCB {ends.get(c.key, 'best distinct')}"))
+            cl = Climber(ctx, len(ctx.climbers), c, ctx.score(c) or 0.0, origin=f"RF_UCB {ends.get(c.key, 'best distinct')}")
+            cl.rider_cap = int(tune("rf.endgame_riders"))   # fewer riders per grid point: a wave ends sooner
+            ctx.climbers.append(cl)
 
         async def lifecycle(cl: Climber) -> None:
             try:
@@ -677,6 +724,7 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             if nxt is None:
                 break
             cl = Climber(ctx, len(ctx.climbers), nxt[0], nxt[1], origin="climbing again")
+            cl.rider_cap = int(tune("rf.endgame_riders"))
             ctx.climbers.append(cl)
             ctx.say("endgame: climbing again from %s %.4f", nxt[0].key[:8], nxt[1])
             await lifecycle(cl)

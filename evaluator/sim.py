@@ -125,6 +125,20 @@ class SimExecutor:
     def cancel(self, job_ids: Iterable[str]) -> None:
         self._cancelled.update(job_ids)
 
+    def cancel_queued(self, job_ids: Iterable[str]) -> List[str]:
+        """Drop these jobs now if they have not started and return the ones dropped. Running ones finish."""
+        ids, out = set(job_ids), []
+        for k, ws in list(self._waiters.items()):
+            out += [w.job_id for w in ws if w.job_id in ids]
+            self._waiters[k] = [w for w in ws if w.job_id not in ids]
+        gone = [it[2] for it in self._queue if it[2].job_id in ids]
+        self._queue = [it for it in self._queue if it[2].job_id not in ids]
+        heapq.heapify(self._queue)
+        for job in gone:
+            out.append(job.job_id)
+            self._drop_cancelled(job)
+        return out
+
     def cost_hint(self, job: EvalJob) -> float:
         """Like LocalExecutor: 0 if done or in flight; a queued job that would carry it prices it at the runner's
         variant cost; else 1 (a solo run)."""

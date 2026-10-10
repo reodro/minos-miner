@@ -162,6 +162,21 @@ class EvalClient:
     def in_flight(self) -> int:
         return len(self._pending)
 
+    def drop_queued(self, tags: Iterable[str]) -> int:
+        """Drop this client's jobs with these tags that no worker has started (when the executor can tell): their
+        futures are cancelled and they leave in_flight. Running ones finish and are delivered as usual."""
+        f = getattr(self.executor, "cancel_queued", None)
+        want = set(tags)
+        ids = [jid for jid, (_f, _c, tag) in self._pending.items() if tag in want]
+        if f is None or not ids:
+            return 0
+        dropped = f(ids)
+        for jid in dropped:
+            fut, _c, _t = self._pending.pop(jid, (None, None, None))
+            if fut is not None and not fut.done():
+                fut.cancel()
+        return len(dropped)
+
     def set_answer_set(self, answer_set: AnswerSet) -> None:
         """The round's first answer set: scoring can start."""
         self.answer_set = answer_set

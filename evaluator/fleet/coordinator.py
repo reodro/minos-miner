@@ -538,6 +538,32 @@ class FleetExecutor:
         with self._lock:
             self._cancelled.update(job_ids)
 
+    def cancel_queued(self, job_ids: Iterable[str]) -> List[str]:
+        """Drop these jobs now if no node has them yet and return the ones dropped: nothing will ever be delivered
+        for them, so the caller can stop waiting. Running ones are left to finish. A duplicate waiting on a dropped
+        job takes its place, as when a cancelled job reaches the head of the queue."""
+        ids, out = set(job_ids), []
+        with self._cv:
+            for k, ws in list(self._waiters.items()):
+                keep = [w for w in ws if w.job_id not in ids]
+                out += [w.job_id for w in ws if w.job_id in ids]
+                self._waiters[k] = keep
+            for _, _, job in list(self._queue):
+                if job.job_id not in ids or job.job_id not in self._queued:
+                    continue
+                self._taken(job)                               # its heap item is skipped later
+                out.append(job.job_id)
+                k = job_key(job)
+                waiters = self._waiters.pop(k, [])
+                if waiters:
+                    self._inflight[k] = waiters[0]
+                    self._waiters[k] = waiters[1:]
+                    self._push(waiters[0])
+                else:
+                    self._inflight.pop(k, None)
+            self._pump()
+        return out
+
     def end_round(self, round_id: str) -> None:
         """The round is over: drop its queued jobs, tell every node holding its work to abort (the node kills those
         GATK containers), and free those workers at once for the next round. Late results for it are ignored."""

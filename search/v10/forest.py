@@ -42,6 +42,7 @@ class Forest:
         self.n_fit = 0
         self._rows: Dict[str, List[float]] = {}     # config key -> its encoding (configs are encoded once)
         self._tree = None                           # KD-tree of the configs of the last fit: distance to the data
+        self.bad_model = None                       # P(a config crashes or scores zero), when enough are known
 
     # ---- encoding -------------------------------------------------------------------------------------------------
     def row(self, c: Config, keep: bool = False) -> List[float]:
@@ -85,6 +86,27 @@ class Forest:
         from sklearn.neighbors import KDTree
         tree = KDTree(X, metric="manhattan")
         self.model, self._tree, self.n_fit = model, tree, self.n_fit + 1
+
+    def fit_bad(self, good: Sequence[Config], bad: Sequence[Config], min_bad: int = 20) -> None:
+        """A classifier of crashes and zero scores, apart from the score forest: taught as a floor inside the score
+        forest (second fleet replay) they pulled every prediction down by 1.4-2.1 and lowered its Spearman (sweep 0.91
+        -> 0.76)."""
+        if len(bad) < min_bad or len(good) < min_bad:
+            self.bad_model = None
+            return
+        from sklearn.ensemble import RandomForestClassifier
+        X = self.matrix(list(good) + list(bad), keep=True)
+        y = np.array([0] * len(good) + [1] * len(bad))
+        sample = self.sample if 0 < self.sample < 1 else None
+        m = RandomForestClassifier(n_estimators=max(20, self.trees // 2), min_samples_leaf=self.min_leaf, n_jobs=self.jobs,
+                                   max_samples=sample, class_weight="balanced", random_state=self.seed + 3)
+        m.fit(X, y)
+        self.bad_model = m
+
+    def p_bad(self, configs: Sequence[Config]) -> np.ndarray:
+        if self.bad_model is None or not configs:
+            return np.zeros(len(configs))
+        return self.bad_model.predict_proba(self.matrix(configs))[:, 1]
 
     @property
     def ready(self) -> bool:
@@ -135,7 +157,11 @@ class Forest:
         # Capped at NOV_CAP typical bonuses: on the first fleet replay a restart reset QGA to uniform, its draws were
         # far from everything, and the uncapped term let them take 52% of the picks with nothing to climb from.
         bonus = np.minimum(kd * nov, NOV_CAP * kappa_dist * mu_spread)
-        return mu + k * sd + bonus, mu, sd, nov
+        u = mu + k * sd + bonus
+        pb = self.p_bad(configs)
+        if pb.any():                                # a likely crash or zero sinks: by its probability, across the pool
+            u = u - pb * float(u.max() - u.min())
+        return u, mu, sd, nov
 
     def flat(self, centre: Config, name: str, points: int, resolution: float) -> bool:
         """QLock's test: sweeping `name` alone across its ladder from `centre` moves the predicted score less than

@@ -557,6 +557,27 @@ class LocalExecutor:
         with self._lock:
             self._cancelled.update(job_ids)
 
+    def cancel_queued(self, job_ids: Iterable[str]) -> List[str]:
+        """Drop these jobs now if they have not started and return the ones dropped (nothing will be delivered for
+        them). Running ones are left to finish."""
+        ids, out = set(job_ids), []
+        with self._lock:
+            for k, ws in list(self._waiters.items()):
+                out += [w.job_id for w in ws if w.job_id in ids]
+                self._waiters[k] = [w for w in ws if w.job_id not in ids]
+            keep = []
+            for item in self._queue:
+                if item[2].job_id in ids:
+                    out.append(item[2].job_id)
+                else:
+                    keep.append(item)
+            gone = [it[2] for it in self._queue if it[2].job_id in ids]
+            self._queue = keep
+            heapq.heapify(self._queue)
+            for job in gone:
+                self._drop_cancelled(job)
+        return out
+
     def cancel_running(self, job_ids: Iterable[str]) -> None:
         """Jobs whose result is no longer wanted even if they are running (a duplicate run elsewhere delivered
         first): queued ones are dropped, a running batch made only of them is killed when the runner can

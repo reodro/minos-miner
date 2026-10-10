@@ -139,6 +139,9 @@ class Climber:
                 v = lad.shift(n, head.params.get(n), off)
                 if v is not None:
                     singles.append((n, v))
+        cap = getattr(self, "rider_cap", None)        # v10's endgame: fewer riders per point, so a wave ends sooner
+        if cap is not None and not pairs and len(singles) > cap:
+            singles = self.ctx.rng.sample(singles, cap)
         for n, v in singles:
             out.append(self.with_(head, {n: v}))
         if pairs:

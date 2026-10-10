@@ -33,8 +33,20 @@ v9 is kept in `search/v9/`; `MINOS_ENGINE=v9` selects it, and v10 is the default
 | After the restart (minute 35) QGA was uniform and its far draws won the novelty bonus: 52% of picks, nothing to climb. | The novelty bonus is capped at 3 typical bonuses. |
 | A Reinitialize at minute 49 sent 972 random configs into the loop's last 5 minutes. | No Restart or Reinitialize within 10 minutes (scaled) of the endgame. |
 | The endgame's first grid wave took 15 minutes behind the loop's leftovers. | The endgame's proposals carry priority 10; every executor's queue orders by priority. |
-| The forest never saw 6,246 final failures or 7,790 zero scores, so it kept proposing next to crash zones. | Final failures (after the evaluator's solo and cold retries) and zero scores are taught at a floor (the 5th percentile of the scored configs, minus 1). |
+| The forest never saw 6,246 final failures or 7,790 zero scores, so it kept proposing next to crash zones. | Final failures (after the evaluator's solo and cold retries) and zero scores are learned by a separate classifier (see the second replay's fixes). |
 | The high-core end (0.003 of core from the kings) was found, then dropped. | The best score, best core and best FP are always centres, and the endgame climbs all three (see above). |
+
+## Fixes from the second fleet replay (same round, 2026-10-09: TRUE 76.447, rank 11 again, 0.057 from the kings)
+
+Both runs ended on the same hill (core 0.864, ~1,554 FP); the kings sit at core 0.8745, 1,655 FP.
+
+| Seen | Fix |
+|---|---|
+| The best-core config (44086fc8: core 0.8745 like the kings, 1,738 FP, 75.997) was not climbed: the centres' callset-distance rule dropped it as "near" the best score. | The three ends (best score, best core, best FP) always take their slots unless they are the same config; only the extra centres need the distance. |
+| The loop converged by minute ~30; after that 82% of picks polished the summit for +0.009. | When the best gains less than `rf.converge_gain` (0.02) for `rf.converge_min` (10) minutes, after `rf.converge_after_min` (20; both scaled), the loop ends and the endgame starts at once (on the second replay: about minute 40 instead of 55). Counted in minutes, not results: riders make a fleet's worth of results about 40 s, and a first try counted that way fired at minute 23 of a simulated round whose earlier runs still gained about 5 after it. Simulated rounds gain 0.02 at most 12 minutes apart, so they lose little. A restart starts a new window (175300Z, third run: a restart at minute 40 was cut off by convergence 1.2 minutes later). `rf.endgame_min` stays the latest start. |
+| Teaching failures at a floor pulled every prediction down by 1.4-2.1 and lowered the sweep's Spearman from 0.91 to 0.76. | The score forest is fitted on scored configs only. A separate classifier (forest.fit_bad, from 20 bad configs) gives P(bad); UCB subtracts P(bad) x the pool's UCB range, so a likely crash sinks and a safe config is unchanged. |
+| Both runs used seed 0: the same 972 opening configs, so not independent tests. | A seed per run (time-based, logged in the first engine line); `MINOS_SEED=<n>` repeats one. |
+| The endgame's waves still queued behind the loop's leftovers, and each grid point carried 16 riders. | At the endgame the loop's picks that no worker has started are dropped (`cancel_queued` on every executor: they leave in_flight at once; running ones finish). Endgame grid points carry `rf.endgame_riders` (4) riders. |
 
 Crashed batches (evaluator/gatk.py, BATCH_CRASH_NO_COLD): a batch (a head with riders) that dies on a server with
 "Graph must have ref source and sink vertices" is no longer re-run cold. The plain batch path dies the same way on such
@@ -49,7 +61,7 @@ where stock GATK does not, belongs to the evaluator developer. MINOS_COLD_AFTER_
 |---|---|
 | 0 to ~8 | **Opening**: the defaults, the official seed, 15% portfolio, the rest a Latin hypercube over every setting; 4 calling-threshold riders each. The loop starts when 80% is back. |
 | ~8 to 55 | **RF_UCB loop** (asynchronous). Background refits as above; each rebuilds one pool (QGA 55% and GA 35% of 6,000 proposals, plus Local's lines and small moves around the 4 best distinct configs) and ranks it by UCB. Each free worker takes: 10% a fresh hypercube config, 20% a mutation of a top proposal, 10% QGA's best remaining proposal, 10% the sweep (every setting's line through the actual best, unranked), 50% the next of the ranking. QLock, Restart and Reinitialize as above. |
-| 55 to the pick | **Endgame**: v9's grid climb with lines on the best score, the best core and the best FP (distinct configs), then v9's Step C around each peak. |
+| converged (from 20) or 55, to the pick | **Endgame**: the loop's queued picks are dropped; v9's grid climb with lines (4 riders a point) on the best score, the best core and the best FP, then v9's Step C around each peak, then "climbing again" from the next best. |
 | 70.5 | **Pick**: the highest local score. |
 
 ## Parts

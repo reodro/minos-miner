@@ -391,3 +391,16 @@ class SelftestPassTest(unittest.TestCase):
                 self.assertIsNone(selftest.cached_pass(d))
                 selftest.record(d, {"ok": False, "digest": "x", "expected": "e1"})
                 self.assertFalse((Path(d) / "selftest" / selftest.PASS_FILE).exists())
+
+
+class CancelQueuedTest(unittest.TestCase):
+    def test_queued_jobs_are_dropped_now_and_a_duplicate_takes_their_place(self):
+        ex = FleetExecutor(Planner(), inventory=Path("/nonexistent"))
+        r = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
+        d = ranges().defaults("gatk").params
+        a, b = Config("gatk", {**d, "min_pruning": 3}), Config("gatk", {**d, "min_pruning": 4})
+        ex.submit([EvalJob("j1", r, a), EvalJob("j2", r, b), EvalJob("dup", r, b)])   # no node yet: all queued
+        self.assertEqual(sorted(ex.cancel_queued(["j1", "j2", "nope"])), ["j1", "j2"])
+        with ex._lock:
+            self.assertEqual(ex._peek().job_id, "dup")              # b is still wanted by its duplicate
+            self.assertEqual(ex._queued, {"dup"})
