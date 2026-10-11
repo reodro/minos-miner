@@ -137,11 +137,13 @@ def main():
     ap.add_argument("--no-hap", action="store_true", help="without the haplotype genotyper (models trained before g008)")
     ap.add_argument("--no-kg-rd", action="store_true", help="1000G rounds without the read comparison (models before k008)")
     ap.add_argument("--kg-hg", action="store_true", help="1000G rounds with the haplotype genotyper too")
+    ap.add_argument("--hapgeno-version", type=int, default=0, help="genotyper version (hapgeno.VERSION if 0; 2 = "
+                                                                   "repeat-aware windows); set MINOS_PREPARED")
     ap.add_argument("--hc", action="store_true", help="GIAB rounds with the GATK evidence (hcrun.py); set "
                                                       "MINOS_PREPARED to keep these tables apart")
     args = ap.parse_args()
     from answer_set.k2 import hapgeno
-    features.HAP_GENOTYPER = 0 if args.no_hap else hapgeno.VERSION
+    features.HAP_GENOTYPER = 0 if args.no_hap else (args.hapgeno_version or hapgeno.VERSION)
     features.KG_READDIFF = 0 if args.no_kg_rd else 1
     features.KG_HAPGENO = hapgeno.VERSION if args.kg_hg else 0
     from answer_set.k2 import hcrun

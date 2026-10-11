@@ -467,7 +467,8 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             orig_bam = (giab_origin.path(mode_donor, chrom, a, b) if mode_giab else
                         kg_origin.path(kg_info["person"], chrom, a, b))
             hg = hapgeno.genotype(str(bam), str(ref_path(chrom)), chrom, seeds, threads, known=set(cands) | set(rdiff),
-                                  orig_bam=orig_bam if "error" not in rd_info and orig_bam.exists() else None)
+                                  orig_bam=orig_bam if "error" not in rd_info and orig_bam.exists() else None,
+                                  version=int(HAP_GENOTYPER if mode_giab else KG_HAPGENO))
             from answer_set.k2 import hapwin
             hapwin.save_windows(workdir / "hg_windows.pkl.gz", hg)        # for window decisions (hapwin.py)
             wins = sorted((k[1], k[2], v) for k, v in hg.items() if k[0] == "window")

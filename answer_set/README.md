@@ -33,7 +33,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g026_20261004T0742, 1000G k025_20261007T0751) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g042_20261010T2220, 1000G k025_20261007T0751) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -101,6 +101,16 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   extra calls): 1-3 bp indel windows 0.55, SNP-only 0.85 (at 0.40 they lost points), longer indels 0.75. 28 rounds
   +0.006 per round (better in 15, worse in 8); fresh rounds not used for tuning: 2026-10-03 +0.029 (6/6), 2026-10-04
   +0.016 (4/5); ~3 fewer windows replaced and 1-3 fewer extra calls per round.
+- g042 (released 2026-10-11) = genotyper version 2 (`hapgeno.py`: window edges moved out of tandem repeats, so the
+  12-bp anchors sit on unique sequence) + the decision and het/hom models retrained on it with the GATK evidence (108
+  rounds, point_alpha 0.5) + the window model retrained on the version-2 windows with the GATK evidence (held out:
+  908 windows fixed, 60 broken; g026's: 850 / 212) + g026's spelling model + per-class cut-offs re-chosen by
+  validator points with the false-positive cost (SNP 0.95, 1 bp 0.70, 2-3 bp 0.80, 4-7 bp 0.80, >= 8 bp 0.45; window
+  0.60). Aimed at Minos's clustered events (an inserted indel with another record within 20 bp; a deletion + an
+  insertion close together), where most remaining 1-bp errors are: 28 development rounds, clustered inserted 1-bp
+  indels g026 missed whose local DNA the genotyper calls 59 -> 74 of 112. 23 development rounds +0.049 per round vs
+  g026 (better 18, worse 5); frozen rounds (from 2026-10-04 08:17, never used for a choice), first 19: +0.058 vs g026
+  (t 3.99, 16/3), +0.033 vs g033 (15/4). Builds take ~2-3 min longer (the GATK run).
 - Writing the person's records: exactly as Minos's truth writes them - NIST's REF, ALT order and genotype order
   (2|1 -> 2/1, `util.donor_records`). The validator classes a two-allele record by the allele its genotype names
   first; writing 1/2 for NIST's 2/1 moved ~20 records per round out of the >= 8 bp class (found by the search

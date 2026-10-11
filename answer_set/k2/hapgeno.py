@@ -51,6 +51,11 @@ FEATS = ["hg_post", "hg_hom", "hg_reads", "hg_anchored", "hg_lr", "hg_n_haps"] +
 # Genotyper version a model is trained with (meta hap_genotyper; build.py runs that one). 1: g009. (Tried 2026-10-03
 # and dropped: denoised candidate sequences - truth's sequence absent 64 -> 62 of 275 missed sites, +40 s per round.)
 VERSION = 1
+# 2: repeat-aware window edges (_repeat_aware). A window edge inside a tandem repeat puts its 12-bp anchor in the repeat,
+# where reads that start or end in the repeat cannot be anchored and the anchor may match at a shifted place.
+# 28 development rounds (2026-10-10), clustered inserted 1-bp indels g026 missed, windows seeded from the neighbouring
+# records: truth's DNA called 59 -> 69 of 112; 120 clustered sites g026 found: 70 -> 70.
+REPEAT_MAX_EXTEND = 30    # bases an edge may move out of a repeat
 BIN = 50                  # originals grouped by (strand, start // BIN); a round read looks in its bin and both neighbours
 
 
@@ -340,12 +345,57 @@ def _windows_job(args):
     return out
 
 
-def genotype(bam_path, fasta, chrom, seeds, threads=8, known=(), orig_bam=None):
+def _repeat_span(seq, i):
+    """[a, b) of the longest tandem repeat (period 1-6, >= 2 copies, span >= 6) covering seq[i], or None."""
+    best = None
+    for per in range(1, 7):
+        for o in range(per):
+            st = i - o
+            if st < 0 or st + per > len(seq):
+                continue
+            unit = seq[st:st + per]
+            a, b = st, st + per
+            while a - per >= 0 and seq[a - per:a] == unit:
+                a -= per
+            while b + per <= len(seq) and seq[b:b + per] == unit:
+                b += per
+            while b < len(seq) and seq[b] == unit[(b - a) % per]:
+                b += 1
+            if b - a >= max(6, 2 * per) and (best is None or b - a > best[1] - best[0]):
+                best = (a, b)
+    return best
+
+
+def _repeat_aware(wins, fasta, chrom):
+    """Windows whose edges (with their anchors) touch a tandem repeat moved out of it, by at most REPEAT_MAX_EXTEND."""
+    fa = pysam.FastaFile(fasta)
+    out = []
+    for s, e in wins:
+        lo = max(1, s - hapcand.ANCHOR - REPEAT_MAX_EXTEND - 10)
+        seq = fa.fetch(chrom, lo - 1, e + hapcand.ANCHOR + REPEAT_MAX_EXTEND + 10).upper()
+        ns = s
+        for x in range(s - hapcand.ANCHOR - 1, s + 1):          # the left anchor and the window's first base
+            sp = _repeat_span(seq, x - lo)
+            if sp:
+                ns = min(ns, sp[0] + lo - 1)
+        ne = e
+        for x in range(e, e + hapcand.ANCHOR + 2):              # the window's last base and the right anchor
+            sp = _repeat_span(seq, x - lo)
+            if sp:
+                ne = max(ne, sp[1] + lo + 1)
+        out.append((max(ns, s - REPEAT_MAX_EXTEND), min(ne, e + REPEAT_MAX_EXTEND)))
+    return out
+
+
+def genotype(bam_path, fasta, chrom, seeds, threads=8, known=(), orig_bam=None, version=1):
     """{event key: features} for the events of likely haplotype pairs, plus {("window", s, e): {...}} per genotyped
     window (so a candidate inside a window that no likely pair carries can be told apart from an unexamined one).
     known: events found otherwise (read scan, read comparison) - preferred when two spellings are equally simple.
-    orig_bam: the donor's original reads over the region (giab_origin.fetch); without it the edit features are NaN."""
+    orig_bam: the donor's original reads over the region (giab_origin.fetch); without it the edit features are NaN.
+    version: the VERSION a model was trained with (2: repeat-aware window edges)."""
     wins = hapcand.windows(seeds)
+    if version >= 2:
+        wins = _repeat_aware(wins, fasta, chrom)
     if not wins:
         return {}
     parts = [wins[i::max(1, threads)] for i in range(max(1, threads))]
