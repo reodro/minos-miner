@@ -178,6 +178,7 @@ function render() {
   renderKpis(L, R, S, E, X, finished);
   renderResult(lastResult, finished);
   renderSchedule(E, finished);
+  renderRegions(E);
   renderLineage(E);
   renderClimbers(E, finished);
   renderStepC(E);
@@ -205,7 +206,7 @@ function phaseClass(phase) {
 }
 
 function climbers(E) { return (E && E.basins) || []; }
-const isRF = (E) => !!(E && E.version === "v10");      // v10: RF_UCB; anything else: the v9 panels
+const isRF = (E) => !!(E && ["v10", "v11", "v12"].includes(E.version));   // v10/v11/v12: RF_UCB loop; anything else: the v9 panels
 
 function rankKpi(rank) {
   // The live best on the published field. A replay's score is the truth formula, so this is the rank during the test.
@@ -268,7 +269,30 @@ function segmentsRF(E) {
     .filter((g) => g[3] - g[2] > 1);
 }
 
+const isV12 = (E) => !!(E && E.version === "v12");
+
+function eventAt(E, text) {
+  // engine seconds of the first event containing `text`, or null
+  const ev = (E.events || []).find((e) => (e[1] || "").includes(text));
+  return ev && E.started_ts ? ev[0] - E.started_ts : null;
+}
+
+function segmentsV12(E) {
+  // v12: the opening, successive-halving screening (16 regions -> 4), the trust-region loop, the endgame climb, the pick
+  const sc = E.schedule || {};
+  const aEnd = sc.a_done_s != null ? sc.a_done_s : Math.max(E.elapsed_s, 4 * 60 * (sc.scale || 1));
+  const screenDone = eventAt(E, "screening done");
+  const sEnd = screenDone != null ? screenDone : Math.max(E.elapsed_s, aEnd + 12 * 60 * (sc.scale || 1));
+  const bEnd = sc.b_done_s != null ? sc.b_done_s : Math.max(sEnd, sc.b_end_s || sEnd);
+  const pick = sc.pick_s != null ? sc.pick_s : sc.length_s;
+  const span = (a, b) => [Math.max(0, a), Math.max(Math.max(0, a), Math.min(sc.length_s, b))];
+  return [["opening", "Opening", ...span(0, aEnd)], ["generations", "Screening", ...span(aEnd, sEnd)],
+          ["climb", "Trust regions", ...span(sEnd, bEnd)], ["stepc", "Endgame climb", ...span(bEnd, pick)],
+          ["final", "pick", ...span(pick, sc.length_s)]].filter((g) => g[3] - g[2] > 1);
+}
+
 function segments(E) {
+  if (isV12(E)) return segmentsV12(E);
   if (isRF(E)) return segmentsRF(E);
   // Step A: wave 0, then the genetic generations; Step B until it ends (climb.end_min or every climber at its peak);
   // Step C from there to the pick. Planned ends until a step has really ended.
@@ -358,7 +382,9 @@ function renderSchedule(E, finished) {
     if (marks.length && m - marks[marks.length - 1] < 2) marks[marks.length - 1] = m; else marks.push(m);
   }
   ticks.replaceChildren(...marks.map((m) => h("span", {style: {left: x(m * 60)}, text: `${m}`})));
-  $("schedule-sub").textContent = isRF(E)
+  $("schedule-sub").textContent = isV12(E)
+    ? `v12 trust regions · opening, screening 16 regions down to 4, the regions' loop, the endgame climb, then the pick · stages scaled ×${E.schedule.scale.toFixed(2)}`
+    : isRF(E)
     ? `${E.version} RF_UCB · opening, the forest-guided loop, the endgame grid climb on the best 2, then the pick · stages scaled ×${E.schedule.scale.toFixed(2)}`
     : `${E.version || "search"} · Step A candidates, Step B grid climb to each peak, Step C around the peaks, then the pick · stages scaled ×${E.schedule.scale.toFixed(2)}`;
 }
@@ -377,6 +403,7 @@ const STATUS_TEXT = {climbing: "climbing", peak: "at its peak", stopped: "stoppe
 function renderLineage(E) {
   const box = $("lineage");
   const cl = climbers(E);
+  box.closest("section").hidden = isV12(E) && !cl.length;   // v12: the regions panel shows the loop; the tree is the endgame's
   if (!E || !E.schedule || !cl.length) {
     box.replaceChildren(h("div", {class: "empty", text: !E ? "The engine has not started."
       : isRF(E) ? `No climber yet: the endgame climbs the best 2 configs from ${E.schedule ? mins(E.schedule.b_end_s) : "minute 55"}.`
@@ -521,7 +548,7 @@ function renderStepC(E) {
   }));
 }
 
-const SOURCES = ["opening", "qga", "ga", "local", "mutate", "sweep", "inject"];
+const SOURCES = ["opening", "tr", "line", "qga", "ga", "local", "mutate", "sweep", "inject"];
 const RECENT_S = 300;                 // the "recent" window of the picks panel
 let pickHistory = [];                 // [engine seconds, picks by source] from each poll, for the recent window
 
@@ -539,11 +566,12 @@ function recentPicks(E) {
   for (const [k, v] of Object.entries(rf.picks)) out[k] = Math.max(0, v - (old[k] || 0));
   return {span: t - t0, picks: out};
 }
-const SOURCE_TEXT = {opening: "opening", qga: "QGA", ga: "GA", local: "Local", mutate: "mutations", sweep: "sweep", inject: "Inject"};
+const SOURCE_TEXT = {opening: "opening", tr: "regions (Thompson)", line: "lines", qga: "QGA", ga: "GA", local: "Local", mutate: "mutations",
+                     sweep: "sweep", inject: "Inject"};
 
 function renderRF(E) {
   // v10: what the RF_UCB loop has done, and how well the forest predicts each source's picks
-  $("h-stepa").textContent = "RF_UCB loop";
+  $("h-stepa").textContent = isV12(E) ? "Trust-region loop" : "RF_UCB loop";
   $("h-stepc").textContent = "Forest predictions";
   const rf = E.rf || {};
   const loopBox = $("waves");
@@ -590,6 +618,54 @@ function renderRF(E) {
           cell("td", c.spearman == null ? "–" : fix(c.spearman, 2), "num"), cell("td", fix(c.novelty_median, 3), "num"));
       }))),
     h("div", {class: "muted", text: "actual − predicted: negative means the forest overrated that source's picks. Spearman: how well it ordered them. Distance: median distance from configs already scored; only far picks explore new regions."}));
+}
+
+function renderRegions(E) {
+  // v12: the live trust regions (best, gain since opened, indel part, length), the finished ones, and region events
+  const panel = $("regions-panel");
+  panel.hidden = !isV12(E);
+  if (!isV12(E)) return;
+  const box = $("regions");
+  const live = [...(E.regions || [])].sort((a, b) => b.best - a.best);
+  const done = [...((E.rf || {}).finished || [])].sort((a, b) => (b.ended_m || 0) - (a.ended_m || 0));
+  const cell = (tag, text, cls, title) => h(tag, {class: cls || "", text, title: title || ""});
+  const LMAX = 1.6;
+  const best = live.length ? live[0].best : null;
+  $("regions-sub").textContent = live.length
+    ? `${live.length} live · ${done.length} finished · best ${fix(best, 3)} · a region is a centre and a step size L (grows on success, shrinks on failure)`
+    : "regions open after the opening";
+  const kids = [];
+  if (!live.length) kids.push(h("div", {class: "empty", text: (E.phase || "").startsWith("A") ? "Opening: the screen opens 16 regions when it ends." : "No live region."}));
+  else kids.push(h("table", {class: "cal"},
+    h("thead", {}, h("tr", {}, cell("th", "region"), cell("th", "best", "num"), cell("th", "gain", "num", "since the region opened"),
+      cell("th", "indel part", "num", "best indel part among its configs at about the best config's false positives"),
+      cell("th", "step size L"), cell("th", "steps ✓/✗", "num", "successful / failed steps in a row"),
+      cell("th", "picks / back", "num"), cell("th", "age", "num"))),
+    h("tbody", {}, ...live.map((r) => h("tr", {},
+      h("td", {}, h("b", {text: `r${r.id}`}), r.far ? h("span", {class: "chip warn", style: {marginLeft: "6px"}, text: "far"}) : null,
+        r.best === best ? h("span", {class: "chip good", style: {marginLeft: "6px"}, text: "leader"}) : null),
+      cell("td", fix(r.best, 3), "num"),
+      cell("td", r.start != null ? `${r.best - r.start >= 0 ? "+" : ""}${fix(r.best - r.start, 3)}` : "–", "num"),
+      cell("td", r.indel != null ? fix(r.indel, 4) : "–", "num"),
+      h("td", {style: {minWidth: "110px"}}, h("div", {class: "top-line"}, h("span", {class: "num", text: fix(r.length, 3)})),
+        bar(Math.min(1, (r.length || 0) / LMAX), "", null)),
+      cell("td", `${int(r.succ)} / ${int(r.fail)}`, "num"),
+      cell("td", `${int(r.picks)} / ${int(r.back)}`, "num"),
+      cell("td", r.age_m != null ? `${fix(r.age_m, 1)} m` : "–", "num"))))));
+  if (done.length) kids.push(h("details", {},
+    h("summary", {text: `Finished regions (${done.length})`}),
+    h("table", {class: "cal"},
+      h("thead", {}, h("tr", {}, cell("th", "region"), cell("th", "best", "num"), cell("th", "indel part", "num"),
+        cell("th", "ended", "num"), cell("th", "why"))),
+      h("tbody", {}, ...done.map((r) => h("tr", {},
+        h("td", {}, h("span", {text: `r${r.id}`}), r.far ? h("span", {class: "chip warn", style: {marginLeft: "6px"}, text: "far"}) : null),
+        cell("td", fix(r.best, 3), "num"), cell("td", r.indel != null ? fix(r.indel, 4) : "–", "num"),
+        cell("td", r.ended_m != null ? `min ${fix(r.ended_m, 1)}` : "–", "num"), cell("td", r.why || "")))))));
+  const ev = (E.events || []).filter((e) => /region|screening|endgame|restart/i.test(e[1] || "")).slice(-8).reverse();
+  if (ev.length) kids.push(h("div", {class: "rows"}, h("b", {text: "Region events"}),
+    ...ev.map((e) => h("div", {class: "rowline"}, h("span", {class: "muted num", text: E.started_ts ? `min ${fix((e[0] - E.started_ts) / 60, 1)} ` : ""}),
+      h("span", {text: e[1]})))));
+  box.replaceChildren(...kids);
 }
 
 function renderStepA(E, R) {

@@ -751,11 +751,40 @@ class CrashRetryTest(unittest.TestCase):
                 got[cs.job_id] = cs
             if len(got) == 3:
                 break
-        self.assertEqual(calls, [("batch", 3), ("solo", 1)])
-        self.assertTrue(got["j0"].ok)                                        # the head, rerun alone
-        self.assertEqual([got[j].ok for j in ("j1", "j2")], [False, False])  # the riders fail with the batch
-        self.assertIn("batch crashed; its head runs alone", got["j1"].error)
-        self.assertEqual(ex.stats()["retries"], 1)
+        # the head reruns alone; the riders are batched again without it (that batch dies too here), then its new
+        # head runs alone and the rider lost twice runs alone: every config gets a result of its own
+        self.assertEqual(calls, [("batch", 3), ("solo", 1), ("batch", 2), ("solo", 1), ("solo", 1)])
+        self.assertTrue(all(got[j].ok for j in ("j0", "j1", "j2")))
+        self.assertEqual(ex.stats()["retries"], 5)
+
+        class OneBad(FakeRunner):                          # one rider crashes GATK wherever it runs
+            def run_batch(self, round, configs, fidelity=FULL):
+                calls2.append(len(configs))
+                if any(c.params[conf] == 50.0 for c in configs):
+                    return [CallSet(round.round_id, c.key, "", "", 0.1, ok=False, fidelity=fidelity,
+                                    error="rc=3 java.lang.IllegalStateException: boom") for c in configs]
+                return super().run_batch(round, configs, fidelity)
+
+            def run(self, round, config, fidelity=FULL):
+                calls2.append(1)
+                if config.params[conf] == 50.0:
+                    return CallSet(round.round_id, config.key, "", "", 0.1, ok=False, error="rc=3 boom",
+                                   fidelity=fidelity)
+                return super().run(round, config, fidelity)
+
+        calls2 = []
+        ex = LocalExecutor(OneBad(r, batching=True), workers=1)
+        jobs = [EvalJob(f"b{i}", ROUND, Config("gatk", {**d, conf: c})) for i, c in enumerate((30.0, 40.0, 50.0, 60.0))]
+        ex.submit(jobs)
+        got = {}
+        for _ in range(60):
+            for cs in ex.poll(0.2):
+                got[cs.job_id] = cs
+            if len(got) == 4:
+                break
+        self.assertEqual(sorted(got), ["b0", "b1", "b2", "b3"])                # every job answered, no endless retry
+        self.assertEqual([got[j].ok for j in ("b0", "b1", "b2", "b3")], [True, True, False, True])
+        self.assertLessEqual(len(calls2), 8)
 
         class Always(FakeRunner):                          # a config that crashes on its own is a failure
             def run(self, round, config, fidelity=FULL):

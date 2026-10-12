@@ -57,7 +57,12 @@ class PortfolioTest(unittest.TestCase):
         self.assertEqual([r["local"] for r in rows], [88.70, 88.60])      # the best first; 88.69 is a near-copy
         self.assertNotIn(87.0, [r["local"] for r in rows])                 # outside the 0.3 window
         self.assertTrue(all(r["src"] == "minos:20261002T092900Z" and r["profile"] == "B" for r in rows))
-        self.assertEqual(portfolio.members(ours=self.ours)[0]["src"], "minos:20261002T092900Z")   # ours come first
+        none = Path(self.ours).parent / "no_kings.json"
+        self.assertEqual(portfolio.members(ours=self.ours, kings=none)[0]["src"], "minos:20261002T092900Z")  # ours first
+        kings = Path(self.ours).parent / "kings.json"
+        kings.write_text(json.dumps({"members": [{"src": "legacy-king:20260915T10490000", "config": {}}]}))
+        got = portfolio.members(ours=self.ours, kings=kings)
+        self.assertEqual([got[0]["src"], got[1]["src"]], ["legacy-king:20260915T10490000", "minos:20261002T092900Z"])
         self.assertEqual(portfolio.add_run(self.space, configs, "20261002T092900Z", "B", path=self.ours), 0)
         self.assertTrue(all(r["group"] == "score" for r in rows))
 

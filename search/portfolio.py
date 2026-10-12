@@ -1,5 +1,7 @@
 """Seeds for the opening: the legacy portfolio plus what our own reviewed rounds add. Owner: search.
 
+  kings    search/portfolio/legacy_kings.json: the legacy pipeline's three configs that beat a king on released truth
+           (2026-09-13/14/15), read before everything else.
   legacy   search/portfolio/legacy.json: the legacy pipeline's portfolio (749 configs from 79 rounds, 2026-09-06 to
            09-18; per round up to 10 diverse configs within 0.3 of its best, spaced apart in normalised setting
            space - his portfolio_select.py). legacy_winners.json (624) is kept as a backup and not read.
@@ -26,6 +28,7 @@ from common.types import Config
 
 HERE = Path(__file__).resolve().parent / "portfolio"
 LEGACY = HERE / "legacy.json"
+FRIEND = HERE / "legacy_kings.json"   # the legacy pipeline's configs that beat a king on released truth (read first)
 OURS = Path(SETTINGS.data_dir) / "portfolio" / "ours.jsonl"
 LONG_READS = 240               # most reads at least this long: profile A
 MIN_DISTANCE = 0.05            # members closer than this (mean normalised difference) are one member
@@ -57,9 +60,15 @@ def _round_of(src: str) -> str:
     return m.group(1)[:16] if m else ""
 
 
-def members(legacy: Path = LEGACY, ours: Path = OURS) -> List[dict]:
-    """Every member, ours first (newest round first), then the legacy ones (newest round first, best rank first)."""
+def members(legacy: Path = LEGACY, ours: Path = OURS, kings: Path = FRIEND) -> List[dict]:
+    """Every member: the legacy kings, then ours (newest round first), then the legacy ones (newest round first, best
+    rank first)."""
     out: List[dict] = []
+    try:                                              # before everything: they are few, and the opening must try them
+        doc = json.loads(kings.read_text())
+        out += doc.get("members", []) if isinstance(doc, dict) else doc
+    except (OSError, ValueError):
+        pass
     try:
         lines = ours.read_text().splitlines()
     except OSError:
