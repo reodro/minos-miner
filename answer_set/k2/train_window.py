@@ -10,6 +10,7 @@ its events (train_track.class_cost: a 1-bp indel ~20 SNP errors).
 Owner: answer_set.
 """
 import argparse
+from pathlib import Path
 import json
 import shutil
 import sys
@@ -34,6 +35,7 @@ def window_model():
 
 
 HC = False                       # --hc: window features with the GATK evidence (hapwin.FEATS_HC, meta window_hc)
+LR = False                       # --lr: window features with lr_answer (hapwin.FEATS_LR, meta window_lr)
 
 
 def round_rows(r, base, cost):
@@ -57,7 +59,16 @@ def round_rows(r, base, cost):
         if not hpath.exists():
             return None
         hc = hcrun.load_calls(hpath)
-    cands = hapwin.candidates(hapwin.load_windows(wpath), answer, dict(zip(keys, p_raw)), r["_donor"], bed, hc)
+    lr_fn = None
+    if LR:
+        import pysam
+        from backtest.data import round_dir
+        from answer_set.k2.util import ref_path
+        chrom = parse_region(r["info"]["region"])[0]
+        bam_lr = pysam.AlignmentFile(str(Path(round_dir(tag)) / "input.bam"))
+        fa_lr = pysam.FastaFile(str(ref_path(chrom)))
+        lr_fn = lambda s_, e_, w_, A_: hapwin.answer_lr(bam_lr, fa_lr, chrom, s_, e_, w_, A_)  # noqa: E731
+    cands = hapwin.candidates(hapwin.load_windows(wpath), answer, dict(zip(keys, p_raw)), r["_donor"], bed, hc, lr_fn)
     if not cands:
         return None
     y, ok = hapwin.label(cands, truth_of(r))
@@ -69,18 +80,28 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", required=True, help="GIAB track version whose answers the windows correct")
     ap.add_argument("--hc", action="store_true", help="with the GATK evidence (needs rounds prepared with --hc)")
+    ap.add_argument("--workers", type=int, default=1, help="rounds processed in parallel")
+    ap.add_argument("--lr", action="store_true", help="with lr_answer (hapwin.FEATS_LR: called pair vs answer on the reads)")
     args = ap.parse_args()
-    global HC
+    global HC, LR
     HC = args.hc
+    LR = args.lr
     t0 = time.time()
     bmeta = tracks.meta("giab", args.base)
     rs = load(set(bmeta["rounds"]))
     cost = class_cost(rs)
     data = {}
-    for r in rs:
-        x = round_rows(r, args.base, cost)
-        if x is not None:
-            data[r["name"]] = x
+    if args.workers > 1:                              # rounds in parallel (forked workers inherit HC / LR)
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(args.workers) as ex:
+            for r, x in zip(rs, ex.map(round_rows, rs, [args.base] * len(rs), [cost] * len(rs))):
+                if x is not None:
+                    data[r["name"]] = x
+    else:
+        for r in rs:
+            x = round_rows(r, args.base, cost)
+            if x is not None:
+                data[r["name"]] = x
     print(f"{len(data)}/{len(rs)} rounds with genotyper windows; candidate windows "
           f"{sum(len(v[1]) for v in data.values())}, called pair right {sum(int(v[1].sum()) for v in data.values())}, "
           f"answer right {sum(int(v[2].sum()) for v in data.values())}")
@@ -122,8 +143,8 @@ def main():
     for f, mdl in fold_models.items():
         joblib.dump(mdl, dst / f"fold{f}_window.joblib")
     bmeta = {k: v for k, v in bmeta.items() if k not in ("window_thr_group", "window_thr_group_of")}  # the old model's
-    meta = dict(bmeta, created=tracks.now(), window_thr=thr, window_base=args.base, window_hc=int(HC),
-                window_features=hapwin.FEATS + (hapwin.FEATS_HC if HC else []),
+    meta = dict(bmeta, created=tracks.now(), window_thr=thr, window_base=args.base, window_hc=int(HC), window_lr=int(LR),
+                window_features=hapwin.FEATS + (hapwin.FEATS_HC if HC else []) + (hapwin.FEATS_LR if LR else []),
                 window_heldout={"fixed": table[thr][1], "broken": table[thr][2], "net_snp_units": round(table[thr][0], 1)})
     (dst / "meta.json").write_text(json.dumps(meta, indent=1))
     tracks.log("giab", "train_window", version=name, base=args.base, threshold=thr)

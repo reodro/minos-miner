@@ -262,6 +262,8 @@ def train(track, rs, name):
             meta["round_feats"] = 1
         if kg_hg:
             meta["kg_hapgeno"] = min(int(r["info"]["kg_hapgeno"]) for r in rs)
+        if track == "kg" and all(r["info"].get("kg_site_rule") for r in rs):
+            meta["kg_site_rule"] = min(int(r["info"]["kg_site_rule"]) for r in rs)
         if track == "giab":
             from answer_set.k2 import features as _features
             meta["rd_1bp_factor"] = _features.RD_1BP_FACTOR

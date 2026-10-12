@@ -39,6 +39,13 @@ KG_HAPGENO = int(os.environ.get("MINOS_KG_HG", "0"))
 # steps never listed become candidates (only_hc), and every candidate gets the run's call (hc_*). Follows the GIAB model
 # (meta hc_evidence = the hcrun.VERSION it was trained with; build.py sets it); prepare.py --hc turns it on.
 HC_EVIDENCE = int(os.environ.get("MINOS_HC", "0"))
+# 1000G rounds: read-comparison candidates judged per SITE for indels >= 2 bp (meta kg_site_rule; build.py sets it).
+# In tandem repeats Minos's inserted indel shows up in the edited reads at several lengths, so no single length reaches
+# 25% of the reads or is the strongest at its spot (2026-10-09, 26 new-pattern rounds: 0.9 / 0.7 / 0.5 inserted
+# 2-3 / 4-7 / >=8 bp indels per round missed this way, a quarter to a third of those misses). Where the edited reads of
+# all lengths at a position reach 25% of its reads, its two best-supported lengths (>= 2 edited reads) become
+# candidates too; the model decides.
+KG_SITE_RULE = int(os.environ.get("MINOS_KG_SITE", "0"))
 HG_CALL = 0.5                   # genotyper events at least this likely become candidates,
 HG_EDIT_ORI = 2                 # and so do events carried by edited reads from at least this many originals
 HG_FEATS = ("hg_post", "hg_hom", "hg_reads", "hg_anchored", "hg_lr", "hg_n_haps", "hg_edit", "hg_edit_ori", "hg_unedit",
@@ -442,10 +449,27 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             j0, j1 = bisect.bisect_left(rd_pos, k[0] - 10), bisect.bisect_right(rd_pos, k[0] + len(k[1]) + 10)
             return max([rdiff[o][0] for o in rd_keys[j0:j1] if o != k] or [0])
         n_rd_only = 0
+        site_keep = set()
+        if KG_SITE_RULE and not mode_giab:
+            by_pos = {}
+            for k, (sup, cov, ori) in rdiff.items():
+                by_pos.setdefault(k[0], []).append((k, sup, cov))
+            for p_, al in by_pos.items():
+                if sum(s for _, s, _ in al) >= 0.25 * max(c for _, _, c in al):
+                    top = sorted((x for x in al if x[1] >= 2), key=lambda x: -x[1])[:2]
+                    if KG_SITE_RULE >= 2:
+                        # version 2 (k027): each kept length has >= 2 original reads, and a second length >= 0.3x the
+                        # first's edited reads (k026's rule added 293 candidates on k025's training rounds, 29 real;
+                        # this keeps 82 of them, 25 real)
+                        top = [x for j, x in enumerate(top) if rdiff[x[0]][2] >= 2
+                               and (j == 0 or x[1] >= 0.3 * top[0][1])]
+                    site_keep.update(k for k, _, _ in top if abs(len(k[1]) - len(k[2])) >= 2)
         for k, (sup, cov, ori) in rdiff.items():
             # 1-bp indels: half the strongest neighbour is enough (g005's "must be strongest" rule lost real ones)
             need = RD_1BP_FACTOR * sib_max(k) if abs(len(k[1]) - len(k[2])) == 1 else sib_max(k)
-            if (k in cands or k in own or not (a <= k[0] <= b) or sup < 2 or sup < 0.25 * cov or sup < need
+            if k in site_keep and k not in cands and k not in own and a <= k[0] <= b:
+                pass                                    # a strong repeat site's best lengths (KG_SITE_RULE)
+            elif (k in cands or k in own or not (a <= k[0] <= b) or sup < 2 or sup < 0.25 * cov or sup < need
                     or (mode_giab and not (dbed.contains(k[0]) and dbed.contains(k[0] + len(k[1]) - 1)))):
                 continue
             L = len(k[2]) - len(k[1])
@@ -665,4 +689,5 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
     info["kg_readdiff"] = int(bool(KG_READDIFF) and not mode_giab)
     info["kg_hapgeno"] = int(KG_HAPGENO) if (not mode_giab and rd_on and hg_window is not None) else 0
     info["hc_evidence"] = int(HC_EVIDENCE) if hc is not None else 0
+    info["kg_site_rule"] = int(KG_SITE_RULE) if (not mode_giab and rd_on and "error" not in rd_info) else 0
     return keys, X, info, donors, beds

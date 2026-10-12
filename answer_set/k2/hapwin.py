@@ -34,6 +34,39 @@ KINDS = {"adds": 0, "removes": 1, "changes": 2}
 # window models trained with the GATK evidence (meta window_hc; hcrun.py): GATK's calls inside the window - how many,
 # whether their DNA pair is the genotyper's called pair or the answer's, their QUAL. A third opinion on the same DNA.
 FEATS_HC = ["hc_n", "hc_agree_called", "hc_agree_answer", "hc_qual_min", "hc_qual_max"]
+# window models trained with lr_answer (meta window_lr): how much better the called pair explains the window's anchored
+# reads than the per-variant answer's records do (log-likelihood, hapgeno's read model; best phasing of the answer's
+# het records). Where the genotyper is right and the answer wrong it is large (108 training rounds: median 30.4) - not
+# one read may fit the answer (2026-10-11 16:42, chr13:28,078,730: the answer's G>T, read as a substitution in 6 reads
+# that carry an insertion + a deletion of equal length) - and smaller where the answer is right (median 13.1). Held-out
+# windows, same folds: fixed / broken / net at every cut-off better (best net 17,609 -> 17,987 SNP-error units).
+FEATS_LR = ["lr_answer"]
+
+
+def answer_lr(bam, fa, chrom, s, e, w, A):
+    """log-likelihood of the window's anchored reads under the called pair minus under the best phasing of the answer's
+    records A [(key, zyg)], capped at +-50; NaN when it cannot be computed."""
+    from answer_set.k2 import hapgeno
+    try:
+        reads = hapgeno._anchored_reads(bam, fa, chrom, s, e, None)
+        called = tuple(sorted(w["pair"]))
+        aps = pairs_of(w["ref"], s, A) or set()
+        if not reads or not aps:
+            return math.nan
+        haps = sorted({h for pr in aps for h in pr} | set(called))
+        L = {h: [hapgeno._read_ll(q, qual, h) for q, qual, *_ in reads] for h in haps}
+        best = [max(L[h][i] for h in haps) for i in range(len(reads))]
+
+        def pair_ll(a, b):
+            tot = 0.0
+            for i in range(len(reads)):
+                x, y = max(L[a][i], best[i] - hapgeno.FLOOR), max(L[b][i], best[i] - hapgeno.FLOOR)
+                mx = max(x, y)
+                tot += mx + math.log(0.5 * math.exp(x - mx) + 0.5 * math.exp(y - mx))
+            return tot
+        return min(50.0, max(-50.0, pair_ll(*called) - max(pair_ll(*pr) for pr in aps)))
+    except Exception:  # noqa: BLE001  (one odd window must not stop the build)
+        return math.nan
 
 
 def save_windows(path, hg):
@@ -129,7 +162,7 @@ def _hp_max(seq):
     return best
 
 
-def candidates(windows, answer, p_of, donor, bed, hc=None):
+def candidates(windows, answer, p_of, donor, bed, hc=None, lr_fn=None):
     """Windows inside the confident region whose called pair differs from the answer's, with their features.
     answer: {key: (zyg, synthetic)} (the per-variant answer, the person's records included); p_of: {key: model
     score} of the per-variant candidates; donor: the person's GIAB records {key: zyg}; hc: the GATK run's calls
@@ -191,6 +224,9 @@ def candidates(windows, answer, p_of, donor, bed, hc=None):
                      hc_agree_called=nan if hps is None else float(called in hps),
                      hc_agree_answer=nan if hps is None else float(bool(hps & aps)),
                      hc_qual_min=min(q, default=nan), hc_qual_max=max(q, default=nan))
+        if lr_fn is not None:                              # window models trained with lr_answer (FEATS_LR)
+            names = names + FEATS_LR
+            f["lr_answer"] = lr_fn(s, e, w, [(k, answer[k][0]) for k in A])
         out.append((s, e, w, [(k, answer[k][0]) for k in A], ev, np.array([f[n] for n in names], dtype=float)))
     return out
 

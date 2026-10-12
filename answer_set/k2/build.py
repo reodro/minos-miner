@@ -121,6 +121,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     kname = (track_versions or {}).get("kg") or tracks.active_name("kg")
     features.KG_READDIFF = int(tracks.meta("kg", kname).get("kg_readdiff", 0)) if kname else 0
     features.KG_HAPGENO = int(tracks.meta("kg", kname).get("kg_hapgeno", 0)) if kname else 0
+    features.KG_SITE_RULE = int(tracks.meta("kg", kname).get("kg_site_rule", 0)) if kname else 0
     keys, X, info, donors, beds = extract(bam, region, out / "work", threads)
     t_feat = time.time() - t0
     track = tracks.track_of_info(info)
@@ -178,7 +179,11 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
             hp_ = out / "work" / "hc.norm.vcf.gz"
             hc_calls = hcrun.load_calls(hp_) if hp_.exists() else {}
         wins = hapwin.load_windows(out / "work" / "hg_windows.pkl.gz")
-        cands = hapwin.candidates(wins, answer, dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]], hc_calls)
+        lr_fn = None
+        if meta.get("window_lr"):                       # window model trained with lr_answer (hapwin.FEATS_LR)
+            bam_lr, fa_lr = pysam.AlignmentFile(str(bam)), pysam.FastaFile(str(ref_path(chrom)))
+            lr_fn = lambda s_, e_, w_, A_: hapwin.answer_lr(bam_lr, fa_lr, chrom, s_, e_, w_, A_)  # noqa: E731
+        cands = hapwin.candidates(wins, answer, dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]], hc_calls, lr_fn)
         if cands:
             pw = wm.predict_proba(np.vstack([c[5] for c in cands]))[:, 1]
             vname = (track_versions or {}).get(track) or tracks.active_name(track)
