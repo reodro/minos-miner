@@ -229,7 +229,8 @@ def release(track, name):
     if (dst / "meta.json").exists():
         return dst
     dst.mkdir(parents=True, exist_ok=True)
-    for f in list(RELEASE_FILES) + [x for x in ("window.joblib", "spelling.joblib") if (src / x).exists()]:
+    for f in list(RELEASE_FILES) + [x for x in ("window.joblib", "spelling.joblib", "cluster_chooser.joblib",
+                                                "cluster_arbiter.joblib") if (src / x).exists()]:
         shutil.copy2(src / f, dst / f)
     return dst
 

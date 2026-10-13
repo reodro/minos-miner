@@ -30,12 +30,13 @@ the released truth.
 | `k2/giab_origin.py`, `k2/readdiff.py`, `k2/localhap.py` | GIAB original reads, read-vs-original comparison, local haplotypes |
 | `k2/hapgeno.py`, `k2/hapcand.py` | edit-aware local haplotype genotyper (GIAB): the person's two local sequences per spot |
 | `k2/hapwin.py`, `k2/train_window.py`, `k2/train_spelling.py` | window decisions: where the genotyper's whole-window answer replaces the per-variant one, and how it is spelled |
+| `k2/clusterdec.py` | edit-based cluster decoder (GIAB): a cluster's two copies from the reads, Minos's spelling, an arbiter against the per-variant answer |
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g042_20261010T2220, 1000G k025_20261007T0751) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g075_20261013T0429, 1000G k025_20261007T0751) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
-version = `tracks.promote` (copies those three files here) + commit; rollback = `--rollback` or git revert.
+version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
 Inputs, under `SETTINGS.data_dir` (listed in `k2/util.py`): the shared `reference/`, `giab/<donor>.vcf.gz|.bed` and
 `1kg/{phased,index,gatk_sites,masks}` (the last three: the builder's 1000G inputs). This clone's `cache/answer_set/k2/`: one build per
@@ -111,6 +112,17 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   indels g026 missed whose local DNA the genotyper calls 59 -> 74 of 112. 23 development rounds +0.049 per round vs
   g026 (better 18, worse 5); frozen rounds (from 2026-10-04 08:17, never used for a choice), first 19: +0.058 vs g026
   (t 3.99, 16/3), +0.033 vs g033 (15/4). Builds take ~2-3 min longer (the GATK run).
+- g075 (released 2026-10-13) = g054 + the edit-based cluster decoder (`clusterdec.py`). g054 = g048 (decision and
+  het/hom models on genotyper version 4, window model with the `lr_answer` feature) with window cut-off 0.75 and per-class
+  cut-offs SNP 0.90, 1 bp 0.50, 2-3 bp 0.80, 4-7 bp 0.80, >= 8 bp 0.45 (chosen on 23 development rounds). The cluster
+  decoder: Minos puts each inserted mutation on one copy at random and every read it edits for that copy carries all of
+  the copy's edits, so per cluster (>= 2 candidates within 20 bp, one an indel) the two local DNA copies are read off the
+  reads; every minimal-cost spelling of each copy is listed and a learned chooser picks Minos's (99.7% of copies on
+  held-out training rounds); only copies carried by edited reads are written, never the donor's records; where this
+  decode and the per-variant answer disagree a learned arbiter decides (held out: 265 clusters fixed, 38 broken in 108
+  training rounds). 23 development rounds: +0.0123 vs g042, +0.0027 vs g054 (13 better, 5 worse). Frozen rounds (82, from
+  2026-10-04 08:17, never used for a choice): +0.0273 per round vs g042, t 4.54, better 60, worse 22; missed / false
+  1-bp indels 611 / 301 -> 470 / 295, missed het SNPs 1120 -> 902. Builds take ~1 min longer.
 - Writing the person's records: exactly as Minos's truth writes them - NIST's REF, ALT order and genotype order
   (2|1 -> 2/1, `util.donor_records`). The validator classes a two-allele record by the allele its genotype names
   first; writing 1/2 for NIST's 2/1 moved ~20 records per round out of the >= 8 bp class (found by the search

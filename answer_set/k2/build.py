@@ -165,6 +165,17 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         bed = beds[info["mode_donor"]]
         allowed = lambda k: bed.contains(k[0]) and bed.contains(k[0] + len(k[1]) - 1)  # noqa: E731
     recs = assemble_records(keys, p_any, p_hom, thr, info["mode_giab"], donor, allowed)
+    n_clusters = None
+    if info["mode_giab"] and meta.get("cluster_decoder") and len(keys):
+        # edit-based cluster decoder (clusterdec.py): disputed clusters decided by its arbiter
+        import joblib
+        from answer_set.k2 import clusterdec, giab_origin
+        vname_ = (track_versions or {}).get(track) or tracks.active_name(track)
+        vd_ = tracks.vdir(track, vname_)
+        models_ = (joblib.load(vd_ / "cluster_chooser.joblib"), joblib.load(vd_ / "cluster_arbiter.joblib"))
+        op_ = giab_origin.path(info["mode_donor"], chrom, a, b)
+        recs, n_clusters = clusterdec.apply(recs, bam, ref_path(chrom), chrom, op_ if op_.exists() else None, donor,
+                                            out / "work", keys, p_any, p_hom, models_, meta["cluster_decoder"]["cut"])
     if isinstance(kg_own, int):                       # 1000G: the model's calls are the inserted mutations, flagged
         recs = [r[:4] + (k_ not in donor,) + r[5:] for r in recs for k_ in [(r[0], r[1], r[2])]]  # as Minos does
     n_windows = None
@@ -233,7 +244,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "gatk_person_error": (info.get("kg") or {}).get("gatk_person_error"),
         "donor_support": {d: round(v, 4) for d, v in info["donor_scores"].items()},
         "candidates": info["n_candidates"], "answer_set_size": len(recs),
-        "background_from_donor": len(donor), "model_calls": len(recs) - len(donor),
+        "clusters_replaced": n_clusters, "background_from_donor": len(donor), "model_calls": len(recs) - len(donor),
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
         "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok", "windows_replaced": n_windows,
