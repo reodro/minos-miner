@@ -394,10 +394,18 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
                     else:
                         origin = "far" if group == "far" else "step A"
                 ready.append((c, s, origin))
+        from search import excess
+        lanes_task = asyncio.ensure_future(excess.run_lanes(ctx, end_b))   # beside the seats (search/excess.py)
         try:
             await occupy(ctx, ready, end_b)
         except Exception:  # noqa: BLE001 - Step B failing must not skip Step C
             log.exception("engine: step B failed")
+        if not lanes_task.done():
+            lanes_task.cancel()
+        try:
+            await lanes_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001 - a lane must not stop the round
+            pass
         ctx.marks["b"] = ctx.elapsed()
         ctx.say("step B done at t+%.1fm: %s", ctx.elapsed() / 60,
                 " | ".join(f"c{d.id} {d.opened:.4f} -> {d.score:.4f} ({d.state}, {d.iteration} it)"

@@ -411,3 +411,39 @@ Warnings:
   competent field reaches a better core-at-FP curve than every config our searches scored.
 - Exact ties are rare outside plateaus like 20261012T115400Z's 89.9983; on most rounds this changes nothing.
 - The slice centre is an interpretation (median), not the config a line was actually sent from.
+## Excess lane (v9.18.2, 2026-10-14; off by default)
+
+`search/excess.py`, settings group `excess`. Off by default (`excess.lanes` 0): v9.18.2 with the lane off is v9.18.1.
+Turn it on with `excess.lanes` 1 to test it against v9.18.1 on the same code.
+
+**Why.** The whole competent field, not one king, reaches more true indels at the same false positives than our
+search: on 18 truth rounds 98-100% of field ranks 1-20 sit above our core-vs-FP curve (+0.003-0.004 core), at matched
+FP their SNP calls equal ours, and our evaluation is exact (30/30 configs byte-identical to stock GATK 4.5.0.0;
+plain-defaults submissions score identical to ours). The score blends core and FP, so a better trade-off can sit
+behind a score dip that a score-only climb never crosses (Brockhoff et al. 2009; Knowles, Watson and Corne 2001).
+Evidence: on 20261010T044200Z a climb on core-above-our-curve (test/niche_climb) reached core 0.8723 at FP 1353
+(the king: 0.8703 at 1232), +0.0040 above our curve, while its score went 82.7 -> 81.9 -> 82.2.
+
+**The measure.** J = core - the run's curve at FP clamped to [0.95, 1.05] x the best score's FP - the score's own price
+of each % of FP above that band, in core ((30 / 8N) exp(-FP / 8N) points per FP, 70 points per unit of core; about
+0.0009 core per % at 044200Z). The curve excludes the lane's own results.
+
+**Use.** `excess.lanes` lanes run beside Step B's seats: each starts at the best-J config at least
+`excess.start_far` (0.2) apart in settings from the best config, climbs on J (every setting +-1, 2, 4, 8 rungs; best
+single move or top-3 / top-6 combination), then climbs on the score from its J peak. Its results go to the store; the
+pick is still the highest score.
+
+**Warnings.**
+- Tight band (2026-10-14, test/conversion_sweep): with 0.90-1.15 and a token 0.0003 core per % above it, climbs
+  settled at 1.2x our FP (+0.0040 above our curve at 044200Z, score 82.24); cutting FP with the calling threshold, BQST
+  and contamination reached only 82.39 (our best 82.73) and halved the edge. The field's edge exists at our own FP
+  (82% of its top 40 within 0.97-1.03x our FP are above our curve, +0.0018), so J now looks there. Untested on a fleet.
+- The curve is dense only near the best score's FP. Comparing a config with the curve at its own FP far away let
+  climbs drift to FP 700-780 and look +0.01 to +0.08 "above" a thin curve; ranking out-of-band configs below the band
+  regardless of core made climbs trade any core for FP (test/region_hunt). The band-edge rule is the version that held.
+- The lane's gain on our side is shown on one round only (044200Z). On the binned (20261009T164200Z) and HG005
+  (20261012T033000Z) rounds a 4-pass hunt found no region above our curve (closest -0.001 / -0.002).
+- The lane spends fleet workers (one-setting passes of ~150 configs at GA priority). Its score conversion is a plain
+  greedy climb; whether it turns +0.0040 of J into points above our best is not yet measured on a real round.
+- Simulator (tests/test_excess.py): a lane started at J -0.0144 climbed to +0.0132 and its score to 94.65 (round best
+  94.71). The simulator's landscape is not GATK's.
