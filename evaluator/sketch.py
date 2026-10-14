@@ -48,8 +48,10 @@ def _gt(fmt: str, sample: str) -> str:
 
 
 def callset_sketch(vcf: str, k: int = K) -> Dict[str, object]:
-    """{"k": k, "n": {class: records}, "h": {class: base64 of the k smallest 32-bit hashes, ascending}}."""
+    """{"k": k, "n": {class: records}, "max_alts": most ALT alleles in one record,
+    "h": {class: base64 of the k smallest 32-bit hashes, ascending}}."""
     hashes: Dict[str, set] = {c: set() for c in CLASSES}
+    max_alts = 0
     opener = gzip.open if str(vcf).endswith(".gz") else open
     with opener(vcf, "rt") as f:
         for line in f:
@@ -58,11 +60,14 @@ def callset_sketch(vcf: str, k: int = K) -> Dict[str, object]:
             p = line.rstrip("\n").split("\t")
             if len(p) < 5:
                 continue
+            alts = [a for a in p[4].split(",") if a and a not in ("*", "<NON_REF>")]
+            if len(alts) > max_alts:
+                max_alts = len(alts)
             gt = _gt(p[8], p[9]) if len(p) > 9 else "."
             cls = _class_of(p[3], p[4].split(","), gt)
             digest = hashlib.blake2b(f"{p[0]}:{p[1]}:{p[3]}:{p[4]}:{gt}".encode(), digest_size=4).digest()
             hashes[cls].add(int.from_bytes(digest, "big"))
-    return {"k": k, "n": {c: len(h) for c, h in hashes.items()},
+    return {"k": k, "n": {c: len(h) for c, h in hashes.items()}, "max_alts": max_alts,
             "h": {c: pack(heapq.nsmallest(k, h)) for c, h in hashes.items()}}
 
 

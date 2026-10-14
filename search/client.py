@@ -201,6 +201,7 @@ class EvalClient:
                 self.latest[(cs.config_key, cs.fidelity)] = result
                 self._note_best(result)
                 self.store.add(result, config, cs.runtime_s, tag)
+                self.store.add_sketch(cs.round_id, cs.config_key, cs.fidelity, cs.sketch)
                 outcome.result = result
         if fut is not None and not fut.done():
             fut.set_result(outcome)

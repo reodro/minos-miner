@@ -1,4 +1,9 @@
-"""Step C: what Step B's grid did not look at, one setting at a time, from each peak (search/DESIGN.md, Step C).
+"""Step C: after the climbers stop, one fine-tune of the best config (search/DESIGN.md).
+
+The two GA generations that used to fill the time before this climb are gone. The fine-tune does not breed.
+
+The single-setting pass below is no longer the round's Step C. Step B's lines use the same rung plan, and the
+tests still call it.
 
 For every setting at a peak, the values already run with every other setting at the peak's values are looked up in
 the results. Then, on each side of the peak:
@@ -20,86 +25,45 @@ All of it goes out as one wave of single-setting changes. Then:
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from common.tuning import tune
 from common.types import Config
 from search.climb import Climber
-from search.space import GENOTYPING_PARAMS, PAIRHMM_PARAMS
+from search.lines import CHEAP, densest, gap, single, tried
 
-CHEAP = set(GENOTYPING_PARAMS) | set(PAIRHMM_PARAMS)
-DENSER = (1, 2, 4, 8, 16, 1000)          # far.coarse times this, the largest that still fits the wave's budget
-
-
-def tried(ctx, peak: Config) -> Dict[str, Dict[int, float]]:
-    """setting -> {rung: score} of the scored configs that differ from `peak` in that setting only."""
-    names = [n for n in ctx.space.names if ctx.ladders.movable(n)]
-    pp = peak.params
-    out: Dict[str, Dict[int, float]] = {n: {} for n in names}
-    for c, s in ctx.scored():
-        diff = None
-        for n in names:
-            if c.params.get(n) != pp.get(n):
-                if diff is not None:
-                    diff = "two"
-                    break
-                diff = n
-        if diff is None or diff == "two":
-            continue
-        out[diff][int(round(ctx.ladders.index(diff, c.params[diff])))] = s
-    return out
+log = logging.getLogger(__name__)
 
 
-def spread(lo: int, hi: int, n: int) -> List[int]:
-    """Up to n rungs from lo to hi inclusive, evenly spread, both ends included."""
-    if hi < lo:
-        return []
-    if hi - lo + 1 <= n:
-        return list(range(lo, hi + 1))
-    if n <= 1:
-        return [lo]
-    return sorted({int(round(lo + k * (hi - lo) / (n - 1))) for k in range(n)})
+def fine_tune_at(ctx) -> float:
+    """Clock time when the fine-tune starts: eight scaled minutes before the pick."""
+    return ctx.pick_at() - ctx.T(8 * 60)
 
 
-def plan(ctx, peak: Config, known: Dict[str, Dict[int, float]], coarse: int) -> Dict[str, List[int]]:
-    """setting -> the rungs to try: the gaps on both sides, and `coarse` rungs beyond each side's nearest tried one."""
-    out: Dict[str, List[int]] = {}
-    for n, have in known.items():
-        rungs = ctx.ladders.rungs[n]
-        p = int(round(ctx.ladders.index(n, peak.params.get(n))))
-        last = len(rungs) - 1
-        if n in CHEAP:
-            want = [i for i in range(len(rungs)) if i != p]
-        else:
-            want = []
-            up = min((i for i in have if i > p), default=None)
-            down = max((i for i in have if i < p), default=None)
-            if up is None:
-                want += [p + 1] + spread(p + 2, last, coarse) if p < last else []
-            else:
-                want += list(range(p + 1, up)) + spread(up + 1, last, coarse)
-            if down is None:
-                want += [p - 1] + spread(0, p - 2, coarse) if p > 0 else []
-            else:
-                want += list(range(down + 1, p)) + spread(0, down - 1, coarse)
-        out[n] = sorted({i for i in want if 0 <= i <= last and i != p and i not in have})
-    return out
-
-
-def gap(ctx, peak: Config, known: Dict[str, Dict[int, float]], name: str, rung: int) -> bool:
-    """Case 1: `rung` lies between the peak and the nearest tried value on its side."""
-    p = int(round(ctx.ladders.index(name, peak.params.get(name))))
-    have = known.get(name, {})
-    if rung > p:
-        up = min((i for i in have if i > p), default=None)
-        return up is not None and rung < up
-    down = max((i for i in have if i < p), default=None)
-    return down is not None and rung > down
-
-
-def single(ctx, peak: Config, name: str, rung: int) -> Optional[Config]:
-    return ctx.space._assemble({**peak.params, name: ctx.ladders.rungs[name][rung]})
-
+async def refine(ctx) -> None:
+    """The round's Step C. Climb the best config until the pick. A higher score restarts that climb. No GA."""
+    if ctx.over() or ctx.clock() >= ctx.pick_at():
+        return
+    horizon = ctx.pick_at()
+    top = ctx.best()
+    if top is None or ctx.clock() >= horizon:
+        ctx.say("step C: nothing left to fine-tune")
+        return
+    c, s = top
+    ctx.phase = "C: fine-tune"
+    ctx.say("step C: fine-tune %s opened at %.4f", c.key[:8], s)
+    cl = Climber(ctx, len(ctx.climbers), c, s, origin="step C")
+    from search.separate import enabled as separate_enabled
+    cl.compass_only = separate_enabled()
+    ctx.climbers.append(cl)
+    try:
+        await cl.run(horizon)
+    except Exception:  # noqa: BLE001 - the fine-tune must not end the round
+        log.exception("engine: step C fine-tune failed")
+        cl.state = "stopped"
+    ctx.say("step C: fine-tune %s %.4f -> %.4f (%s, %d it)", c.key[:8], s, cl.score, cl.state, cl.iteration)
+    ctx.publish(force=True)
 
 def second_highs(ctx, peak: Config, score: float, known: Dict[str, Dict[int, float]]) -> List[Tuple[float, str, int, int, int]]:
     """(score, setting, rung, low, high) of each second high point within far.second_margin of the peak: higher than its
@@ -138,13 +102,7 @@ async def one_pass(ctx, cl: Climber, budget: int, until: float) -> bool:
     """One Step C pass on climber `cl`'s peak. True when it moved the peak (and climbed on), False when final."""
     peak, score = cl.centre, cl.score
     known = tried(ctx, peak)
-    base = int(tune("far.coarse"))
-    chosen = plan(ctx, peak, known, base)
-    for f in DENSER:                                   # the densest coarse pass that fits this peak's share of the wave
-        p = plan(ctx, peak, known, base * f)
-        if sum(len(v) for n, v in p.items() if n not in CHEAP) > budget:
-            break
-        chosen = p
+    chosen = densest(ctx, peak, known, budget)
     configs = [single(ctx, peak, n, i) for n, rungs in chosen.items() for i in rungs]
     n_gap = sum(len(v) for v in chosen.values())
     entry = {"peak": cl.id, "pass": len([e for e in ctx.c_log if e["peak"] == cl.id]) + 1,
@@ -216,8 +174,27 @@ async def one_pass(ctx, cl: Climber, budget: int, until: float) -> bool:
     return False
 
 
+def share(ctx) -> int:
+    """A peak's share of the workers: the capacity over the climbers still at work (climbing or in Step C)."""
+    active = [c for c in ctx.climbers if c.parent is None and c.state not in ("joined", "landed")]
+    return max(1, ctx.cap // max(1, len(active)))
+
+
+async def improve(ctx, cl: Climber, until: float) -> None:
+    """Step C on one climber's peak, as soon as Step B has left it there; each pass repeated while it moves the peak."""
+    passes = 0
+    ctx.say("step C c%d: from the peak %.4f", cl.id, cl.score)
+    while ctx.clock() < until and not ctx.over():
+        passes += 1
+        if not await one_pass(ctx, cl, share(ctx), until):
+            break
+    if cl.state == "climbing":
+        cl.state = "stopped"
+    ctx.say("step C c%d: %d pass(es), final %.4f", cl.id, passes, cl.score)
+
+
 async def run(ctx, climbers: Sequence[Climber], until: float) -> None:
-    """Step C on every peak at once, each pass repeated while it moves its peak."""
+    """Step C on every distinct peak at once."""
     peaks: List[Climber] = []
     for c in climbers:
         if c.state in ("peak", "stopped") and all(c.centre.key != o.centre.key for o in peaks):
@@ -225,17 +202,4 @@ async def run(ctx, climbers: Sequence[Climber], until: float) -> None:
     if not peaks:
         ctx.say("step C: no peak")
         return
-    budget = max(1, ctx.cap // len(peaks))
-
-    async def improve(cl: Climber) -> None:
-        passes = 0
-        while ctx.clock() < until and not ctx.over():
-            passes += 1
-            if not await one_pass(ctx, cl, budget, until):
-                break
-        if cl.state == "climbing":
-            cl.state = "stopped"
-        ctx.say("step C c%d: %d pass(es), final %.4f", cl.id, passes, cl.score)
-
-    ctx.say("step C on %d peak(s): %s", len(peaks), ", ".join(f"c{c.id} {c.score:.4f}" for c in peaks))
-    await asyncio.gather(*(improve(c) for c in peaks))
+    await asyncio.gather(*(improve(ctx, c, until) for c in peaks))

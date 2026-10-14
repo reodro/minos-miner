@@ -99,20 +99,30 @@ KNOBS_LIST: List[Knob] = [
          "Share of wave 0 taken by portfolio seeds (the round's read-length profile first, never the round being "
          "replayed); the rest is a hypercube."),
     Knob("candidates.riders", 4, 0, 6, ROUND, "count", "Calling-threshold riders on each wave 0 point."),
-    Knob("candidates.generations", 3, 0, 6, LIVE, "count",
-         "Genetic generations after wave 0. The last one crosses the groups (core x fp, both x the others)."),
+    Knob("candidates.generations", 1, 0, 6, LIVE, "count",
+         "Genetic generations after wave 0. One: on 20261008T152900Z and 20261008T175300Z generation 1 raised the "
+         "best by 0.15-0.18, generation 2 raised it by nothing, and generation 3 by 0.037. Later generations are "
+         "not worth a fleet wave. Step C still breeds the cross (core x fp) itself."),
+    Knob("candidates.generation_min", 12.0, 2.0, 30.0, LIVE, "min",
+         "Minutes generation 1 is given after it is launched (scaled). The wave is waited until "
+         "candidates.launch_back of it is back. candidates.max_min does not abandon it."),
     Knob("candidates.launch_back", 0.8, 0.1, 1.0, LIVE, "share",
          "A generation launches once this share of the previous wave is back."),
     Knob("candidates.mutate_frac", 0.3, 0.0, 1.0, LIVE, "share",
-         "Share of the children that get candidates.mutate_axes settings redrawn anywhere on their ladder."),
-    Knob("candidates.mutate_axes", 2, 1, 10, LIVE, "count", "Settings redrawn in a mutated child."),
-    Knob("candidates.group_size", 20, 2, 200, LIVE, "count", "Parents per group (both, core, fp), chosen far apart."),
+         "Share of the children that get candidates.mutate_axes settings moved by one rung."),
+    Knob("candidates.mutate_axes", 2, 1, 10, LIVE, "count", "Settings a mutated child moves by one rung."),
+    Knob("candidates.elite_frac", 0.5, 0.0, 1.0, LIVE, "share",
+         "Step B leftover GA: this share of children use the current best as one parent (v9.17). "
+         "The rest stay within-group pairs. 0 turns elite-anchored breeding off."),
+    Knob("candidates.group_size", 60, 2, 200, LIVE, "count", "Parents per group (both, core, fp), each far from the others."),
     Knob("candidates.core_band", 0.01, 0.0, 0.2, LIVE, "score",
          "The core and fp groups take configs whose core is within this of the best core."),
-    Knob("candidates.max_min", 15.0, 2.0, 40.0, LIVE, "min", "Hard limit of Step A (scaled to the round)."),
-    Knob("candidates.workers_per_candidate", 500, 8, 5000, ROUND, "count",
-         "One climbing candidate per this many workers (at least one)."),
-    Knob("candidates.min_distance", 0.08, 0.0, 1.0, LIVE, "x",
+    Knob("candidates.max_min", 20.0, 2.0, 50.0, LIVE, "min",
+         "Safety limit of wave 0 only (scaled). On a heavy region that wave took about 10 minutes to come back. "
+         "Generation 1 is separate: candidates.generation_min, and it is waited out."),
+    Knob("candidates.workers_per_candidate", 243, 8, 5000, ROUND, "count",
+         "One climbing candidate per this many workers (at least one). 243 seats four on a 972-worker fleet."),
+    Knob("candidates.min_distance", 0.05, 0.0, 1.0, LIVE, "x",
          "Two candidates are at least this far apart by callset distance (class-weighted 1 - Jaccard)."),
     Knob("candidates.min_setting_distance", 0.05, 0.0, 1.0, LIVE, "x",
          "The same when a callset has no sketch: mean normalised setting difference."),
@@ -126,7 +136,15 @@ KNOBS_LIST: List[Knob] = [
          "1: a wave decides once its riders are back too. 0: once its grid points are back; riders that come back "
          "later count at the next decision."),
     Knob("climb.quorum", 1.0, 0.5, 1.0, LIVE, "share", "A wave counts as back at this share."),
-    Knob("climb.end_min", 50.0, 10.0, 72.0, LIVE, "min", "Step B ends here (scaled to the round); Step C follows."),
+    Knob("climb.end_min", 55.0, 10.0, 72.0, LIVE, "min",
+         "No longer the cut. Step B runs until the fine-tune, eight scaled minutes before the pick. "
+         "Kept so an older override still loads."),
+    Knob("climb.ga_quiet_min", 4.0, 1.0, 20.0, LIVE, "min",
+         "After a GA child or a candidate moves a climber, the climbers send nothing for this many "
+         "minutes (scaled) and the fleet breeds. Then one rung past the compass walks to the peak."),
+    Knob("climb.ga_open_min", 8.0, 1.0, 20.0, ROUND, "min",
+         "At the start of Step B the whole fleet breeds. Grids start once a free GA score beats the lowest "
+         "climber, or when this many minutes (scaled) have passed. One wave: usually 2-4 minutes, 6-8 on a long region."),
     Knob("far.coarse", 25, 3, 500, LIVE, "count",
          "Step C: rungs tried beyond the nearest tried value on each side of a peak, at least (more when the fleet has room)."),
     Knob("far.second_margin", 0.1, 0.0, 2.0, LIVE, "score",

@@ -6,7 +6,7 @@ rungs up or down the ladder.
     base_quality_score_threshold
     enums                          the allowed values in their published order; bools False, True
     active_probability_threshold   0.001 .. 0.05, step 0.001
-    contamination_fraction_...     0 .. 0.05, step 0.0025
+    contamination_fraction_...     0 .. 0.05, step 0.0025; rungs that remove the same number of reads are one rung
     standard_min_confidence_...    30 .. 100, step 1
     heterozygosity                 1e-4 .. 1e-2, 10 per decade (log)
     indel_heterozygosity           1e-5 .. 1e-3, 10 per decade (log)
@@ -37,7 +37,15 @@ def ladder(space, name: str) -> list:
         return list(range(int(lo), int(hi) + 1))
     if name in FLOAT_STEP:
         step = FLOAT_STEP[name]
-        return [round(lo + i * step, 6) for i in range(int(round((hi - lo) / step)) + 1)]
+        rungs = [round(lo + i * step, 6) for i in range(int(round((hi - lo) / step)) + 1)]
+        bounds = getattr(space, "bounds", None)
+        facts = getattr(bounds, "facts", None)
+        if name == "contamination_fraction_to_filter" and facts is not None and facts.depths:
+            from search.bamgroups import contamination_groups
+            reps = contamination_groups(facts.depths, float(lo), float(hi), step)
+            if reps:
+                return list(reps)
+        return rungs
     if name in FLOAT_LOG_PER_DECADE:
         k = FLOAT_LOG_PER_DECADE[name]
         return [float(f"{lo * 10 ** (i / k):.4g}") for i in range(int(round(math.log10(hi / lo) * k)) + 1)]

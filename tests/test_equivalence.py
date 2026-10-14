@@ -1,7 +1,7 @@
 import unittest
 
 from common.types import Config
-from evaluator.equivalence import BQST, MBQ, MMQ, MRPAS, RoundFacts, _class_low, canonical
+from evaluator.equivalence import BQST, CONT, MBQ, MMQ, MRPAS, RoundFacts, _class_low, canonical
 
 QUALS = frozenset({2, 14, 15, 16, 25, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40})   # round 20261004T092900Z
 FACTS = RoundFacts(QUALS, frozenset(range(61)), 22)
@@ -34,6 +34,20 @@ class EquivalenceTest(unittest.TestCase):
         self.assertIs(canonical(kept, FACTS), kept)                                # a threshold GATK rejects
         self.assertEqual(canonical(Config("gatk", {MRPAS: 300}), FACTS).key,
                          canonical(Config("gatk", {MRPAS: 25}), FACTS).key)        # no start has more than 22 reads
+
+    def test_contamination_fractions_that_remove_no_reads_are_one_run(self):
+        # Depths of 20261010T044200Z: max 71, so every fraction below 1/71 removes 0 reads.
+        depths = frozenset(i for i in range(1, 72) if i not in (64, 65))
+        facts = RoundFacts(QUALS, frozenset(range(61)), 22, depths=depths)
+        zero = canonical(Config("gatk", {CONT: 0.01}), facts)
+        self.assertEqual(zero.params[CONT], 0.0)
+        self.assertEqual(canonical(Config("gatk", {CONT: 0.0125}), facts).params[CONT], 0.0)
+        kept = canonical(Config("gatk", {CONT: 0.01875}), facts)          # removes a read at depth 54; not the zero class
+        self.assertEqual(kept.params[CONT], 0.01875)
+        self.assertNotEqual(canonical(Config("gatk", {CONT: 0.045}), facts).params[CONT],
+                            canonical(Config("gatk", {CONT: 0.0475}), facts).params[CONT])
+        bare = canonical(Config("gatk", {CONT: 0.01}), FACTS)              # no depths recorded: the fraction stays
+        self.assertEqual(bare.params[CONT], 0.01)
 
     def test_a_result_that_ran_as_another_config_is_also_found_under_its_own_name(self):
         import shutil

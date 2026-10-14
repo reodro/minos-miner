@@ -4,7 +4,9 @@
 
 replay  the whole miner on a stored round, as if live: real answer set, real GATK (batched), real scoring, the
         search part's searcher, dry-run submissions, a deadline `--minutes` from now. Then reports what it would have
-        submitted, and reviews the run (main.review): answer-set accuracy, TRUE scores, rank.
+        submitted, releases the fleet, and reviews the run here (main.review): answer-set accuracy, TRUE scores, rank.
+        `--no-review` stops after mining so a follow-up `python -m main review` can run while the next round takes
+        the fleet.
 live    the real miner (needs bittensor, httpx and a registered wallet; untested - try --demo first). Next to it
         main.review checks every 5 min whether a mined round's truth is out / the round is finalized, and reviews
         it then (answer-set accuracy, true scores, rank) - main's spare CPU is for this.
@@ -22,7 +24,7 @@ import time
 
 from common.params import ParamRanges
 from common.settings import SETTINGS, default_workers
-from common.store import ResultStore
+from common.store import ResultStore, clear_round
 from common.types import Round
 
 
@@ -74,7 +76,7 @@ def make_parts(rnd: Round, r: ParamRanges, submitter, workers: int, fleet=None, 
                  status=_board(), scoring=scoring)
 
 
-def replay(tag: str, minutes: float, workers: int, fleet=None, scoring=None) -> None:
+def replay(tag: str, minutes: float, workers: int, fleet=None, scoring=None):
     from backtest.data import load
     from main.miner import mine_round
     from main.submitter import DryRunSubmitter
@@ -87,11 +89,12 @@ def replay(tag: str, minutes: float, workers: int, fleet=None, scoring=None) -> 
     print(f"\n{tag}: {mined.mode} {mined.note} | {time.time() - t0:.0f}s")
     out = mined.outcome
     if not sub.sent:
-        print("nothing submitted"); return
+        print("nothing submitted")
+        return None
     if out:
         print(f"evaluated {out.evaluated}, failed {out.failed}, submissions {len(out.submissions)}; "
               f"local best {out.best.score if out.best else None}")
-    review_now(_board().state.get("round", {}).get("run_id"))
+    return _board().state.get("round", {}).get("run_id")
 
 
 def review_now(run_id: str) -> None:
@@ -122,6 +125,8 @@ def main() -> None:
     sp = ap.add_subparsers(dest="cmd", required=True)
     a = sp.add_parser("replay"); a.add_argument("tag"); a.add_argument("--minutes", type=float, default=15)
     a.add_argument("--workers", type=int, default=default_workers())
+    a.add_argument("--no-review", action="store_true",
+                   help="do not review after mining; the fleet is free for the next round")
     b = sp.add_parser("live"); b.add_argument("--wallet", required=True); b.add_argument("--hotkey", required=True)
     b.add_argument("--demo", action="store_true"); b.add_argument("--workers", type=int, default=default_workers())
     c = sp.add_parser("review"); c.add_argument("run", help="run id (<tag>-<epoch>) or round tag (its newest run)")
@@ -131,6 +136,8 @@ def main() -> None:
                        help="run GATK and scoring on the sub-VPSs in the inventory (over ssh) instead of here")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from common.limits import raise_open_files
+    raise_open_files()                            # main's local workers and fleet sessions hold many files at once
     if args.cmd == "review":
         from main.review import find_run
         review_now(find_run(args.run)); return
@@ -140,9 +147,10 @@ def main() -> None:
     import evaluator
     fleet = evaluator.fleet_executor(args.fleet) if args.fleet else None
     scoring = None if fleet is not None else evaluator.scoring_pool(args.workers)   # the nodes score on a fleet
+    run_id = None
     try:
         if args.cmd == "replay":
-            replay(args.tag, args.minutes, args.workers, fleet, scoring)
+            run_id = replay(args.tag, args.minutes, args.workers, fleet, scoring)
         else:
             from main.review import Reviewer
             Reviewer(board=_board()).start()                  # every 5 min: truth out? finalized? -> review / rank
@@ -156,6 +164,9 @@ def main() -> None:
             fleet.close()                         # every node agent stops and kills its GATK containers
         if scoring is not None:
             scoring.close()
+    if args.cmd == "replay" and run_id and not args.no_review:
+        logging.info("fleet released; review runs here")
+        review_now(run_id)
 
 
 if __name__ == "__main__":

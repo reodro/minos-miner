@@ -597,6 +597,34 @@ class SpaceTest(unittest.TestCase):
         self.assertEqual(fixed._assemble({MRPAS: 116}).params[MRPAS], 25)
         self.assertIsNone(bam_bounds("/nonexistent.bam", ranges()))
 
+    def test_contamination_rungs_that_remove_the_same_number_of_reads_are_one_rung(self):
+        from search.bamgroups import CONT, BamFacts, bounds_from, contamination_groups, snap
+        from search.space import Space
+        from search.steps import Ladders
+        depths = frozenset(i for i in range(1, 72) if i not in (64, 65))
+        facts = BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13, depths)
+        reps = contamination_groups(depths, 0.0, 0.05)
+        self.assertEqual(reps[0], 0.0)
+        self.assertNotIn(0.0025, reps)
+        self.assertNotIn(0.0125, reps)
+        self.assertIn(0.015, reps)
+        self.assertIn(0.045, reps)
+        self.assertIn(0.0475, reps)
+        self.assertLess(len(reps), 21)
+        bounds = bounds_from(facts, ranges())
+        self.assertNotIn(CONT, bounds.groups)                 # allowed would encode an off-ladder fraction as rung 0
+        self.assertIn(f"{CONT} 21 -> {len(reps)}", bounds.report)
+        sp = Space(ranges(), bounds=bounds)
+        self.assertEqual(Ladders(sp).rungs[CONT], list(reps))
+        self.assertEqual(sp._assemble({CONT: 0.01}).params[CONT], 0.0)
+        self.assertEqual(sp._assemble({CONT: 0.01875}).params[CONT], 0.01875)
+        self.assertEqual(snap(facts, CONT, 0.005, mmq=0, lo=0.0, hi=0.05), 0.0)
+        shallow = BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13, frozenset(range(1, 11)))
+        one = bounds_from(shallow, ranges())
+        fixed = Space(ranges(), bounds=one)
+        self.assertEqual(Ladders(fixed).rungs[CONT], [0.0])    # depth 10 removes nothing anywhere on the ladder
+        self.assertEqual(fixed._assemble({CONT: 0.04}).params[CONT], 0.0)
+
     def test_snapping_keeps_every_class_the_bam_can_tell_apart(self):
         """A representative has to be the same GATK run as the value it replaces, and every coarser class has to
         stay reachable from the finest list. Checked against the executor's own canonical() on four BAM shapes."""
@@ -683,6 +711,21 @@ class PortfolioTest(unittest.TestCase):
         self.assertEqual([c.key for c in current.portfolio()], [cfg.key])   # the later round never leaks back
         self.assertEqual(past.portfolio(), [])
         self.assertEqual(ResultStore(os.path.join(d, "scratch.sqlite")).portfolio(), [])
+
+    def test_clearing_one_round_leaves_the_others(self):
+        import os
+        import tempfile
+        from common.store import clear_round
+        d = tempfile.mkdtemp()
+        tag = "20261011T141800Z"
+        kept = "20261010T141800Z"
+        os.close(os.open(os.path.join(d, tag + ".sqlite"), os.O_CREAT | os.O_WRONLY, 0o644))
+        os.close(os.open(os.path.join(d, tag + ".sqlite-wal"), os.O_CREAT | os.O_WRONLY, 0o644))
+        os.close(os.open(os.path.join(d, kept + ".sqlite"), os.O_CREAT | os.O_WRONLY, 0o644))
+        self.assertEqual(clear_round(d, tag), 2)
+        self.assertFalse(os.path.exists(os.path.join(d, tag + ".sqlite")))
+        self.assertFalse(os.path.exists(os.path.join(d, tag + ".sqlite-wal")))
+        self.assertTrue(os.path.exists(os.path.join(d, kept + ".sqlite")))
 
 
 class RoundSafetyTest(unittest.TestCase):

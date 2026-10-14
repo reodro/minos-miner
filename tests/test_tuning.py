@@ -76,7 +76,7 @@ class TuningTest(unittest.TestCase):
         self.t.round_started()
         self.write({"candidates.workers_per_candidate": 100, "candidates.mutate_frac": 0.1})
         self.assertEqual(self.t.get("candidates.mutate_frac"), 0.1)               # live: now
-        self.assertEqual(self.t.get("candidates.workers_per_candidate"), 500)     # round: waits
+        self.assertEqual(self.t.get("candidates.workers_per_candidate"), 243)     # round: waits
         self.assertEqual(self.t.snapshot()["pending"], {"candidates.workers_per_candidate": 100})
         self.t.round_ended()
         self.assertEqual(self.t.get("candidates.workers_per_candidate"), 100)

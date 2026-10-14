@@ -17,9 +17,13 @@ Proven from the 4.5.0.0 source (and the batching patch, which keeps these call s
 - base_quality_score_threshold (bqst): compared as q < bqst on q = min(qual, read MAPQ) (PairHMMLikelihoodCalculation
   Engine.capMinimumReadQualities), reads with MAPQ < min_mapping_quality_score having been filtered out. Two
   thresholds are the same run when no such q lies in [low, high). Values below 6 are left alone (GATK rejects them).
+- contamination_fraction_to_filter: AlleleBiasedDownsamplingUtils.selectAlleleBiasedEvidence removes
+  (int)(totalEvidence * fraction) reads. Two fractions are the same run when that count agrees at every pileup
+  depth the BAM contains. A fraction the 0.0025 ladder does not represent is left as written.
 
 Everything is conservative: the value sets come from every read in the BAM (a superset of what any config reads),
-always include 0 and 20, and every mapping quality the filter can let through.
+always include 0 and 20, and every mapping quality the filter can let through. Coverage is the raw pileup, a
+superset of the reads that reach genotyping.
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ OVERLAP_QUALS = (0, 20)        # FragmentUtils: conflicting mates -> 0; agreeing
 MIN_USABLE_Q = 6               # QualityUtils.MIN_USABLE_Q_SCORE: GATK refuses a lower base_quality_score_threshold
 MRPAS, MBQ, BQST, MMQ = ("max_reads_per_alignment_start", "min_base_quality_score", "base_quality_score_threshold",
                          "min_mapping_quality_score")
+CONT = "contamination_fraction_to_filter"
+CONT_STEP = 0.0025                 # the search ladder; same constant as search/bamgroups.py
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,7 @@ class RoundFacts:
     mapqs: FrozenSet[int]          # every mapping quality in the BAM
     max_reads_per_start: int       # most reads sharing one assigned start position
     reads: int = 0
+    depths: FrozenSet[int] = frozenset()   # pileup depths; empty leaves contamination alone
 
     @property
     def compared_quals(self) -> list:
@@ -58,6 +65,7 @@ def scan(bam: str) -> RoundFacts:
     best = run = 0
     last = None
     n = 0
+    events = []
     with pysam.AlignmentFile(bam) as f:
         for r in f.fetch(until_eof=True):
             n += 1
@@ -75,9 +83,23 @@ def scan(bam: str) -> RoundFacts:
             run = run + 1 if pos == last else 1
             last = pos
             best = max(best, run)
+            end = r.reference_end
+            if end is None or end <= r.reference_start:
+                continue
+            events.append((r.reference_start, 1))
+            events.append((end, -1))
+    events.sort()
+    depth = 0
+    prev = None
+    seen_depth = set()
+    for pos, delta in events:
+        if prev is not None and pos > prev and depth > 0:
+            seen_depth.add(depth)
+        depth += delta
+        prev = pos
     for v in set(chunk):
         seen_q[v] = 1
-    return RoundFacts(frozenset(i for i in range(256) if seen_q[i]), frozenset(mapqs), best, n)
+    return RoundFacts(frozenset(i for i in range(256) if seen_q[i]), frozenset(mapqs), best, n, frozenset(seen_depth))
 
 
 def _class_low(value: int, values: list, closed: bool) -> int:
@@ -106,6 +128,16 @@ def canonical(config: Config, facts: Optional[RoundFacts]) -> Config:
         capped = {min(q, m) for q in facts.compared_quals for m in facts.mapqs if m >= mmq}
         low = _class_low(v, sorted(capped), closed=False)
         p[BQST] = max(low, MIN_USABLE_Q)
-    for k in (MRPAS, MBQ, BQST):
+    v = p.get(CONT)
+    if facts.depths and isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 0.05:
+        ordered = tuple(sorted(d for d in facts.depths if d > 0))
+        sig = tuple(int(d * float(v)) for d in ordered)
+        n = int(round(0.05 / CONT_STEP))
+        for i in range(n + 1):
+            rep = round(i * CONT_STEP, 6)
+            if tuple(int(d * rep) for d in ordered) == sig:
+                p[CONT] = rep
+                break
+    for k in (MRPAS, MBQ, BQST, CONT):
         changed |= p.get(k) != config.params.get(k)
     return Config(config.tool, p) if changed else config

@@ -50,7 +50,8 @@ Design and the evidence behind it: [DESIGN.md](DESIGN.md). Three steps, one afte
 | `engine.py` | runs A -> B -> C on a 72-minute schedule scaled to the round, then climbs again from the best config off every hill climbed so far until the pick (the highest local score, `far.pick_s` before the end); publishes `client.notes["engine"]` |
 | `candidates.py` | Step A: wave 0 (defaults, the official seed, up to 40% portfolio seeds, a Latin hypercube; 4 calling-threshold riders each), then 3 genetic generations bred from three groups of the scored configs (both: the Pareto front on core and false positives; core: highest core; fp: fewest false positives within 0.01 of the best core), 30% of children with 2 settings redrawn; then one candidate per 500 workers, far apart by callset distance |
 | `climb.py` | Step B: each candidate climbs to its peak. Every combination of 5 settings at -d, 0, +d (odd iterations the read-pass settings, even ones 5 of the 7 assembly/activity settings in turn); the cheap settings ride on every point at +-d, and in pairs on the centre's run; the best point is the new centre; a winning setting's step grows in the next grid (2d, 3d...) while it keeps winning; 20 random jumps at a stall |
-| `far.py` | Step C: from every peak, one setting at a time, the rungs step growth jumped over and the rungs beyond the nearest tried value; a better point, or a second high point that wins its short climb, moves the peak and Step B climbs on |
+| `lines.py` | a setting's line through a config: the values already run with everything else equal, and the gaps and rungs beyond to try next (Step B's lines, Step C) |
+| `far.py` | Step C, on each climber as soon as it peaks: from every peak, one setting at a time, the rungs step growth jumped over and the rungs beyond the nearest tried value; a better point, or a second high point that wins its short climb, moves the peak and Step B climbs on |
 | `steps.py` | each setting's ladder: its values at the agreed resolution (d = one rung) |
 | `distance.py` | callset distance (class-weighted 1 - Jaccard from the sketches on every CallSet); setting distance when a sketch is missing |
 | `portfolio.py` | the opening's seeds: the legacy portfolio and our reviewed runs, the round's read-length profile first, never the replayed round's own |
@@ -62,7 +63,7 @@ Design and the evidence behind it: [DESIGN.md](DESIGN.md). Three steps, one afte
 ## Engine versions
 
 How v4 got here, version by version, is [v422/DEVELOPMENT.md](v422/DEVELOPMENT.md). The table below is the measured
-record up to v4.8; v9 has no fleet run yet.
+record up to v4.8. The v9 fleet runs are under it.
 
 All on round 2026-10-02 09:29 (field best 89.912, 66 rows), 72-minute fleet runs unless noted. TRUE = scored on the
 released truth; one run's noise is 0.04-0.08 TRUE.
@@ -84,6 +85,9 @@ released truth; one run's noise is 0.04-0.08 TRUE.
 | v4.6 | (this tree) | no merge at minute 34 or 50. All 12 opening centres climb at once. Fleet replay of 20261007T070500Z is in progress on this code | | | | |
 | v4.7 | (this tree) | six of the twelve centres climb. The other six are held and swapped in, one at a time, for a basin whose first scan gained under 0.05. Not on the fleet | | | | |
 | v4.8 | (this tree) | a basin whose best has not moved for 10 minutes is retired and the next candidate takes its workers. Not on the fleet | | | | |
+| v9.1 | 10c1a91, uncommitted | oracle replay of 20261009T010600Z, chr13:74727001-84995000, true N 702, 972 workers. Step A ran 3 generations and kept 2,545 extra seats; Step B's 3 climbers were stopped by the clock still gaining; Step C's fine-tune added 0.033. Rank 1's core is 0.8739 at 1224 region FP; this pick is core 0.8689 at 1192. The review on main did not rescore: chr13's reference is not on this host, so TRUE is the fleet's oracle score | 27K | 85.086 | 85.086 | 31 of 70 |
+
+v9.1 on 20261009T010600Z (field best 85.2974, gap 0.212, median 85.067). Oracle answer set, so the search score is TRUE. Pick `4dee856739fa524e`, 85.0856. Wave 0 at t+0.4m opened the climb at 84.7900 (`79b24792`, core 0.8653, 1202 FP), 84.7608 (`830d622f`, core 0.8646, 1198 FP) and 84.0959 (`166d49f4`, core 0.8731, 1497 FP). The seat list was ready at t+25m, after about 11 minutes in the distance scan, with 3 seats climbing and 2,545 waiting on a peak. None of the three peaked: Step B ended at t+49.3m, stopped, at 85.0415, 85.0047 and 84.8049. Step C's generation reached 85.0527 (`fe0b7813`); the fine-tune moved the gap penalty from 26 to 5 and stopped at t+69.5m on 85.0856. 26,939 configs scored, 3,645 failed, 2,960 of them a graph crash that took the batch down. Nothing scored reached 85.10. With region FP at or below 1300 the highest core was 0.8718.
 
 What each step taught: riders inflate counts without information (v1); best-of-sweep beats first accept and stale
 centres (v2); random shakes on spare workers win nothing after the first 20 minutes (v3); fine steps pay late in the

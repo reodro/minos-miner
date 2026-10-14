@@ -36,10 +36,16 @@ class SimExecutor:
         self._done: Dict = {}
         self._ready: List[CallSet] = []
         self._cancelled = set()
+        self._branches: Dict = {}                 # (config key, fidelity) -> branch key: packing asks for it often
 
     def _branch(self, job: EvalJob):
         f = getattr(self.runner, "branch_key", None)
-        return f(job.config, job.fidelity) if f else None
+        if f is None:
+            return None
+        k = (job.config.key, job.fidelity)
+        if k not in self._branches:
+            self._branches[k] = f(job.config, job.fidelity)
+        return self._branches[k]
 
     def _drop_cancelled(self, job: EvalJob) -> None:
         k = job_key(job)

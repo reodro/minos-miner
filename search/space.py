@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 
 from common.params import ParamRanges, ParamSpec
 from common.types import Config
-from search.bamgroups import BQST, MBQ, MMQ, MRPAS, snap
+from search.bamgroups import BQST, CONT, MBQ, MMQ, MRPAS, snap
 
 
 # emit_ref_confidence: GVCF / BP_RESOLUTION make GATK write reference blocks; hap.py rejects that output on the
@@ -84,8 +84,9 @@ class Space:
                  caps: Optional[Dict[str, object]] = None, bounds=None):
         """`caps`: upper bounds the round's data sets (bam_caps), on top of FLOORS; values beyond them are never
         proposed and are clamped when a config comes from outside (a seed, a portfolio member).
-        `bounds`: a BamBounds from this round's BAM. The three settings it groups are proposed only at their
-        representatives, and a config from outside is snapped onto those representatives."""
+        `bounds`: a BamBounds from this round's BAM. The settings it groups are proposed only at their
+        representatives, and a config from outside is snapped onto those representatives. Contamination fractions
+        that remove the same number of reads at every observed depth share one ladder rung."""
         self.ranges, self.tool = ranges, tool
         self.bounds = bounds
         specs = ranges.tools[tool]
@@ -129,7 +130,8 @@ class Space:
         spec = self.specs[name]
         if spec.min is None or spec.max is None:
             return value
-        return snap(self.bounds.facts, name, value, mmq=mmq, lo=int(spec.min), hi=int(spec.max))
+        lo, hi = (float(spec.min), float(spec.max)) if name == CONT else (int(spec.min), int(spec.max))
+        return snap(self.bounds.facts, name, value, mmq=mmq, lo=lo, hi=hi)
 
     def _to_unit(self, s: ParamSpec, v) -> float:
         if s.allowed:
@@ -181,7 +183,7 @@ class Space:
         if self.bounds is not None:
             mmq = full.get(MMQ, self._mmq_floor)
             mmq = int(mmq) if isinstance(mmq, (int, float)) and not isinstance(mmq, bool) else self._mmq_floor
-            for n in (MBQ, BQST, MRPAS):
+            for n in (MBQ, BQST, MRPAS, CONT):
                 if n in full and n in self.specs:
                     full[n] = self._snap(n, full[n], mmq)
         if self.reductions is not None:
