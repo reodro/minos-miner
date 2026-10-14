@@ -92,6 +92,7 @@ import random
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+from common.limits import VALIDATOR_RUN_S
 from common.params import ParamRanges
 from common.tuning import tune
 from common.types import FULL, Config
@@ -258,6 +259,10 @@ class Context:
         top = self.best()
         if top is not None and top[0].key != self.client.pick_key:
             self.client.pick_key = top[0].key
+            if top[0].key in getattr(self.client, "slow", ()):
+                cs = self.client.callsets.get((top[0].key, FULL))
+                self.say("WARNING: the pick %s ran %.0f s here, over the validator's %d s limit per run",
+                         top[0].key[:8], getattr(cs, "runtime_s", 0) or 0, VALIDATOR_RUN_S)
             self.picked = {"key": top[0].key, "score": round(top[1], 4), "at_s": round(self.elapsed(), 1)}
             self.say("pick %s (%.4f) at t+%.1fm", top[0].key, top[1], self.elapsed() / 60)
 

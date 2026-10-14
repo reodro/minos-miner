@@ -240,6 +240,16 @@ def bounds_from(facts: BamFacts, ranges: ParamRanges, tool: str = "gatk") -> Bam
     if span and facts.mapqs and mmq_spec is not None and mmq_spec.min is not None:
         lo, hi, _n = span
         usable = hi - max(lo, MIN_USABLE_Q) + 1     # GATK rejects a threshold below 6
+        # A threshold above every base quality lowers every base to MIN_USABLE_Q (6), below the lowest
+        # min_base_quality_score the platform allows (10): the run calls nothing. On a binned Q30 BAM that is 31, on
+        # a Q41 BAM 42 (2026-10-14; 3-7% of a binned round's opening scored 0). Capped like MBQ, while MBQ's floor is
+        # above MIN_USABLE_Q.
+        mbq_spec = specs.get(MBQ)
+        top = max(facts.quals) if facts.quals else None
+        if (top is not None and top < hi and mbq_spec is not None and mbq_spec.min is not None
+                and int(mbq_spec.min) > MIN_USABLE_Q):
+            caps[BQST] = max(top, MIN_USABLE_Q)
+            hi = max(max(lo, MIN_USABLE_Q), top)
         reps = bqst_groups(facts, int(mmq_spec.min), lo, hi)
         full[BQST], count[BQST] = usable, len(reps)
         if 1 < len(reps) < usable:

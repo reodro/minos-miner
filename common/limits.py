@@ -29,3 +29,18 @@ def raise_open_files() -> tuple:
         return (soft, soft)
     log.info("open-file limit raised from %d to %d", soft, want)
     return (soft, want)
+
+
+# The validator kills a GATK run after this many seconds (minos_subnet PR #40, 2026-10-08:
+# VALIDATOR_VARIANT_CALLING_TIMEOUT_SECONDS, default 900; it was 3600). Our runs may take 1800 s, so a config can score
+# here and fail on the platform. Validators use 2-8 threads and we use 1, so a run over the limit here is a warning,
+# not a certain failure there.
+VALIDATOR_RUN_S = 900
+
+
+def over_validator_limit(runtime_s) -> bool:
+    """True when a run of ours took longer than the validator allows one."""
+    try:
+        return runtime_s is not None and float(runtime_s) > VALIDATOR_RUN_S
+    except (TypeError, ValueError):
+        return False

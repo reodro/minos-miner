@@ -58,7 +58,9 @@ def bam_caps(bam: str, chrom: str, start: int, end: int, reads: int = 20000) -> 
                     break
     except Exception:  # noqa: BLE001 - no BAM, no index, no pysam: no caps
         return {}
-    return {"min_base_quality_score": int(top)} if n else {}
+    # base_quality_score_threshold above that maximum lowers every base below any allowed min_base_quality_score:
+    # also nothing called (search/bamgroups.py, bounds_from).
+    return {"min_base_quality_score": int(top), "base_quality_score_threshold": max(int(top), 6)} if n else {}
 
 # Copied from evaluator.gatk.BRANCH groups. Search must not import evaluator (CONTRIBUTING.md).
 GENOTYPING_PARAMS = ("standard_min_confidence_threshold_for_calling", "indel_heterozygosity",
