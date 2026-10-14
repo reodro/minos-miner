@@ -130,6 +130,9 @@ KNOBS_LIST: List[Knob] = [
          "Settings in each grid (every combination at -d, 0, +d: 3^n points)."),
     Knob("climb.accept_min", 0.005, 0.0, 0.1, LIVE, "score",
          "An iteration gaining less than this has failed; both grid kinds failing in a row is a stall."),
+    Knob("climb.plateau_interval", 1, 0, 1, LIVE, "flag",
+         "1: on an exact score tie, the plateau probe centres on the tied config nearest the per-setting intervals "
+         "and sends the rung toward each interval first (search/plateau.py). It never accepts a move."),
     Knob("climb.random_jumps", 20, 0, 500, LIVE, "count",
          "At a stall: random local jumps (2-4 settings, 2-5 rungs each); one that gains climb.accept_min resumes the grid."),
     Knob("climb.wait_riders", 0, 0, 1, LIVE, "count",

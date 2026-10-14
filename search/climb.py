@@ -1271,8 +1271,25 @@ def _probe_value(ctx, centre: Config, name: str, base: float, known: Dict[int, f
     return None if best is None else best[1]
 
 
+def _probe_side(ctx, centre: Config, name: str, base: float, known: Dict[int, float], direction: int):
+    """_probe_value on one side only: the nearest untried rung in `direction`, None when that side is closed."""
+    current = centre.params.get(name)
+    k = direction
+    while True:
+        v = ctx.ladders.shift(name, current, k)
+        if v is None:
+            return None
+        i = int(round(ctx.ladders.index(name, v)))
+        if i not in known:
+            return v
+        if base - known[i] >= PROBE_LOSS:
+            return None
+        k += direction
+
+
 def next_probes(ctx, centre: Config, base: float) -> List[Config]:
-    """One untried rung of each setting the plateau holds at a single value.
+    """One untried rung of each setting the plateau holds at a single value (two when search/plateau.py knows the
+    setting's interval: the rung toward it first, the opposite rung after every first rung).
 
     The plateau is every config with score `base`. A setting that already varies inside it is the same callset
     and is not probed. A probe changes one locked setting and leaves the rest of the centre alone.
@@ -1298,17 +1315,28 @@ def next_probes(ctx, centre: Config, base: float) -> List[Config]:
         seen.update(c.key for c in getattr(cl, "pending", ()))
         seen.update(getattr(cl, "waiting", {}))
         seen.update(c.key for c in getattr(cl, "later", ()))
-    out = []
+    # search/plateau.py: a locked setting whose interval lies to one side sends the rung toward it first; the
+    # opposite rung goes after every first rung (sent when a worker is free). No interval: the nearest untried rung.
+    from search import plateau
+    iv = plateau.intervals(ctx) if plateau.enabled() else {}
+    first, second = [], []
     for n in locked:
-        value = _probe_value(ctx, centre, n, base, known[n])
-        if value is None:
-            continue
-        c = ctx.space._assemble({**centre.params, n: value})
-        if c is None or c.key in seen or not ctx.fresh(c):
-            continue
-        seen.add(c.key)
-        out.append(c)
-    return out
+        d = plateau.direction(ctx, centre, n, iv) if iv else 0
+        if d == 0:
+            picks = [(first, _probe_value(ctx, centre, n, base, known[n]))]
+        else:
+            toward = _probe_side(ctx, centre, n, base, known[n], d)
+            away = _probe_side(ctx, centre, n, base, known[n], -d)
+            picks = [(first, toward), (second, away)] if toward is not None else [(first, away)]
+        for tier, value in picks:
+            if value is None:
+                continue
+            c = ctx.space._assemble({**centre.params, n: value})
+            if c is None or c.key in seen or not ctx.fresh(c):
+                continue
+            seen.add(c.key)
+            tier.append(c)
+    return first + second
 
 
 def _queue_probes(ctx, n: int) -> Optional[list]:
@@ -1334,7 +1362,8 @@ def _queue_probes(ctx, n: int) -> Optional[list]:
     if getattr(ctx, "_probe_base", None) == base and (
             any(c.key in keys for c in owner.pending) or any(k in keys for k in owner.waiting)):
         return None
-    probes = next_probes(ctx, owner.centre, base)
+    from search.plateau import centre_of_flat
+    probes = next_probes(ctx, centre_of_flat(ctx, base, owner.centre), base)   # the tied config nearest the intervals
     ctx._probe_base = base
     if not probes:
         if len([1 for _, s in ctx.scored() if s == base]) >= 2:

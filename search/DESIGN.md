@@ -391,3 +391,23 @@ Built in v9.30. One climber finishes a compass on the highest score. The other c
   (legacy).
 - Run-to-run noise is 0.04–0.08 TRUE, so one pair of runs on one round decides nothing: at least 3 rounds.
 - Report: final TRUE, rank, gap to #1, and per step (A: best candidate TRUE; B: gain per candidate; C: gain).
+
+## Plateau second score (v9.18.1, 2026-10-14)
+
+`search/plateau.py`, setting `climb.plateau_interval` (1; 0 = the v9.18 probe). The blended score stays the only number
+that accepts a move. On an exact score tie (a flat) a second score orders the plateau probe: the probe centres on the
+tied config with the highest second score, and on each locked setting the rung toward that setting's interval goes
+first, the opposite rung after every first rung (sent when a worker is free). Settings without an interval keep the
+nearest untried rung (Brockhoff et al. 2009: a second measure removes a flat and helps only when it points at the exit).
+
+Second score: per setting, slices of one-setting lines (every other setting fixed) whose scores span more than 0.10;
+per rung, its gain over the slice's centre (the slice's median score: stored runs do not say which config a line was
+sent from); the interval = rungs whose average gain is within 0.05 of the best; the score = minus the rungs outside
+each interval over the ladder length, summed over settings that have one.
+
+Warnings:
+- It only reorders probes on exact ties; it points at where one-setting moves already raised the score, so it cannot
+  reach a higher region no one-setting move has reached. Our audit (2026-10-13) puts the gap to the field there: the
+  competent field reaches a better core-at-FP curve than every config our searches scored.
+- Exact ties are rare outside plateaus like 20261012T115400Z's 89.9983; on most rounds this changes nothing.
+- The slice centre is an interpretation (median), not the config a line was actually sent from.
