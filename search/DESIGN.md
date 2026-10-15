@@ -447,3 +447,32 @@ pick is still the highest score.
   greedy climb; whether it turns +0.0040 of J into points above our best is not yet measured on a real round.
 - Simulator (tests/test_excess.py): a lane started at J -0.0144 climbed to +0.0132 and its score to 94.65 (round best
   94.71). The simulator's landscape is not GATK's.
+
+## Tie walk (v9.18.3, 2026-10-15)
+
+`search/climb.py` (`Climber.tie_walk_heads`), setting `climb.tie_walk` (4 rungs; 0 = v9.18.2). The blended score still
+accepts every move. A grid wave that gains nothing (no head, line point or rider above the centre) walks each
+one-setting line whose head tied the centre exactly: every untried rung on that line out to `climb.tie_walk` rungs from
+the centre goes in one more wave, before the grid closes and its settings count as flat. A rung that already scored
+differently ends its line. Lines on the side of search/plateau.py's interval go first (the v9.18.1 second score now
+steers a walk across the flat, as in Brockhoff et al. 2009, not only the order of one-rung probes).
+
+**Why.** Before, `land()` stepped past a tied rung only on the next visit to that setting; a grid with no gain marked its
+settings flat, and once every setting was flat the climber jumped at random or stopped. A flat exit 2-4 rungs out was
+rarely reached. The v9.18.1 tie-break never acted in the 20261014T213000Z fleet run (0 centre moves): with 324 workers
+every one-rung probe goes in the same wave, so ordering alone changes nothing.
+
+**Evidence (20261014T213000Z, scored against the released truth).** Around our two peaks (v9.18.2 final 87.616, the
+bridge test's best 87.624), 25 of 69 one-rung neighbours tied exactly: 16 byte-identical VCFs, 9 with the same calls and
+genotypes (only QUAL moved, by <= 0.03 on average), none with a different call. So no second score computed from the
+output (core and FP, call counts, QUAL) can order those ties; the second score has to come from the settings.
+Extending every tied line 2-4 rungs (test/wide_flat, 210 configs): 8 higher, best +0.017 (max haplotypes 17 -> 13) and
++0.027 (mmq 3 -> 4, two rungs on the ladder; FP 1085 -> 1078); 196 still tied; none of 135 pairs of tied moves rose.
+
+**Warnings.**
+- Expected gain is small: about +0.01 to +0.03 per round. The gap to the field on that round is 0.17 and sits on a
+  different hill (test/local_peak: both peaks are local peaks; no one-rung move gains more than +0.007).
+- Cost: one extra wave per failed grid that had a tie, up to about 3 x (tied lines) runs. On a small fleet that is time
+  the climb does not spend elsewhere.
+- Pairs of tied moves gained nothing on the one round measured, so the walk stays on one setting at a time.
+- Measured on one round only.

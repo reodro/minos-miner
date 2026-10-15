@@ -134,6 +134,9 @@ KNOBS_LIST: List[Knob] = [
     Knob("climb.plateau_interval", 1, 0, 1, LIVE, "flag",
          "1: on an exact score tie, the plateau probe centres on the tied config nearest the per-setting intervals "
          "and sends the rung toward each interval first (search/plateau.py). It never accepts a move."),
+    Knob("climb.tie_walk", 4, 0, 10, LIVE, "rungs",
+         "A grid that gains nothing walks each one-setting line that tied the centre exactly, every untried rung out "
+         "to this many rungs, in one more wave (lines toward search/plateau.py's interval first). 0: off (v9.18.2)."),
     Knob("climb.random_jumps", 20, 0, 500, LIVE, "count",
          "At a stall: random local jumps (2-4 settings, 2-5 rungs each); one that gains climb.accept_min resumes the grid."),
     Knob("climb.wait_riders", 0, 0, 1, LIVE, "count",

@@ -334,6 +334,69 @@ class Climber:
             return value
         return None
 
+    def tie_walk_heads(self, centre: Config, group: Sequence[str],
+                       results: Sequence[Tuple[Config, float]], base: float) -> List[Config]:
+        """The tie walk (v9.18.3): a grid that gained nothing walks each line that tied the centre exactly.
+
+        A one-setting head of this grid that scored exactly `base` is a flat line. Every untried rung on that line out
+        to climb.tie_walk rungs from the centre goes in one wave; a rung already scored differently ends the line (that
+        direction is measured). Lines on the side of search/plateau.py's interval go first. On 20261014T213000Z the
+        exits of two peaks' flats sat 2-4 rungs out (+0.017, +0.027 true) while every one-rung neighbour tied or lost.
+        The blended score still accepts the move: this only decides which configs are sent.
+        """
+        reach = int(tune("climb.tie_walk"))
+        if reach <= 0 or any(s is not None and s > base for _, s in results):
+            return []
+        ctx = self.ctx
+        lines = set()
+        for c, s in results:
+            if c is None or s is None or s != base:
+                continue
+            n = _differs(ctx, centre, c)
+            if n is None or n not in group or ctx.space.specs[n].type == "bool":
+                continue
+            r = ctx.ladders.rungs_moved(n, centre.params.get(n), c.params.get(n))
+            if r:
+                lines.add((n, 1 if r > 0 else -1))
+        if not lines:
+            return []
+        from search import plateau
+        iv = plateau.intervals(ctx) if plateau.enabled() else {}
+        known = {c.key: s for c, s in results if c is not None and s is not None}
+        first, second, keys = [], [], {centre.key, *known}
+        for n, side in sorted(lines):
+            d = plateau.direction(ctx, centre, n, iv) if iv else 0
+            tier = second if d == -side else first
+            for k in range(1, reach + 1):
+                v = ctx.ladders.shift(n, centre.params.get(n), side * k)
+                if v is None:
+                    break
+                c = self.with_(centre, {n: v})
+                if c is None or c.key == centre.key or c.params.get(n) == centre.params.get(n):
+                    continue
+                s = known.get(c.key)
+                if s is None:
+                    s = self._known_score(c)
+                if s is not None:
+                    if s == base:
+                        continue
+                    break
+                if c.key not in keys and ctx.fresh(c):
+                    keys.add(c.key)
+                    tier.append(c)
+        return first + second
+
+    def begin_tie_walk(self, heads: Sequence[Config]) -> None:
+        self.phase = "tie walk"
+        self.pending = list(heads)
+        self.gate_futs = []
+        self.inflight = []
+        self._wave_t0 = self.ctx.clock()
+        self._wave_n = 0
+        self.batch_live = True
+        self.ctx.say("climber %d it %d (%s): tie walk, %d rungs on flat lines", self.id, self.iteration, self.kind,
+                     len(heads))
+
     def compass_heads(self, centre: Config, group: Sequence[str]) -> List[Config]:
         """Each grid setting at −d and +d, the others held. A flat step lands on the next untried rung."""
         heads, keys = [], {centre.key}
@@ -531,6 +594,10 @@ class Climber:
         for pack in self.packs(self.centre_later(centre, known)):
             more = await self.send(pack[:1], lambda h, pack=pack: pack[1:] if h.key == pack[0].key else [], kind, until)
             results.extend(more)
+        walk = self.tie_walk_heads(centre, group, results, self.score)
+        if walk:
+            ctx.say("climber %d it %d (%s): tie walk, %d rungs on flat lines", self.id, self.iteration, kind, len(walk))
+            results.extend(await self.send(walk, riders_of, kind, until))
         self.refresh()
         best = max(results, key=lambda t: t[1], default=None)
         old = self.centre
@@ -817,6 +884,12 @@ class Climber:
             centre = self.wave_centre or self.centre
             live = self.live_axes(centre, self.group, self.wave_results, self.wave_before)
             if len(live) >= 2 and self.begin_confirm(live):
+                return
+        if self.phase in ("compass", "confirm"):
+            walk = self.tie_walk_heads(self.wave_centre or self.centre, self.group, self.wave_results,
+                                       self.wave_before)
+            if walk:
+                self.begin_tie_walk(walk)
                 return
         self._finish_grid_wave()
 
