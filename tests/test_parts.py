@@ -576,9 +576,11 @@ class SpaceTest(unittest.TestCase):
         facts = BamFacts(frozenset({2, 3, 4, 5, 6, 10, 20, 30}), frozenset(range(61)), 74)
         bounds = bounds_from(facts, ranges())
         self.assertEqual(bounds.groups[MBQ], (10, 11, 20, 21, 30))
-        self.assertEqual(bounds.count[BQST], 26)          # finest list, at mapping quality 0
+        self.assertEqual(bounds.count[BQST], 25)          # finest list, at mapping quality 0; 31 (above Q30) calls nothing
+        self.assertEqual(bounds.caps[BQST], 30)
+        self.assertEqual(max(bounds.groups[BQST]), 30)
         self.assertEqual(bounds.count[MRPAS], 50)         # 25..74; everything above 74 is 74
-        self.assertIn("1/78", bounds.report)
+        self.assertIn("1/81", bounds.report)              # 41 x 45 x 276 -> 5 x 25 x 50
         sp = Space(ranges(), bounds=bounds)
         rng = _r.Random(0)
         got = [c for c in (sp.random(rng) for _ in range(80)) if c]
@@ -591,11 +593,40 @@ class SpaceTest(unittest.TestCase):
         self.assertEqual(snapped.params[BQST], 11)        # at mapping quality 59 the 26 collapse toward 5
         self.assertEqual(snapped.params[MRPAS], 74)
         self.assertEqual(sp._assemble({MBQ: 45}).params[MBQ], 30)
+        self.assertEqual(sp._assemble({BQST: 45}).params[BQST], 30)   # every base lowered to 6 would call nothing
         nothing = bounds_from(BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13), ranges())
         fixed = Space(ranges(), bounds=nothing)
         self.assertNotIn(MRPAS, fixed.names)              # no start has 25 reads, so the axis is one value
         self.assertEqual(fixed._assemble({MRPAS: 116}).params[MRPAS], 25)
         self.assertIsNone(bam_bounds("/nonexistent.bam", ranges()))
+
+    def test_contamination_rungs_that_remove_the_same_number_of_reads_are_one_rung(self):
+        from search.bamgroups import CONT, BamFacts, bounds_from, contamination_groups, snap
+        from search.space import Space
+        from search.steps import Ladders
+        depths = frozenset(i for i in range(1, 72) if i not in (64, 65))
+        facts = BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13, depths)
+        reps = contamination_groups(depths, 0.0, 0.05)
+        self.assertEqual(reps[0], 0.0)
+        self.assertNotIn(0.0025, reps)
+        self.assertNotIn(0.0125, reps)
+        self.assertIn(0.015, reps)
+        self.assertIn(0.045, reps)
+        self.assertIn(0.0475, reps)
+        self.assertLess(len(reps), 21)
+        bounds = bounds_from(facts, ranges())
+        self.assertNotIn(CONT, bounds.groups)                 # allowed would encode an off-ladder fraction as rung 0
+        self.assertIn(f"{CONT} 21 -> {len(reps)}", bounds.report)
+        sp = Space(ranges(), bounds=bounds)
+        self.assertEqual(Ladders(sp).rungs[CONT], list(reps))
+        self.assertEqual(sp._assemble({CONT: 0.01}).params[CONT], 0.0)
+        self.assertEqual(sp._assemble({CONT: 0.01875}).params[CONT], 0.01875)
+        self.assertEqual(snap(facts, CONT, 0.005, mmq=0, lo=0.0, hi=0.05), 0.0)
+        shallow = BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13, frozenset(range(1, 11)))
+        one = bounds_from(shallow, ranges())
+        fixed = Space(ranges(), bounds=one)
+        self.assertEqual(Ladders(fixed).rungs[CONT], [0.0])    # depth 10 removes nothing anywhere on the ladder
+        self.assertEqual(fixed._assemble({CONT: 0.04}).params[CONT], 0.0)
 
     def test_snapping_keeps_every_class_the_bam_can_tell_apart(self):
         """A representative has to be the same GATK run as the value it replaces, and every coarser class has to
@@ -684,6 +715,21 @@ class PortfolioTest(unittest.TestCase):
         self.assertEqual(past.portfolio(), [])
         self.assertEqual(ResultStore(os.path.join(d, "scratch.sqlite")).portfolio(), [])
 
+    def test_clearing_one_round_leaves_the_others(self):
+        import os
+        import tempfile
+        from common.store import clear_round
+        d = tempfile.mkdtemp()
+        tag = "20261011T141800Z"
+        kept = "20261010T141800Z"
+        os.close(os.open(os.path.join(d, tag + ".sqlite"), os.O_CREAT | os.O_WRONLY, 0o644))
+        os.close(os.open(os.path.join(d, tag + ".sqlite-wal"), os.O_CREAT | os.O_WRONLY, 0o644))
+        os.close(os.open(os.path.join(d, kept + ".sqlite"), os.O_CREAT | os.O_WRONLY, 0o644))
+        self.assertEqual(clear_round(d, tag), 2)
+        self.assertFalse(os.path.exists(os.path.join(d, tag + ".sqlite")))
+        self.assertFalse(os.path.exists(os.path.join(d, tag + ".sqlite-wal")))
+        self.assertTrue(os.path.exists(os.path.join(d, kept + ".sqlite")))
+
 
 class RoundSafetyTest(unittest.TestCase):
     def test_a_late_loop_failure_does_not_replace_a_submitted_config_with_the_baseline(self):
@@ -751,11 +797,40 @@ class CrashRetryTest(unittest.TestCase):
                 got[cs.job_id] = cs
             if len(got) == 3:
                 break
-        self.assertEqual(calls, [("batch", 3), ("solo", 1)])
-        self.assertTrue(got["j0"].ok)                                        # the head, rerun alone
-        self.assertEqual([got[j].ok for j in ("j1", "j2")], [False, False])  # the riders fail with the batch
-        self.assertIn("batch crashed; its head runs alone", got["j1"].error)
-        self.assertEqual(ex.stats()["retries"], 1)
+        # the head reruns alone; the riders are batched again without it (that batch dies too here), then its new
+        # head runs alone and the rider lost twice runs alone: every config gets a result of its own
+        self.assertEqual(calls, [("batch", 3), ("solo", 1), ("batch", 2), ("solo", 1), ("solo", 1)])
+        self.assertTrue(all(got[j].ok for j in ("j0", "j1", "j2")))
+        self.assertEqual(ex.stats()["retries"], 5)
+
+        class OneBad(FakeRunner):                          # one rider crashes GATK wherever it runs
+            def run_batch(self, round, configs, fidelity=FULL):
+                calls2.append(len(configs))
+                if any(c.params[conf] == 50.0 for c in configs):
+                    return [CallSet(round.round_id, c.key, "", "", 0.1, ok=False, fidelity=fidelity,
+                                    error="rc=3 java.lang.IllegalStateException: boom") for c in configs]
+                return super().run_batch(round, configs, fidelity)
+
+            def run(self, round, config, fidelity=FULL):
+                calls2.append(1)
+                if config.params[conf] == 50.0:
+                    return CallSet(round.round_id, config.key, "", "", 0.1, ok=False, error="rc=3 boom",
+                                   fidelity=fidelity)
+                return super().run(round, config, fidelity)
+
+        calls2 = []
+        ex = LocalExecutor(OneBad(r, batching=True), workers=1)
+        jobs = [EvalJob(f"b{i}", ROUND, Config("gatk", {**d, conf: c})) for i, c in enumerate((30.0, 40.0, 50.0, 60.0))]
+        ex.submit(jobs)
+        got = {}
+        for _ in range(60):
+            for cs in ex.poll(0.2):
+                got[cs.job_id] = cs
+            if len(got) == 4:
+                break
+        self.assertEqual(sorted(got), ["b0", "b1", "b2", "b3"])                # every job answered, no endless retry
+        self.assertEqual([got[j].ok for j in ("b0", "b1", "b2", "b3")], [True, True, False, True])
+        self.assertLessEqual(len(calls2), 8)
 
         class Always(FakeRunner):                          # a config that crashes on its own is a failure
             def run(self, round, config, fidelity=FULL):

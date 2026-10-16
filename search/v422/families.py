@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Callable, List, Optional
 
 from common.types import Config
-from search.space import CALL_CONF_GRID, CONTAMINATION_GRID, Space
+from search.v422.space import CALL_CONF_GRID, CONTAMINATION_GRID, Space
 
 CONF = "standard_min_confidence_threshold_for_calling"
 CONF_STEPS = (3.0, 6.0, 10.0, 15.0, 20.0)

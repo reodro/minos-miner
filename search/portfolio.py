@@ -10,7 +10,8 @@ A member has a profile: "A" for rounds with 250 bp reads (HG005), "B" for every 
 takes the round's profile first, best-ranked and newest first, skips a member too close to one already taken,
 and fills up with the other profile only when the round's own runs short. Members carry only configs: a new
 round has a new donor and region, so their old scores mean nothing here. A reviewed run also keeps a high-core
-group and a high false-positive group, tagged, so the next opening can draw both.
+group and a low false-positive group (fewest false positives among the configs whose core is within CORE_BAND of the
+run's best core), tagged, so the next opening can draw both.
 """
 from __future__ import annotations
 
@@ -29,8 +30,8 @@ OURS = Path(SETTINGS.data_dir) / "portfolio" / "ours.jsonl"
 LONG_READS = 240               # most reads at least this long: profile A
 MIN_DISTANCE = 0.05            # members closer than this (mean normalised difference) are one member
 SCORE_WINDOW, PER_RUN_MAX = 0.3, 10
-GROUP_MAX = 5                 # high-core and high-fp members kept beside the near-best score set
-CORE_BAND, FP_BAND = 0.01, 0.25   # how far below the best of that measure a member may sit
+GROUP_MAX = 5                 # high-core and fewest-fp members kept beside the near-best score set
+CORE_BAND = 0.01               # the core and fp groups: core within this of the run's best core
 _TAG = re.compile(r"(2026\d{4}T\d{6,7})")
 
 
@@ -97,12 +98,20 @@ def _member_group(m: dict) -> str:
     return m.get("group") if m.get("group") in ("score", "core", "fp") else "score"
 
 
-def pick(space, profile: Optional[str], n: int, pool: Optional[Sequence[dict]] = None) -> List[Config]:
+def same_round(src: str, tag: Optional[str]) -> bool:
+    """A member taken from the round `tag` (a replay must not seed itself with its own answers)."""
+    a, b = _round_of(src)[:15], _round_of(tag or "")[:15]
+    return bool(a) and a == b
+
+
+def pick(space, profile: Optional[str], n: int, pool: Optional[Sequence[dict]] = None,
+         exclude_round: Optional[str] = None) -> List[Config]:
     """Up to n seeds: the round's profile first, then the other. Within a profile, score, core and fp members
-    are taken in turn, each at least MIN_DISTANCE from those taken."""
+    are taken in turn, each at least MIN_DISTANCE from those taken. Members from the round `exclude_round` are
+    skipped."""
     if n <= 0:
         return []
-    pool = list(members() if pool is None else pool)
+    pool = [m for m in (members() if pool is None else pool) if not same_round(m.get("src", ""), exclude_round)]
     own = [m for m in pool if profile is None or m.get("profile") in (profile, None)]
     rest = [m for m in pool if m not in own]
     out: List[Config] = []
@@ -164,42 +173,43 @@ def select_run(space, configs: Dict[str, dict], tag: str, profile: Optional[str]
              "group": "score", "at": round(time.time(), 1)} for i, (c, s) in enumerate(taken)]
     have = {c.key for c, _ in taken}
 
-    def more(metric: str, group: str) -> None:
-        cand = []
+    # The core and fp groups: configs whose core is within CORE_BAND of the run's best core, the core group by
+    # highest core, the fp group by fewest false positives, taking one each in turn so neither empties the other.
+    cores = [v["core"] for v in configs.values() if v.get("core") is not None and v.get("local") is not None]
+    band = []
+    if cores:
+        floor = max(cores) - CORE_BAND
         for k, v in configs.items():
-            raw = v.get(metric)
-            if raw is None or v.get("local") is None or not v.get("config"):
+            if v.get("core") is None or v.get("local") is None or not v.get("config") or v["core"] < floor:
                 continue
             c = space._assemble({n: x for n, x in Config.from_dict(v["config"]).params.items() if n in space.names})
-            if c is None or c.key in have:
-                continue
-            cand.append((c, float(raw), v["local"]))
-        if not cand:
-            return
-        best = max(m for _, m, _ in cand)
-        band = CORE_BAND if metric == "core" else FP_BAND
-        cand = [t for t in cand if t[1] >= best - band]
-        cand.sort(key=lambda t: -t[1])
-        chosen: List[Tuple[Config, float]] = []
-        while cand and len(chosen) < GROUP_MAX:
-            if not chosen:
-                c, _metric, local = cand.pop(0)
-            else:
-                i = max(range(len(cand)), key=lambda j: min(distance(space, cand[j][0], t) for t, _ in chosen))
-                c, _metric, local = cand.pop(i)
-            if any(distance(space, c, t) < MIN_DISTANCE for t, _ in taken) or \
-                    any(distance(space, c, t) < MIN_DISTANCE for t, _ in chosen) or \
-                    any(distance(space, c, o) < MIN_DISTANCE for o in others):
-                continue
-            chosen.append((c, local))
-            have.add(c.key)
+            if c is not None and c.key not in have:
+                band.append((c, v))
+    order = {"core": sorted(band, key=lambda t: -t[1]["core"]),
+             "fp": sorted((t for t in band if t[1].get("fp_per_target") is not None),
+                          key=lambda t: t[1]["fp_per_target"])}
+    chosen: Dict[str, List[Tuple[Config, float]]] = {"core": [], "fp": []}
+    at = {"core": 0, "fp": 0}
+    moved = True
+    while moved:
+        moved = False
+        for group in ("core", "fp"):
+            while len(chosen[group]) < GROUP_MAX and at[group] < len(order[group]):
+                c, v = order[group][at[group]]
+                at[group] += 1
+                if c.key in have or any(distance(space, c, t) < MIN_DISTANCE for t, _ in taken) or \
+                        any(distance(space, c, t) < MIN_DISTANCE for g in chosen.values() for t, _ in g) or \
+                        any(distance(space, c, o) < MIN_DISTANCE for o in others):
+                    continue
+                chosen[group].append((c, v["local"]))
+                have.add(c.key)
+                moved = True
+                break
+    for group in ("core", "fp"):
         base = len(rows)
-        for i, (c, local) in enumerate(chosen):
+        for i, (c, local) in enumerate(chosen[group]):
             rows.append({"src": f"minos:{tag}", "config": c.params, "profile": profile, "rank": base + i + 1,
                          "local": round(local, 4), "group": group, "at": round(time.time(), 1)})
-
-    more("core", "core")
-    more("fp_per_target", "fp")
     return rows
 
 

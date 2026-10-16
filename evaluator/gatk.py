@@ -1016,9 +1016,15 @@ class GatkRunner:
         return self._success(round.round_id, config, out, dt, fidelity)
 
     def _success(self, round_id: str, config: Config, out: Path, dt: float, fidelity: str) -> CallSet:
-        """A finished VCF, plus the haplotype cap the assembly actually needed (None when a search hit its cap)."""
+        """A finished VCF, plus the haplotype cap the assembly actually needed (None when a search hit its cap) and the
+        callset's sketch (evaluator.sketch; None if it cannot be read - the run itself still counts)."""
+        from evaluator.sketch import callset_sketch
+        try:
+            sketch = callset_sketch(str(out))
+        except Exception:  # noqa: BLE001 - a sketch is extra information, never a reason to fail a run
+            sketch = None
         return CallSet(round_id, config.key, str(out), records_digest(out), dt, fidelity=fidelity,
-                       haplotype_cap=self.kbest_needed(round_id, config.key, fidelity))
+                       haplotype_cap=self.kbest_needed(round_id, config.key, fidelity), sketch=sketch)
 
 class HappyScorer:
     """Exact: upstream HappyScorer.score_vcf + parse_happy_vcf, counts through common.scoring.finalize.

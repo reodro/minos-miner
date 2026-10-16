@@ -45,8 +45,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from common.types import Config
 from common.tuning import tune
-from search.axes import AxisBook
-from search.space import GENOTYPING_PARAMS, PAIRHMM_PARAMS, Space
+from search.v422.axes import AxisBook
+from search.v422.space import GENOTYPING_PARAMS, PAIRHMM_PARAMS, Space
 
 # Tunable (common/tuning.py): climb.accept_min (the answer set's resolution between neighbours: a smaller gain is
 # not a gain), climb.decisive (a gain that moves the centre at once), climb.back_frac (a set of moves counts as back

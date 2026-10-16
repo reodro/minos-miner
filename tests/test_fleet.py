@@ -234,10 +234,30 @@ class SpeculationTest(unittest.TestCase):
         g_b, g_a = next(iter(b.groups.values())), next(iter(a.groups.values()))
         self.assertTrue(g_a.duplicate and g_b.twin is not None)
         cs = CallSet(r.round_id, Config("gatk", {**d, "min_pruning": 3}).key, "/x.vcf.gz", "d", 1.0, job_id="L")
+        before = (a.solo_s, a.solo_samples)
         ex._result(a, cs)                                          # the duplicate delivers first
+        self.assertEqual((a.solo_s, a.solo_samples), before)       # a copy's time is not the node's expected time
         self.assertEqual(ex.speculation_won, 1)
         self.assertEqual((a.open_groups(), b.open_groups(), list(b.jobs)), (0, 0, []))   # the loser was told to abort
         self.assertEqual([c.job_id for c in ex.poll(0)], ["L"])
+
+    def test_a_faster_free_node_does_not_copy_a_batch_before_it_is_overdue(self):
+        from evaluator.fleet.coordinator import _Session
+        ex = FleetExecutor(Planner(), inventory=Path("/nonexistent"))
+        ex._now = lambda: 1000.0
+        r = Round("2026-01-01T00:00:00+00:00", "chr20", 1, 1000, "", "")
+        d = ranges().defaults("gatk").params
+        slow = _Session(host=None, workers=2, ready=True, rounds_ready={r.round_id}, solo_s=200.0)
+        ex._sessions = {"slow": slow}
+        ex.submit([EvalJob("L", r, Config("gatk", {**d, "min_pruning": 3}), batch="small")])
+        fast = _Session(host=None, workers=2, ready=True, rounds_ready={r.round_id}, solo_s=50.0)
+        ex._sessions["fast"] = fast
+        ex._speculate()
+        self.assertEqual(ex.speculated, 0)                            # free and faster, and the batch just started
+        ex._now = lambda: 1000.0 + 1.6 * 200.0
+        ex._speculate()
+        self.assertEqual(ex.speculated, 1)
+        self.assertIn("L", fast.jobs)
 
 
 class SmallBatchRoutingTest(unittest.TestCase):

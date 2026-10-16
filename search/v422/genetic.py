@@ -12,10 +12,10 @@ import random
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from common.types import Config
-from search.space import (ACTIVITY_PARAMS, ASSEMBLY_PARAMS, FULL_RUN_PARAMS, GENOTYPING_PARAMS, PAIRHMM_PARAMS,
+from search.v422.space import (ACTIVITY_PARAMS, ASSEMBLY_PARAMS, FULL_RUN_PARAMS, GENOTYPING_PARAMS, PAIRHMM_PARAMS,
                           Space)
 from common.tuning import tune
-from search.hills import Hills
+from search.v422.hills import Hills
 
 # Tunable (common/tuning.py): merges.exhaustive_max (parents differing on this many settings or fewer: every
 # combination), merges.random_combos (more: this many random ones), merges.mutated (plus this many children with

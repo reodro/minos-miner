@@ -54,7 +54,7 @@ class _Recent(logging.Handler):
 
 
 class StatusBoard:
-    def __init__(self, directory: Path = STATUS_DIR, every_s: float = 5.0):
+    def __init__(self, directory: Path = STATUS_DIR, every_s: float = 2.0):
         self.dir, self.every_s = directory, every_s
         self.dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -89,7 +89,7 @@ class StatusBoard:
                                 "deadline_ts": deadline_ts, "started_ts": now, "mode": "building answer set"},
                       "answer_set": None, "search": {"evaluated": 0, "failed": 0, "in_flight": 0, "best": None,
                                                      "scored": 0, "zero": 0, "gatk_runs": 0, "points": [],
-                                                     "best_timeline": [], "eval_timeline": []},
+                                                     "best_timeline": [], "eval_timeline": [], "core_timeline": []},
                       "submissions": [], "executor": None, "schema": SCHEMA, "settings": TUNING.snapshot()}
         self._write(force=True)
 
@@ -121,7 +121,7 @@ class StatusBoard:
         s = self.state.setdefault("search", {})
         best = client.best()
         full = {k: r for (k, fid), r in client.latest.items() if fid == "full"}
-        for k, r in full.items():                            # a dot per newly scored config (5 s resolution)
+        for k, r in full.items():                            # a dot per newly scored config (2 s resolution)
             if k not in self._seen and r.score is not None:
                 self._seen.add(k)
                 s.setdefault("points", []).append([now, round(r.score, 4), k])
@@ -137,8 +137,6 @@ class StatusBoard:
         if best:
             s.setdefault("best_timeline", []).append([now, best.score])
         s.setdefault("eval_timeline", []).append([now, s["scored"]])
-        for k in ("best_timeline", "eval_timeline"):
-            s[k] = s[k][-2000:]
         self.state["submissions"] = [[t, key, score] for t, key, score in out.submissions]
         self.state["settings"] = TUNING.snapshot()
         stats = getattr(executor, "stats", None)
@@ -155,6 +153,9 @@ class StatusBoard:
         if ex and ex.get("workers"):
             self._util.append(ex.get("running", 0) / ex["workers"])
             self._workers = max(self._workers, int(ex["workers"]))
+            s.setdefault("core_timeline", []).append([now, int(ex.get("running") or 0), int(ex["workers"])])
+        for k in ("best_timeline", "eval_timeline", "core_timeline"):
+            s[k] = s[k][-2000:]
         self._write()
 
     def round_ended(self, mined) -> None:
@@ -203,7 +204,10 @@ class StatusBoard:
                              "repairs": (ex.get("round") or {}).get("repairs_run"),
                              "nodes": len(ex.get("nodes") or []) or None,
                              "workers": self._workers or (int(ex["workers"]) if ex.get("workers") else None),
-                             "utilization": round(sum(self._util) / len(self._util), 3) if self._util else None},
+                             "utilization": round(sum(self._util) / len(self._util), 3) if self._util else None,
+                             "core_timeline": [[round((t - started) / 60, 2), int(busy), int(cap)]
+                                               for t, busy, cap in (srch.get("core_timeline") or [])
+                                               if t is not None]},
                "search": {"best_local": best, "final_config": final, "baseline_config": self._baseline,
                           "baseline_local": local.get(self._baseline),
                           "time_to_best_min": next((round((t - started) / 60, 1) for t, v in best_tl

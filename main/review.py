@@ -11,7 +11,9 @@ and every `poll_s` (5 min) looks at the recent runs in <status_dir>/rounds.jsonl
                         validator saw), with Spearman(local, true), pick gap and local - true of the final.
     round finalized? -> "rank" line: the final config's rank among the real submissions, gap to the field's best.
 
-A replay has both at once (the round is long finished), so `python -m main replay` reviews right after mining.
+A replay has both at once (the round is long finished). `python -m main replay` releases the fleet, then reviews
+here (GATK for missing VCFs is local). `--no-review` leaves that pass to `python -m main review` so the next
+round can take the fleet immediately.
 
     python -m main review <run_id|tag>      review (and rank) one stored run now, e.g. to backfill
 """

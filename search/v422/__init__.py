@@ -1,0 +1,15 @@
+"""Search: the engine that proposes configs through EvalClient (engine.py). Owner: search.
+
+Contract with main: main asks `searcher(ranges, workers)` for the round's search - one async function of the round's
+EvalClient - builds the EvalClient (round, executor, scorer, answer set, budget, deadline, clock) and runs it until the
+deadline. The search only proposes configs and reads results; main submits the best config, or the one the search
+names in `client.pick_key`. Engine history: search/README.md and git.
+"""
+from search.v422.base import RandomSampler, Strategy, random_stream  # noqa: F401
+from search.v422.client import EvalClient, Outcome  # noqa: F401
+
+
+def searcher(ranges, workers: int) -> Strategy:
+    """The search main runs every round, in replays and live alike."""
+    from search.v422.engine import searcher as engine
+    return engine(ranges, workers)

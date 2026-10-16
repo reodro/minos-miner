@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from common.limits import VALIDATOR_RUN_S, over_validator_limit
 from common.params import ParamRanges
 from common.store import ResultStore
 from common.types import FULL, AnswerSet, CallSet, Config, EvalJob, Round, ScoreResult
@@ -197,10 +198,17 @@ class EvalClient:
         outcome = Outcome(config, None, cs.error or error, tag)
         if cs.ok:
             self.callsets[(cs.config_key, cs.fidelity)] = cs
+            if over_validator_limit(cs.runtime_s):
+                slow = self.__dict__.setdefault("slow", set())
+                if cs.config_key not in slow:
+                    slow.add(cs.config_key)
+                    log.warning("config %s ran %.0f s here: over the validator's %d s limit per run (it uses 2-8 "
+                                "threads, we use 1)", cs.config_key[:8], cs.runtime_s, VALIDATOR_RUN_S)
             if result is not None:
                 self.latest[(cs.config_key, cs.fidelity)] = result
                 self._note_best(result)
                 self.store.add(result, config, cs.runtime_s, tag)
+                self.store.add_sketch(cs.round_id, cs.config_key, cs.fidelity, cs.sketch)
                 outcome.result = result
         if fut is not None and not fut.done():
             fut.set_result(outcome)

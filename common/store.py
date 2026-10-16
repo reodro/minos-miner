@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS results (
     score REAL, score_sd REAL, gate_passed INTEGER, result TEXT, runtime_s REAL, tag TEXT, created REAL
 );
 CREATE INDEX IF NOT EXISTS results_round ON results (round_id, answer_set_version);
+CREATE TABLE IF NOT EXISTS sketches (
+    round_id TEXT, config_key TEXT, fidelity TEXT, sketch TEXT, created REAL
+);
+CREATE INDEX IF NOT EXISTS sketches_key ON sketches (round_id, config_key, fidelity);
 """
 
 
@@ -34,6 +38,16 @@ class ResultStore:
              result.answer_set_version, result.score, result.score_sd,
              None if result.gate_passed is None else int(result.gate_passed),
              json.dumps(result.to_dict()), runtime_s, tag, time.time()))
+        self.db.commit()
+
+    def add_sketch(self, round_id: str, config_key: str, fidelity: str, sketch: Optional[dict]) -> None:
+        """The callset sketch beside the score. Older rows have none. Equality of sketches is observed
+        sketch equivalence, not a guarantee that the full callsets are identical."""
+        if not sketch:
+            return
+        self.db.execute(
+            "INSERT INTO sketches VALUES (?,?,?,?,?)",
+            (round_id, config_key, fidelity, json.dumps(sketch), time.time()))
         self.db.commit()
 
     def results(self, round_id: str, answer_set_version: Optional[int] = None) -> List[ScoreResult]:
@@ -71,6 +85,22 @@ class ResultStore:
             if len(out) >= limit:
                 break
         return out
+
+
+def clear_round(directory: str, tag: str) -> int:
+    """Remove one round tag's saved results, including sqlite sidecars. A replay starts empty: the dashboard
+    reads this file, and an earlier replay of the same tag would otherwise appear as this run's top score.
+    Other rounds in the directory stay."""
+    if not re.fullmatch(r"\d{8}T\d{6}Z", tag):
+        raise ValueError(f"not a round tag: {tag}")
+    removed = 0
+    for path in glob.glob(os.path.join(directory, tag + ".sqlite*")):
+        base = os.path.basename(path)
+        if base != tag + ".sqlite" and not base.startswith(tag + ".sqlite-"):
+            continue
+        os.remove(path)
+        removed += 1
+    return removed
 
 
 def _round_tag(path: str) -> Optional[str]:

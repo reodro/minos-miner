@@ -1,4 +1,4 @@
-"""Search: the engine that proposes configs through EvalClient (engine.py). Owner: search.
+"""Search: engine v9 proposes configs through EvalClient (engine.py; design in DESIGN.md). Owner: search.
 
 Contract with main: main asks `searcher(ranges, workers)` for the round's search - one async function of the round's
 EvalClient - builds the EvalClient (round, executor, scorer, answer set, budget, deadline, clock) and runs it until the

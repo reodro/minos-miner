@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from common.tuning import read_overrides
 from dashboard.auth import MAX_FAILS, check_password, hash_password, set_password
+from dashboard.field import FieldCache, place
 from dashboard.server import COOKIE, create_app
 
 W = {"X-Minos": "1"}
@@ -36,7 +37,7 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(self.c.get("/api/status").status_code, 401)
         self.assertEqual(self.c.get("/api/history").status_code, 401)
         self.assertEqual(self.c.get("/api/settings").status_code, 401)
-        self.assertEqual(self.c.put("/api/settings", json={"set": {"scout.share": 0.2}}, headers=W).status_code, 401)
+        self.assertEqual(self.c.put("/api/settings", json={"set": {"candidates.mutate_frac": 0.2}}, headers=W).status_code, 401)
         self.assertIn("frame-ancestors 'none'", self.c.get("/login").headers["content-security-policy"])
 
     def test_no_account_no_login(self):
@@ -69,18 +70,18 @@ class DashboardTest(unittest.TestCase):
     def test_settings_are_checked_before_the_file_is_written(self):
         set_password("admin", PASSWORD, self.auth)
         self.login()
-        r = self.c.put("/api/settings", json={"set": {"scout.share": 0.2, "domains.max": 4}}, headers=W)
+        r = self.c.put("/api/settings", json={"set": {"candidates.mutate_frac": 0.2, "candidates.workers_per_candidate": 100}}, headers=W)
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(read_overrides(self.tuning)[0], {"domains.max": 4, "scout.share": 0.2})
-        r = self.c.put("/api/settings", json={"set": {"scout.share": 5, "pick.band": 0.1}}, headers=W)
+        self.assertEqual(read_overrides(self.tuning)[0], {"candidates.workers_per_candidate": 100, "candidates.mutate_frac": 0.2})
+        r = self.c.put("/api/settings", json={"set": {"candidates.mutate_frac": 5, "candidates.core_band": 0.1}}, headers=W)
         self.assertEqual(r.status_code, 422)
-        self.assertEqual([x["name"] for x in r.json()["rejected"]], ["scout.share"])
-        self.assertEqual(read_overrides(self.tuning)[0], {"domains.max": 4, "scout.share": 0.2})   # unchanged
-        r = self.c.put("/api/settings", json={"reset": ["scout.share"], "set": {"domains.max": 24}}, headers=W)
+        self.assertEqual([x["name"] for x in r.json()["rejected"]], ["candidates.mutate_frac"])
+        self.assertEqual(read_overrides(self.tuning)[0], {"candidates.workers_per_candidate": 100, "candidates.mutate_frac": 0.2})   # unchanged
+        r = self.c.put("/api/settings", json={"reset": ["candidates.mutate_frac"], "set": {"candidates.workers_per_candidate": 300}}, headers=W)
         self.assertEqual(read_overrides(self.tuning)[0], {})                # a default needs no override
         self.assertEqual(r.json()["overrides"], {})
-        self.assertEqual(self.c.put("/api/settings", json={"set": {"pick.band": 0.1}}).status_code, 400)
-        self.assertEqual(self.c.put("/api/settings", json={"set": {"pick.band": 0.1}},
+        self.assertEqual(self.c.put("/api/settings", json={"set": {"candidates.core_band": 0.1}}).status_code, 400)
+        self.assertEqual(self.c.put("/api/settings", json={"set": {"candidates.core_band": 0.1}},
                                     headers={**W, "Origin": "https://evil.example"}).status_code, 400)
         meta = self.c.get("/api/settings").json()
         self.assertEqual(len(meta["knobs"]), len(meta["defaults"]))
@@ -92,7 +93,9 @@ class DashboardTest(unittest.TestCase):
             {"type": "round", "run_id": "old", "tag": "20261002T092900Z", "region": "chr18:1-2", "kind": "replay",
              "started": 100.0, "ended": 200.0,
              "answer_set": {"donor": "HG001", "regime": "giab"},
-             "search": {"best_local": 88.1}, "evaluator": {"evaluated": 10, "failed": 1, "workers": 162}},
+             "search": {"best_local": 88.1},
+             "evaluator": {"evaluated": 10, "failed": 1, "workers": 162,
+                           "core_timeline": [[0.0, 80, 162], [12.5, 160, 162]]}},
             {"type": "review", "run_id": "old", "tag": "20261002T092900Z",
              "answer_set": {"germline_exact": {"match": 9, "truth": 10}},
              "search": {"final_true": 89.1, "final_local": 88.1, "baseline_true": 86.0, "spearman": 0.99,
@@ -117,6 +120,7 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(old["gap_to_best"], 0.8)
         self.assertEqual(old["germline_match"], 9)
         self.assertEqual(old["workers"], 162)
+        self.assertEqual(old["core_timeline"], [[0.0, 80, 162], [12.5, 160, 162]])
         self.assertEqual(old["answer_score"], 0.9912)
         self.assertNotIn("configs_noise", old)
         new = body["runs"][0]
@@ -124,6 +128,42 @@ class DashboardTest(unittest.TestCase):
         self.assertFalse(new["ranked"])
         self.assertEqual(new["best_local"], 89.7)
         self.assertIsNone(new["true_score"])
+
+    def test_a_replay_shows_its_live_rank_on_the_published_field(self):
+        set_password("admin", PASSWORD, self.auth)
+        self.login()
+        (self.status / "live.json").write_text(json.dumps({
+            "schema": 2,
+            "round": {"tag": "r1", "id": "2026-10-09T01:06:00+00:00", "kind": "replay"},
+            "search": {"best": 85.05},
+        }))
+        cache = FieldCache(lambda rid: [85.30, 85.07, 84.00], ttl_s=60)
+        self.c = TestClient(create_app(self.status, self.tuning, self.auth, secure_cookie=False,
+                                       fail_delay_s=0.0, field_cache=cache))
+        self.login()
+        rank = self.c.get("/api/status").json()["rank"]
+        self.assertEqual(rank["rank"], 3)
+        self.assertEqual(rank["field"], 4)
+        self.assertEqual(rank["field_best"], 85.3)
+        self.assertEqual(rank["gap_to_best"], 0.25)
+        self.assertTrue(rank["filling"])
+
+    def test_a_live_round_has_no_field_rank(self):
+        set_password("admin", PASSWORD, self.auth)
+        (self.status / "live.json").write_text(json.dumps({
+            "schema": 2, "round": {"tag": "r1", "id": "round", "kind": "live"}, "search": {"best": 85.05},
+        }))
+        called = []
+        cache = FieldCache(lambda rid: called.append(rid) or [90.0], ttl_s=60)
+        self.c = TestClient(create_app(self.status, self.tuning, self.auth, secure_cookie=False,
+                                       fail_delay_s=0.0, field_cache=cache))
+        self.login()
+        self.assertIsNone(self.c.get("/api/status").json()["rank"])
+        self.assertEqual(called, [])
+
+    def test_place_counts_a_replay_as_one_more_in_the_field(self):
+        row = place(89.0, [89.3, 89.1, 88.0], replay=True)
+        self.assertEqual((row["rank"], row["field"], row["gap_to_best"]), (3, 4, 0.3))
 
     def test_password_hashes(self):
         h = hash_password("x" * 12)

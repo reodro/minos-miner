@@ -47,10 +47,8 @@ SPEEDS = Path.home() / ".minos" / "fleet" / "speeds.json"   # host -> measured s
 SOLO_EMA = 0.3                # weight of each new solo-time sample in a node's running estimate
 KEEP_ROUNDS = 3               # rounds kept on main and nodes (older ones are pruned)
 # Tunable (common/tuning.py): evaluator.overdue (a small batch running this many times its expected time is a
-# straggler), evaluator.slow_factor (a node slower than this times the fastest is "slow": small batches prefer the
-# fast ones), evaluator.small_batch / evaluator.big_batch (evaluator.local.batch_limit).
-DUPLICATE_GAIN = 0.25         # a duplicate must finish this share of the remaining time sooner, and at least a
-                              # fifth of a run on the faster node (not a few seconds' difference in estimates)
+# straggler and may be copied), evaluator.slow_factor (a node slower than this times the fastest is "slow": small
+# batches prefer the fast ones), evaluator.small_batch / evaluator.big_batch (evaluator.local.batch_limit).
 
 
 @dataclass
@@ -306,7 +304,8 @@ class FleetExecutor:
             g.jobs.pop(cs.job_id, None)
             g.due -= 1
             if g.due <= 0:                                        # every result of the run came back from here
-                s.note_group_done(g.units, self._now() - g.t0)
+                if not g.duplicate:                               # a copy's short time would teach the node it is faster than it is
+                    s.note_group_done(g.units, self._now() - g.t0)
                 s.gatk_runs_done += 1
                 del s.groups[gid]
                 if s.solo_samples % 10 == 1:
@@ -612,7 +611,15 @@ class FleetExecutor:
                           rejected=bool(s.rejected), solo_s=round(s.solo_s), slow=s.ready and s.solo_s > slow,
                           sick=s.ready and s.solo_s > sick)
                      for i, s in enumerate(self._sessions.values(), 1)]
-            return {"kind": "fleet", "queued": len(self._queued), "nodes": nodes, "done": sum(n["done"] for n in nodes),
+            cores: dict = {}
+            for s in self._sessions.values():
+                if not s.ready:
+                    continue
+                for g in s.groups.values():                    # one open group is one core
+                    tag = next((j.tag for j in g.jobs.values() if j.tag), "")
+                    cores[tag] = cores.get(tag, 0) + 1
+            return {"kind": "fleet", "queued": len(self._queued), "nodes": nodes, "cores": cores,
+                    "done": sum(n["done"] for n in nodes),
                     "gatk_runs": sum(n["gatk_runs"] for n in nodes),
                     "gatk_runs_done": sum(n["gatk_runs_done"] for n in nodes),
                     "workers": sum(n["workers"] for n in nodes if n["ready"]),
@@ -713,9 +720,9 @@ class FleetExecutor:
         return gid
 
     def _speculate(self) -> None:
-        """Width is cheap, latency is not: a small batch that is overdue on its node, or that a free faster
-        node could redo before its node is expected to finish, is duplicated there while the fleet has a worker to
-        spare (nothing queued could use it: _pump ran first). The first result wins; the other run is aborted.
+        """A small batch that has run past the time this node itself takes is duplicated on a free faster node,
+        while the fleet has a worker to spare (nothing queued could use it: _pump ran first). The first result
+        wins; the other run is aborted. A copy is not started early just because a faster node is free.
         Lock held."""
         now = self._now()
         for s in list(self._sessions.values()):
@@ -731,9 +738,7 @@ class FleetExecutor:
                     continue
                 f = min(others, key=lambda o: o.solo_s)
                 expected, elapsed, fresh = s.solo_s * g.units, now - g.t0, f.solo_s * g.units
-                remaining = expected - elapsed
-                worthwhile = remaining - fresh >= max(0.2 * f.solo_s, DUPLICATE_GAIN * remaining)
-                if fresh > self._room(f) or not (elapsed > tune("evaluator.overdue") * expected or worthwhile):
+                if fresh > self._room(f) or elapsed <= tune("evaluator.overdue") * expected:
                     continue
                 jobs = list(g.jobs.values())
                 gid2 = self._send_group(f, jobs, g.units, duplicate=True, twin=(s, gid))

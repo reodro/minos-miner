@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from common.tuning import DEFAULTS, KNOBS, TUNING, Tuning, describe, read_overrides, tune, validate, write_overrides
+from common.tuning import DEFAULTS, KNOBS, LIVE, TUNING, Knob, Tuning, describe, read_overrides, tune, validate, write_overrides
 
 
 class TuningTest(unittest.TestCase):
@@ -26,66 +26,69 @@ class TuningTest(unittest.TestCase):
 
     def test_defaults_without_a_file(self):
         self.assertIsNone(TUNING.path)                       # tests never read the repo's tuning.json
-        self.assertEqual(tune("scout.share"), 0.0)
-        self.assertEqual(self.t.get("climb.shake_k"), [2, 3, 5, 8])
+        self.assertEqual(tune("candidates.mutate_frac"), 0.3)
+        self.assertEqual(self.t.get("climb.random_jumps"), 20)
         self.t.use_file(self.path)                           # no file yet: still the defaults
         self.assertEqual(self.t.values, DEFAULTS)
 
     def test_a_live_override_applies_and_its_removal_restores_the_default(self):
         self.t.use_file(self.path)
-        self.write({"scout.share": 0.2, "merges.mutated": 10})
-        self.assertEqual((self.t.get("scout.share"), self.t.get("merges.mutated")), (0.2, 10))
-        self.assertEqual([c["name"] for c in self.t.changes], ["merges.mutated", "scout.share"])
+        self.write({"candidates.mutate_frac": 0.2, "climb.random_jumps": 10})
+        self.assertEqual((self.t.get("candidates.mutate_frac"), self.t.get("climb.random_jumps")), (0.2, 10))
+        self.assertEqual([c["name"] for c in self.t.changes], ["candidates.mutate_frac", "climb.random_jumps"])
         self.write({})
-        self.assertEqual(self.t.get("scout.share"), 0.0)
+        self.assertEqual(self.t.get("candidates.mutate_frac"), 0.3)
 
     def test_bad_values_are_rejected_and_the_value_in_force_stays(self):
         self.t.use_file(self.path)
-        self.write({"scout.share": 0.3})
-        self.write({"scout.share": 2, "riders.global": 1.5, "climb.shake_k": [2, "x"], "nope.x": 1})
-        self.assertEqual(self.t.get("scout.share"), 0.3)    # previous value, not the default
-        self.assertEqual(self.t.get("riders.global"), 2)
+        self.write({"candidates.mutate_frac": 0.4})
+        self.write({"candidates.mutate_frac": 2, "candidates.mutate_axes": 1.5, "climb.group_size": "x", "nope.x": 1})
+        self.assertEqual(self.t.get("candidates.mutate_frac"), 0.4)    # previous value, not the default
+        self.assertEqual(self.t.get("candidates.mutate_axes"), 2)
         why = {r["name"]: r["reason"] for r in self.t.rejected}
-        self.assertIn("outside", why["scout.share"])
-        self.assertIn("whole number", why["riders.global"])
-        self.assertIn("not a number", why["climb.shake_k"])
+        self.assertIn("outside", why["candidates.mutate_frac"])
+        self.assertIn("whole number", why["candidates.mutate_axes"])
+        self.assertIn("not a number", why["climb.group_size"])
         self.assertEqual(why["nope.x"], "unknown setting")
+
+    def test_a_list_setting_is_checked_value_by_value(self):
+        k = Knob("climb.example", [2, 3], 1, 20, LIVE, "count", "")
+        self.assertEqual(k.check([2, 5])[:2], (True, [2, 5]))
+        self.assertIn("not a number", k.check([2, "x"])[2])
+        self.assertIn("outside", k.check([2, 30])[2])
 
     def test_broken_json_keeps_everything(self):
         self.t.use_file(self.path)
-        self.write({"scout.share": 0.25})
+        self.write({"candidates.mutate_frac": 0.25})
         self.write("{not json")
-        self.assertEqual(self.t.get("scout.share"), 0.25)
+        self.assertEqual(self.t.get("candidates.mutate_frac"), 0.25)
         self.assertIn("not valid JSON", self.t.snapshot()["error"])
 
     def test_checks_across_settings(self):
-        ok, rejected = validate({"schedule.reduce_to_1_start_min": 30.0, "evaluator.small_batch": 2.5,
-                                 "evaluator.big_batch": 2.0})
-        self.assertEqual(ok, {})
-        self.assertEqual({r["name"] for r in rejected},
-                         {"schedule.reduce_to_1_start_min", "evaluator.small_batch", "evaluator.big_batch"})
-        ok, rejected = validate({"schedule.reduce_to_3_start_min": 30, "schedule.reduce_to_3_by_min": 36})
-        self.assertEqual((ok, rejected), ({"schedule.reduce_to_3_start_min": 30.0,
-                                           "schedule.reduce_to_3_by_min": 36.0}, []))
+        ok, rejected = validate({"climb.end_min": 55.0, "evaluator.small_batch": 2.5, "evaluator.big_batch": 2.0})
+        self.assertEqual(ok, {"climb.end_min": 55.0})                      # not part of the failed check
+        self.assertEqual({r["name"] for r in rejected}, {"evaluator.small_batch", "evaluator.big_batch"})
+        ok, rejected = validate({"evaluator.small_batch": 1.2, "evaluator.big_batch": 2.0})
+        self.assertEqual((ok, rejected), ({"evaluator.small_batch": 1.2, "evaluator.big_batch": 2.0}, []))
 
     def test_round_settings_wait_for_the_next_round(self):
         self.t.use_file(self.path)
         self.t.round_started()
-        self.write({"domains.max": 4, "scout.share": 0.1})
-        self.assertEqual(self.t.get("scout.share"), 0.1)     # live: now
-        self.assertEqual(self.t.get("domains.max"), 24)      # round: waits
-        self.assertEqual(self.t.snapshot()["pending"], {"domains.max": 4})
+        self.write({"candidates.workers_per_candidate": 100, "candidates.mutate_frac": 0.1})
+        self.assertEqual(self.t.get("candidates.mutate_frac"), 0.1)               # live: now
+        self.assertEqual(self.t.get("candidates.workers_per_candidate"), 243)     # round: waits
+        self.assertEqual(self.t.snapshot()["pending"], {"candidates.workers_per_candidate": 100})
         self.t.round_ended()
-        self.assertEqual(self.t.get("domains.max"), 4)
+        self.assertEqual(self.t.get("candidates.workers_per_candidate"), 100)
         self.assertEqual(self.t.snapshot()["pending"], {})
         self.t.round_started()
-        self.write({"domains.max": 5})
+        self.write({"candidates.workers_per_candidate": 200})
         self.t.round_started()                                # the next round's start applies it
-        self.assertEqual(self.t.get("domains.max"), 5)
+        self.assertEqual(self.t.get("candidates.workers_per_candidate"), 200)
 
     def test_write_and_read_back(self):
-        write_overrides(self.path, {"pick.band": 0.1})
-        self.assertEqual(read_overrides(self.path), ({"pick.band": 0.1}, None))
+        write_overrides(self.path, {"candidates.core_band": 0.1})
+        self.assertEqual(read_overrides(self.path), ({"candidates.core_band": 0.1}, None))
         self.assertEqual(sorted(os.listdir(self.dir.name)), ["tuning.json"])   # no temp file left behind
 
     def test_every_default_passes_its_own_check(self):

@@ -6,9 +6,9 @@ tighter cap is a different assembly and can score higher. A later report never l
 would start rewriting caps that were still distinct. A later report that raises the floor replaces a stored cap
 that now sits below the floor, so a higher cap is never rewritten to a smaller, different assembly.
 
-max_alternate_alleles is not rewritten. The VCF lists alleles that appear in the genotype, not every allele the
-cap kept. A count taken from the VCF can be too small, and a cap between that count and the true number of
-alleles can score higher.
+max_alternate_alleles is not rewritten. On the stored VCFs a higher cap above one that had left alleles
+unused was a different callset 1,137 times out of 16,700. A count of ALT alleles can be too small for the
+cap that produced them.
 
 The calling threshold is not rewritten from equal scores. The score can fall and rise again as calls drop, so
 two equal ends do not mean the values between them are the same run.
