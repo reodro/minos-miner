@@ -334,6 +334,27 @@ def window_group(c):
     return "1-3 bp indel" if any(1 <= x <= 3 for x in L) else "SNP only" if all(x == 0 for x in L) else "longer indel"
 
 
+def select_key_changes(cands, p, thr, answer):
+    """Windows at or above thr whose synthetic alleles differ from the answer.
+
+    A window that only flips het/hom on the same alleles is not returned: on the rounds
+    where that flip was checked, the per-variant genotype was the true one. answer maps
+    a key to (zyg, synthetic)."""
+    donor_keys = {k for k, (z, syn) in answer.items() if not syn}
+    t_of = (lambda i: thr.get(window_group(cands[i]), thr.get("default", 0.5))) if isinstance(thr, dict) \
+        else (lambda i: thr)
+    keep, pk = [], []
+    for i, c in enumerate(cands):
+        if p[i] < t_of(i):
+            continue
+        syn_a = {k for k, _z in c[3] if k not in donor_keys}
+        syn_e = {k for k in c[4] if k not in donor_keys}
+        if syn_a != syn_e:
+            keep.append(c)
+            pk.append(float(p[i]))
+    return keep, np.array(pk, dtype=float)
+
+
 def apply(recs, cands, p, thr, respell_fn=None):
     """recs (assemble_records output: (pos, ref, alt, zyg, synthetic, confidence)) with the windows scored >= thr
     replaced by their called events (most confident first; overlapping windows skipped). thr: one cut-off, or
@@ -555,3 +576,75 @@ def emit_from_called(recs, windows, donor, bed, fa, chrom, p_of=None):
     kept = [r for r in recs if (r[0], r[1], r[2]) not in drop]
     have = {(r[0], r[1], r[2]) for r in kept}
     return kept + [r for r in add if (r[0], r[1], r[2]) not in have], n_sp, n_add
+
+
+LONG_IMF = 0.20          # a true long indel the window left out still had at least 23% of the reads (g075 rounds)
+
+
+def drop_unneeded(recs, windows, imf=None):
+    """Drop a synthetic indel whose removal leaves a confident window's two haplotypes unchanged.
+
+    Two synthetic alleles at one position: the one the haplotypes do not use is a second spelling.
+    A single indel of 8 bp or more is the same, when fewer than one read in five carries it.
+    Exactly one such allele per position is removed. A donor record stays, and a window that
+    already matches is left alone."""
+    from answer_set.k2.util import trim
+    imf = {trim(*k): v for k, v in (imf or {}).items()}
+    by = {(r[0], r[1], r[2]): r for r in recs}
+    ak = sorted(by)
+    ap = [k[0] for k in ak]
+    syn_at = {}
+    for r in recs:
+        if r[4]:
+            syn_at.setdefault(r[0], []).append((r[0], r[1], r[2]))
+    named = []
+    for s, e, w in windows:
+        if w.get("post", 0.0) < 0.98:
+            continue
+        if w["pair"][0] == w["ref"] and w["pair"][1] == w["ref"]:
+            continue
+        A = _inside(ak, ap, s, e)
+        if not A:
+            continue
+        inside = [by[k] for k in A]
+        if sum(1 for r in inside if r[3] != "hom") > 8:
+            continue
+        if not any(r[4] and len(r[1]) != len(r[2]) and (
+                len(syn_at.get(r[0], ())) >= 2
+                or abs(len(r[1]) - len(r[2])) >= 8 and imf.get(trim(r[0], r[1], r[2]), 1.0) < LONG_IMF)
+                for r in inside):
+            continue
+        called = tuple(sorted(w["pair"]))
+        cur = pairs_of(w["ref"], s, [((r[0], r[1], r[2]), r[3]) for r in inside])
+        if not cur or called in cur:
+            continue
+        cands = []
+        for r in inside:
+            if not r[4] or len(r[1]) == len(r[2]):
+                continue
+            key = (r[0], r[1], r[2])
+            sib = len(syn_at.get(r[0], ())) >= 2
+            long = abs(len(r[1]) - len(r[2])) >= 8 and imf.get(trim(*key), 1.0) < LONG_IMF
+            if not sib and not long:
+                continue
+            rest = [x for x in inside if (x[0], x[1], x[2]) != key]
+            if sib and not any(x[4] and x[0] == r[0] and (x[0], x[1], x[2]) != key for x in rest):
+                if not long:
+                    continue
+            if sum(1 for x in rest if x[3] != "hom") > 8:
+                continue
+            pr = pairs_of(w["ref"], s, [((x[0], x[1], x[2]), x[3]) for x in rest])
+            if pr and called in pr:
+                cands.append(key)
+        if len(cands) == 1:
+            named.append(cands[0])
+    drop = set()
+    by_pos = {}
+    for k in named:
+        by_pos.setdefault(k[0], set()).add(k)
+    for keys in by_pos.values():
+        if len(keys) == 1:
+            drop.add(next(iter(keys)))
+    if not drop:
+        return recs
+    return [r for r in recs if (r[0], r[1], r[2]) not in drop]

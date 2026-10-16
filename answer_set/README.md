@@ -34,7 +34,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g075_20261013T0429, 1000G k025_20261007T0751) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k029_20261014T1325) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -194,6 +194,25 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   mean +0.071 per round (t 3.75, better 7/8, worst -0.0005); mean score 99.506 -> 99.577; FN down in every class.
   Six old-pattern fold rounds: +0.009 (t 0.73, better 4 / worse 2). Worst frozen round 20261006T201700Z (HG01953)
   99.123 -> 99.185.
+- k028 (1000G, 2026-10-14, not active) = k025's forest with class cut-offs re-chosen on the 40 prepared 1000G
+  rounds since 2026-10-07, charging each extra record 3.75/N with that round's mutations.vcf count (the two
+  2026-10-14 rounds held out). Cut-offs: snp 0.90, 1 bp 0.60 -> 0.80, 2-3 bp 0.80 -> 0.85, 4-7 bp 0.75 -> 0.90,
+  >= 8 bp 0.45 -> 0.15. Mean class points on the 40 rounds moved by about +0.004. On held-out
+  20261014T093000Z the new cut-offs removed one extra 1 bp indel and three true 4-7 bp indels (correct 205 -> 202,
+  missed 6 -> 9); extras of the other classes did not fall. A support-based one-spelling pass (most
+  read-comparison support, then fewest events) rewrote 6 clusters and dropped true alleles, so it is off.
+  Future training uses each round's real N (`train_track.extra_cost`).
+- k029 (1000G, released 2026-10-14) = k025's recipe retrained on all 109 prepared 1000G rounds (26 Sep through 13 Oct),
+  cut-offs chosen with each round's real mutations.vcf count. The two 14 Oct rounds were held out. Cut-offs: SNP 0.90,
+  1 bp 0.80, 2-3 bp 0.90, 4-7 bp 0.85, >= 8 bp 0.70. On 20261014T093000Z versus k025, allele by allele: extra
+  indels 9 -> 7 (the two 2-3 bp extras gone), inserted exact 7325/7356 -> 7327/7356, 4-7 bp misses 6 -> 4, one
+  >= 8 bp indel newly missed. On 20261014T104200Z the extra SNP is gone and one 2-3 bp indel that was the wrong
+  het/hom is now exact; one SNP that was the wrong het/hom is now missed. The person's records stay exact on both.
+- g077 (GIAB, released 2026-10-16) = g075 + the read guard (`k2/readguard.py`, meta `read_guard`): an inserted indel
+  the per-variant model did not call (written by the cluster decoder, window, emit or run-edge step) is dropped when
+  >= 6 spanning reads are judged by their DNA and < 15% carry it. Those steps wrote 106 false and 125 true indels in
+  31 monitored rounds. Rule fixed before measuring; frozen GIAB rounds 2026-10-13 22:42 to 10-15 23:54 (31), on the
+  monitor's saved answers: +0.0075 per round (t 2.96, better 12 / worse 5 / same 14), 22 false and 6 true indels dropped.
 
 ## Open work
 
@@ -202,8 +221,7 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   spots with no window.
 - **Spelling**: ~28% of replaced windows are still not spelled exactly like Minos (~17% need spellings no option
   produces yet).
-- **1000G**: the person's part is exact (k012). Live new-pattern rounds (from 2026-10-05 05:53) still cost ~0.4 points
-  vs old-pattern; k025 recovered +0.07 of that on frozen rounds. Worst leftover is HG01953-style high-FP rounds
-  (~99.19). The model still trains on every candidate; training it only on candidates outside the person's list
-  (as GIAB) may help.
+- **1000G**: k029 is the active forest (k025's recipe on 109 rounds, real N in the cut-offs). The held-out gain on
+  14 Oct is a handful of alleles. A 1000 Genomes spelling chooser, trained the way the GIAB one was, is still
+  unbuilt; picking the spelling with the most read support dropped true alleles (k028).
 - **`update()` during a live round** (parked by the user).

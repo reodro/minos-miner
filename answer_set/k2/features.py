@@ -29,6 +29,9 @@ RD_BUDGET_S = 900               # the whole read comparison, every try: past it 
 # hap_genotyper; build.py sets it from the model before extracting), so a model trained without it is never fed
 # candidates it has not seen. prepare.py turns it on (--no-hap: off).
 HAP_GENOTYPER = int(os.environ.get("MINOS_HAPGENO", "0"))     # 0 off, else the hapgeno.VERSION it was trained with
+# Windows used only for replacement (hapwin.py). 0: the same run as HAP_GENOTYPER. A different version
+# leaves the forest's hg_* columns on HAP_GENOTYPER and writes hg_windows_replace.pkl.gz from this one.
+WINDOW_GENOTYPER = int(os.environ.get("MINOS_WIN_HAPGENO", "0"))
 # 1000G rounds: compare each round read with the person's public original read (kg_origin.py), as for GIAB. Like
 # HAP_GENOTYPER it changes the candidates, so it follows the 1000G model (meta kg_readdiff; build.py sets it).
 KG_READDIFF = int(os.environ.get("MINOS_KG_RD", "0"))
@@ -490,9 +493,11 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             seeds += [(k[0], k[0] + len(k[1])) for k, v in rdiff.items() if v[0] >= 2]
             orig_bam = (giab_origin.path(mode_donor, chrom, a, b) if mode_giab else
                         kg_origin.path(kg_info["person"], chrom, a, b))
-            hg = hapgeno.genotype(str(bam), str(ref_path(chrom)), chrom, seeds, threads, known=set(cands) | set(rdiff),
-                                  orig_bam=orig_bam if "error" not in rd_info and orig_bam.exists() else None,
-                                  version=int(HAP_GENOTYPER if mode_giab else KG_HAPGENO))
+            known_ev = set(cands) | set(rdiff)
+            orig = orig_bam if "error" not in rd_info and orig_bam.exists() else None
+            feat_version = int(HAP_GENOTYPER if mode_giab else KG_HAPGENO)
+            hg = hapgeno.genotype(str(bam), str(ref_path(chrom)), chrom, seeds, threads, known=known_ev,
+                                  orig_bam=orig, version=feat_version)
             from answer_set.k2 import hapwin
             hapwin.save_windows(workdir / "hg_windows.pkl.gz", hg)        # for window decisions (hapwin.py)
             wins = sorted((k[1], k[2], v) for k, v in hg.items() if k[0] == "window")
@@ -521,6 +526,13 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
                 n_hg_only += 1
             rd_info["hg_candidates_added"] = n_hg_only
             rd_info["hg_windows"] = len(wins)
+            wv = int(WINDOW_GENOTYPER or 0)
+            if mode_giab and wv and wv != feat_version:
+                hg_w = hapgeno.genotype(str(bam), str(ref_path(chrom)), chrom, seeds, threads, known=known_ev,
+                                        orig_bam=orig, version=wv)
+                hapwin.save_windows(workdir / "hg_windows_replace.pkl.gz", hg_w)
+                rd_info["window_genotyper"] = wv
+                rd_info["hg_windows_replace"] = sum(1 for k in hg_w if k[0] == "window")
     hc = None
     if HC_EVIDENCE and mode_giab:
         from answer_set.k2 import hcrun

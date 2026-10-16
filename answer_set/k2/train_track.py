@@ -14,6 +14,7 @@ kg track:   decision and het/hom models see every candidate of 1000 Genomes-pers
 import argparse
 import io
 import json
+import shutil
 import sys
 import time
 from collections import Counter, defaultdict
@@ -34,8 +35,8 @@ IN_BED = FEATURES.index("in_donor_bed")
 # 0.14); per class, one error costs ~ weight / (2 x truth records of the class). giab track: training rows are
 # weighted by that cost (POINT_ALPHA: 0 = every row alike) and each class gets its own cut-off, chosen on held-out
 # folds for weight x F1 - points, not counts: a missed 1-bp indel costs ~20 SNP errors. kg track: the same, and its
-# cut-offs also count each extra record's cost in the false-positive part (~3.75 / N points; 1000G answers carry
-# ~110 extras per round, ~0.7 points).
+# cut-offs also count each extra record's cost in the false-positive part (3.75 / N points, N that round's
+# mutations.vcf count).
 CLASS_W = {"snp": 0.20, "ind1": 0.40, "ind2_3": 0.16, "ind4_7": 0.10, "ind8+": 0.14}
 POINT_ALPHA = 1.0
 # kg track with Minos's exact rule for the person's part (kg.gatk_person_own, meta kg_own_rule): that part is copied
@@ -103,10 +104,17 @@ def fit(track, rs, cols, cost=None):
     return model().fit(X, y, sample_weight=sw), model().fit(Xh, yh, sample_weight=swh)
 
 
+def extra_cost(r):
+    """Core-unit cost of one extra record on this round: 3.75 / N / 70, N = mutations.vcf entries (prepare stores
+    it as n_targets). A round prepared before that field existed is charged at the old fixed 580."""
+    n = r["info"].get("n_targets") or 0
+    return 3.75 / (float(n) if n else 580.0) / 70
+
+
 def class_points(rs, oof, truths, c, t, track="giab"):
     """Mean over rounds of weight x F1 of class c with cut-off t (held-out scores; giab: the person's own records are
     copied, so they count as found; a record of ours counts only with the right het/hom). kg: minus each extra
-    record's false-positive cost (in core units, 3.75 / 580 points / 70)."""
+    record's false-positive cost (in core units, 3.75 / N / 70, N that round's mutations.vcf count)."""
     vals = []
     for r in rs:
         pa, ph = oof[r["name"]]
@@ -121,9 +129,19 @@ def class_points(rs, oof, truths, c, t, track="giab"):
         n_truth = sum(1 for k in t_ if cls(k) == c)
         v = CLASS_W[c] * 2 * (own + tp) / max(1, own + int(pred.sum()) + n_truth)
         if track == "kg":
-            v -= int(np.sum(pred & (r["y_any"] == 0))) * 3.75 / 580 / 70
+            v -= int(np.sum(pred & (r["y_any"] == 0))) * extra_cost(r)
         vals.append(v)
     return float(np.mean(vals))
+
+
+def choose_thr_class(rs, oof, truths, track):
+    """{class: cut-off} on THR_GRID maximising class_points, and {class: {cut-off: points}}."""
+    thr_class, detail = {}, {}
+    for c in CLASS_W:
+        tab = {t: class_points(rs, oof, truths, c, t, track) for t in THR_GRID}
+        thr_class[c] = max(tab, key=tab.get)
+        detail[c] = tab
+    return thr_class, detail
 
 
 def predict(pair, r, cols):
@@ -219,11 +237,10 @@ def train(track, rs, name):
             thr_rd = max(t2tab, key=t2tab.get)
             print("held-out median F1 by cut-off for read-comparison-only candidates",
                   {k: round(v, 5) for k, v in t2tab.items()})
-        thr_class = {}
         print("held-out points by class cut-off (weight x F1, mean per round):")
+        thr_class, thr_tabs = choose_thr_class(rs, oof, truths, track)
         for c in CLASS_W:
-            tab = {t: class_points(rs, oof, truths, c, t, track) for t in THR_GRID}
-            thr_class[c] = max(tab, key=tab.get)
+            tab = thr_tabs[c]
             print(f"   {c:7s} at {thr}: {tab[min(THR_GRID, key=lambda x: abs(x - thr))]:.6f}  best {thr_class[c]}: "
                   f"{tab[thr_class[c]]:.6f}  (+{70 * (tab[thr_class[c]] - tab[min(THR_GRID, key=lambda x: abs(x - thr))]):.4f} pts)")
         agg = defaultdict(Counter)
@@ -274,10 +291,91 @@ def train(track, rs, name):
     return meta
 
 
+def _scores_of(meta, pair, rs):
+    """{round: (p_any, p_hom)} from a frozen model. p_hom already has the GATK het/hom rule when the model uses it."""
+    cols = [tracks.col_index(f) for f in meta["features"]]
+    out = {}
+    for r in rs:
+        if meta.get("round_feats") and r["X"].shape[1] == len(FEATURES):
+            r["X"] = tracks.with_round_feats(r["X"], r["pos"])
+        pa, ph = predict(pair, r, cols)
+        if meta.get("gt_from_gatk"):
+            ph = tracks.apply_gt_rule(meta, r["X"], ph)
+        out[r["name"]] = (pa, ph)
+    return out
+
+
+def _own_of(rs):
+    from answer_set.k2 import kg
+    from answer_set.k2.util import parse_region
+    for r in rs:
+        ch, a_, b_ = parse_region(r["info"]["region"])
+        r["_own"] = set(kg.gatk_person_own(ch, a_, b_, r["info"]["kg"]["person"])[0])
+
+
+def retune_cutoffs(since, hold_prefix):
+    """Re-choose the five kg class cut-offs on prepared rounds since `since`, charging 3.75/N with each round's real
+    mutations.vcf count. Rounds whose tag starts with `hold_prefix` are scored, not used to choose. Returns
+    (new version name, report text). The forest is the active kg model's; only the cut-offs change."""
+    global KG_OWN_RULE
+    src = tracks.active_name("kg")
+    pair_m, pair_h, meta, _ = tracks.load("kg", src)
+    KG_OWN_RULE = bool(meta.get("kg_own_rule"))
+    rs = [r for r in load() if round_track(r) == "kg" and r["name"] >= since and r["info"].get("n_targets")
+          and r["info"].get("kg_hapgeno") and not r["info"].get("no_spot_features")
+          and not r["info"].get("no_mask_features") and not r["info"].get("no_annot_features")
+          and not r["info"].get("no_gatkonly_features")]
+    tune = [r for r in rs if not r["name"].startswith(hold_prefix)]
+    hold = [r for r in rs if r["name"].startswith(hold_prefix)]
+    if len(tune) < 8:
+        sys.exit(f"only {len(tune)} prepared 1000G rounds since {since} outside {hold_prefix}; need at least 8")
+    if KG_OWN_RULE:
+        _own_of(tune + hold)
+    oof = _scores_of(meta, (pair_m, pair_h), tune + hold)
+    truths = {r["name"]: truth_of(r) for r in tune + hold}
+    thr_class, tabs = choose_thr_class(tune, oof, truths, "kg")
+    buf = io.StringIO()
+    buf.write(f"cut-offs re-chosen on {len(tune)} rounds since {since}, hold-out prefix {hold_prefix!r} "
+              f"({len(hold)} rounds)\n")
+    buf.write(f"active model {src}; each extra record costs 3.75/N points, N = that round's mutations.vcf\n")
+    old = meta.get("thr_class") or {}
+    for c in CLASS_W:
+        tab = tabs[c]
+        was = old.get(c)
+        buf.write(f"   {c:7s} {was} -> {thr_class[c]}   points {tab.get(was, float('nan')):.6f} -> "
+                  f"{tab[thr_class[c]]:.6f}\n")
+    if hold:
+        buf.write("hold-out points (not used to choose):\n")
+        for c in CLASS_W:
+            was = old.get(c)
+            buf.write(f"   {c:7s} {class_points(hold, oof, truths, c, was, 'kg'):.6f} -> "
+                      f"{class_points(hold, oof, truths, c, thr_class[c], 'kg'):.6f}\n")
+    name = tracks.new_name("kg")
+    dst = tracks.dev_dir("kg", name)
+    dst.mkdir(parents=True, exist_ok=True)
+    src_dir = tracks.vdir("kg", src)
+    for fn in ("model.joblib", "hom.joblib"):
+        shutil.copy2(src_dir / fn, dst / fn)
+    new = dict(meta)
+    new.update(created=tracks.now(), thr_class=thr_class, variant_of=src, kg_one_spelling=1,
+               retune_rounds=sorted(r["name"] for r in tune),
+               retune_held_out=sorted(r["name"] for r in hold),
+               thr_class_note=("chosen on 1000G rounds since 2026-10-07 with each round's mutations.vcf count; "
+                               "rounds from 2026-10-14 held out"))
+    (dst / "meta.json").write_text(json.dumps(new, indent=1))
+    (dst / "report.txt").write_text(buf.getvalue())
+    return name, buf.getvalue()
+
+
 def main():
     global POINT_ALPHA, KG_OWN_RULE, ROUND_FEATS, NO_HC
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--track", required=True, choices=tracks.TRACKS)
+    ap.add_argument("--retune-cutoffs", action="store_true",
+                    help="kg: re-choose the five class cut-offs on prepared rounds since --since, using each "
+                         "round's real mutations.vcf count; copy the active forest into a new version")
+    ap.add_argument("--since", default="20261007T000000Z", help="with --retune-cutoffs: first round tag included")
+    ap.add_argument("--hold-out", default="20261014", help="with --retune-cutoffs: tag prefix left out of the choice")
     ap.add_argument("--same-rounds-as", help="train on the rounds (of this track) that a track version used")
     ap.add_argument("--promote", action="store_true")
     ap.add_argument("--exclude-rounds", help="file with round dirs to leave out (e.g. a test set)")
@@ -289,6 +387,16 @@ def main():
     ap.add_argument("--round-feats", action="store_true",
                     help="kg: add the round-level measurements (tracks.ROUND_FEATS: which insertion pattern the round has)")
     args = ap.parse_args()
+    if args.retune_cutoffs:
+        if args.track != "kg":
+            sys.exit("--retune-cutoffs is the 1000G track")
+        name, report = retune_cutoffs(args.since, args.hold_out)
+        print(report)
+        print(f"kg version {name} saved")
+        if args.promote:
+            tracks.promote("kg", name, "class cut-offs at each round's real N, one spelling per edited haplotype")
+            print("promoted")
+        return
     POINT_ALPHA = args.point_alpha
     KG_OWN_RULE = args.kg_own_rule
     ROUND_FEATS = args.round_feats
