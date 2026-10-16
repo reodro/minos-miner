@@ -34,7 +34,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k029_20261014T1325) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k030_20261016T1057) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -213,6 +213,13 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   >= 6 spanning reads are judged by their DNA and < 15% carry it. Those steps wrote 106 false and 125 true indels in
   31 monitored rounds. Rule fixed before measuring; frozen GIAB rounds 2026-10-13 22:42 to 10-15 23:54 (31), on the
   monitor's saved answers: +0.0075 per round (t 2.96, better 12 / worse 5 / same 14), 22 false and 6 true indels dropped.
+- k030 (1000G, released 2026-10-16) = k029 + a repeat het/hom model (`k2/homrep.py`, `hom_repeat.joblib`, meta
+  `hom_repeat`): called inserted indels of >= 2 bp in a 1-6 bp tandem repeat spanning >= 8 bp get p_hom from a model
+  that adds repeat unit / span / copies, reads judged by their DNA (carrying / reference / other) and CIGAR stutter.
+  k029's folds, true inserted repeat indels of its 109 rounds: genotype errors >= 2 bp 258 -> 210 (1 bp worse, so
+  1 bp keeps k029's). Release check, 12 live 1000G rounds 2026-10-15 03:30 to 10-16 05:54 (k029 never trained on
+  them), both built and scored like the validator: +0.0096 per round, t 2.22, better 5 / worse 2 / same 5
+  (`test/answer_set/kg_release_check.py`). Without 10-16 05:54, examined before the design: +0.0067.
 
 ## Open work
 

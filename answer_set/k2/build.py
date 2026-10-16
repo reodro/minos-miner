@@ -144,6 +144,17 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         p_any = tracks.apply_source_thr(meta, X_full, p_any, p_raw)
     if len(keys) and meta.get("gt_from_gatk"):
         p_hom = tracks.apply_gt_rule(meta, X_full, p_hom)
+    n_hom_repeat = None
+    if not info["mode_giab"] and meta.get("hom_repeat") and len(keys):
+        # called indels of >= 2 bp in tandem repeats: het/hom from the repeat model (homrep.py)
+        import joblib
+        from answer_set.k2 import homrep
+        m_rep = joblib.load(tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
+                            / "hom_repeat.joblib")
+        fa_h, bam_h = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
+        p_hom, n_hom_repeat = homrep.apply(p_hom, keys, X, X_full[:, FEATURES.index("gatk_person_hom")], p_any, thr,
+                                           bam_h, fa_h, chrom, m_rep)
+        fa_h.close(); bam_h.close()
 
     donor = donors[info["mode_donor"]] if info["mode_giab"] else {}
     kg_own = None
@@ -326,7 +337,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
         "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok",
-        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard,
+        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "hom_repeat": n_hom_repeat,
     }
     (out / "report.json").write_text(json.dumps(report, indent=1))
     return report
