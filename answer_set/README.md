@@ -34,7 +34,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k038_20261017T0834) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k040_20261017T1012) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -235,6 +235,16 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   training, built and scored like the validator (`test/answer_set/kg_compare.py`): vs k030 +0.0251 per round, t 2.15,
   better 12 / worse 6 (k036 = without the decoder: +0.0198). Gains come from the weak rounds: on the 9 where k030
   scored below 99.70, +0.049 each (9/9 better); on the other 9 about even.
+- k040 (1000G, released 2026-10-17) = k038's stack on a base that also sees the GATK evidence:
+  - base k039: the k033 recipe (78 new-pattern rounds) with the fixed-config GATK run's columns (`hcrun.py`; meta
+    `kg_hc`, `features.KG_HC`, `prepare.py --kg-hc`; tables in `cache/answer_set/k2/prepared_kghc`). Probe first: on
+    3 held-out rounds GATK was right on 24 of 58 inserted indels k036 got wrong. Fold genotype errors 530 -> 449 for
+    the base alone; cut-offs snp .9 / 1 bp .8 / 2-3 .8 / 4-7 .65 / 8+ .4;
+  - repeat het/hom (all-indel training) and DNA call model re-trained on k039 (folds: genotype 449 -> ~411;
+    missed/false indels 872/210 -> 851/202); k038's 1000G cluster chooser/arbiter.
+  Release check: 19 live 1000G rounds 2026-10-16 07:06 to 10-17 08:18, held out from every model: vs k038 +0.0350
+  per round, t 3.95, better 16 / worse 3; vs k030 +0.0646 (t 4.61); false records 228 -> 202. Builds run GATK
+  (~45 s more feature time, median build ~4 min).
 
 ## Open work
 
