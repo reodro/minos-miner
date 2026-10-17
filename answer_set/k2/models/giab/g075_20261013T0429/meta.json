@@ -332,7 +332,6 @@
  "point_alpha": 0.5,
  "rd_1bp_factor": 0.5,
  "hap_genotyper": 4,
- "window_genotyper": 2,
  "hc_evidence": 1,
  "spelling": true,
  "spelling_of": "g013_20261003T1402",
