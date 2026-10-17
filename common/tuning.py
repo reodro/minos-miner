@@ -183,6 +183,14 @@ KNOBS_LIST: List[Knob] = [
          "A node slower than this times the fastest is slow: small batches prefer the others."),
     Knob("evaluator.sick_factor", 3.0, 1.5, 20.0, LIVE, "x",
          "A node slower than this times the fleet's median gets no small batches at all, only big ones."),
+    Knob("evaluator.keep_rounds", 3, 1, 50, LIVE, "count",
+         "Rounds the fleet keeps on main and the nodes. Older ones are pruned once none of their jobs is queued or "
+         "running. Each kept round holds its BAM and callsets on every node: raise it for multi-round tuning."),
+    Knob("evaluator.max_copy_share", 0.02, 0.0, 1.0, LIVE, "share",
+         "Most of the ready workers that slow-batch copies may hold at once (0 turns copies off)."),
+    Knob("evaluator.lost_factor", 6.0, 2.0, 100.0, LIVE, "x",
+         "A GATK run outstanding this many times its expected time (and at least 10 minutes) is lost: its jobs are "
+         "queued again and the node is told to drop it."),
     Knob("main.resubmit_interval_s", 300.0, 0.0, 3600.0, ROUND, "s", "Least time between two submissions."),
     Knob("main.resubmit_margin", 0.0, 0.0, 5.0, ROUND, "score", "A new best must gain this much to be resubmitted."),
     Knob("main.stop_before_deadline_s", 60.0, 10.0, 900.0, ROUND, "s", "The search stops this long before the deadline."),

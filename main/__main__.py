@@ -145,6 +145,10 @@ def main() -> None:
     from common.tuning import TUNING
     TUNING.use_file()                             # tuning.json overrides (the dashboard edits it); re-read on change
     import evaluator
+    import signal
+    import sys
+    for sig in (signal.SIGTERM, signal.SIGHUP):   # kill / a closed terminal: run the finally below, which stops the
+        signal.signal(sig, lambda signum, _: sys.exit(128 + signum))   # node agents (Python skips it by default)
     fleet = evaluator.fleet_executor(args.fleet) if args.fleet else None
     scoring = None if fleet is not None else evaluator.scoring_pool(args.workers)   # the nodes score on a fleet
     run_id = None

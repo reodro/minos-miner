@@ -44,6 +44,49 @@ from evaluator.fleet.inventory import REPO, code_digest
 from evaluator.pool import _proc_init, _proc_score_unit
 
 log = logging.getLogger("node")
+WATCHDOG_S = 120.0            # main pings every 20 s (coordinator.PING_S): this long without a line, main is gone
+AGENTS = os.path.join(os.path.expanduser("~"), ".minos", "fleet", "agents")   # <prefix>.pid of every live agent
+
+
+def register(prefix: str) -> None:
+    """Record this agent's container prefix and pid, after killing the GATK jobs of agents that died without cleaning
+    up (killed, or the node rebooted): their prefixes are on file with a pid that no longer runs. A live agent's jobs
+    are left alone - another main may be using this node."""
+    os.makedirs(AGENTS, exist_ok=True)
+    for name in os.listdir(AGENTS):
+        if not name.endswith(".pid"):
+            continue
+        path = os.path.join(AGENTS, name)
+        try:
+            with open(path) as f:
+                pid = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            pid = 0
+        alive = False
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                alive = True
+        if not alive:
+            log.warning("agent %s (pid %d) is gone: killing its leftover GATK jobs", name[:-4], pid)
+            reap(name[:-4])
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    with open(os.path.join(AGENTS, f"{prefix}.pid"), "w") as f:
+        f.write(str(os.getpid()))
+
+
+def unregister(prefix: str) -> None:
+    try:
+        os.remove(os.path.join(AGENTS, f"{prefix}.pid"))
+    except OSError:
+        pass
 
 
 
@@ -102,6 +145,8 @@ class Node:
         self._by_digest_lock = threading.Lock()
         self._group_of: Dict[str, int] = {}                  # job id -> the GATK batch (group) it was sent in
         self._group_ids = itertools.count()
+        self._heard = time.time()                            # when main last wrote anything (watchdog)
+        self._pinged = False                                 # main sends pings (so silence means it is gone)
 
     # ---- messages -----------------------------------------------------------------------------------------------
     def send(self, msg: dict) -> None:
@@ -111,6 +156,7 @@ class Node:
 
     def _reader(self) -> None:
         for line in sys.stdin:
+            self._heard = time.time()
             line = line.strip()
             if line:
                 try:
@@ -118,6 +164,11 @@ class Node:
                 except json.JSONDecodeError:
                     log.warning("bad line from main: %.200s", line)
         self._stop.set()                                      # main is gone
+
+    def _silent(self) -> bool:
+        """Main has written nothing (not even its ping, every PING_S) for WATCHDOG_S: it is gone even though the
+        ssh channel is still open. Before main's first ping it is never called silent (an older main sends none)."""
+        return self._pinged and time.time() - self._heard > WATCHDOG_S
 
     # ---- rounds -------------------------------------------------------------------------------------------------
     def prepare_round(self, msg: dict) -> None:
@@ -164,11 +215,15 @@ class Node:
     def forget_rounds(self, keep: set) -> None:
         """Rounds main no longer keeps: drop their answer sets and scoring caches, and delete their BAM and callsets
         (a node serves for days on a small disk)."""
-        for rid in [r for r in set(self._rounds) | set(self._asets) if r not in keep]:
+        for rid in [r for r in set(self._rounds) | set(self._asets) | set(self._held) if r not in keep]:
             rnd = self._rounds.pop(rid, None)
             with self._held_lock:
                 self._asets.pop(rid, None)
-                self._held.pop(rid, None)
+                held = self._held.pop(rid, [])
+            if rid not in self._aborted:                      # main may still wait for these: report, never drop
+                for c in (c for unit in held for c in unit if c.job_id not in self._dropped):
+                    self.send({"type": "result", "callset": codec.callset_to(
+                        replace(c, ok=False, error="round forgotten on this node before its answer set came"))})
             for sc in self._scorers:
                 drop = getattr(sc, "drop", None)
                 if drop:
@@ -229,9 +284,14 @@ class Node:
                 unit = self._to_score.get(timeout=1.0)
             except queue.Empty:
                 continue
-            unit = [c for c in unit if c.round_id in self._rounds and c.job_id not in self._dropped]
+            unit = [c for c in unit if c.job_id not in self._dropped and c.round_id not in self._aborted]
+            gone = [c for c in unit if c.round_id not in self._rounds]
+            for c in gone:                                     # main still waits for these: never drop them silently
+                self.send({"type": "result", "callset": codec.callset_to(
+                    replace(c, ok=False, error="round forgotten on this node before scoring"))})
+            unit = [c for c in unit if c.round_id in self._rounds]
             if not unit:
-                continue                                       # a round pruned meanwhile: nothing to report
+                continue
             rid = unit[0].round_id
             with self._held_lock:
                 aset = self._asets.get(rid)
@@ -306,12 +366,19 @@ class Node:
         for i in range(self.score_threads):
             threading.Thread(target=self._scorer, args=(i,), daemon=True).start()
         while not self._stop.is_set():
+            if self._silent():
+                log.error("main silent for %.0f s: stopping (its GATK jobs are killed)", time.time() - self._heard)
+                self._stop.set()
+                break
             while True:
                 try:
                     msg = self._in.get_nowait()
                 except queue.Empty:
                     break
-                if msg["type"] == "round":
+                if msg["type"] == "ping":
+                    self._pinged = True
+                elif msg["type"] == "round":
+                    self._aborted.discard(msg["round"]["round_id"])   # main reopened a round it had ended
                     self.forget_rounds(set(msg.get("keep") or [msg["round"]["round_id"]]) | {msg["round"]["round_id"]})
                     threading.Thread(target=self.prepare_round, args=(msg,), daemon=True).start()
                 elif msg["type"] == "answer_set":
@@ -384,9 +451,17 @@ def main() -> None:
         print(json.dumps(result)); return
     node = Node(workers, runner, scorer_factory, a.score_threads,
                 score_dir=None if a.fake else os.path.join(SETTINGS.cache_dir, "dcache"))
+    if not a.fake:
+        register(prefix)
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGHUP):               # a killed session or a hang-up: stop and clean up
+        signal.signal(sig, lambda *_: node._stop.set())
     node.send({"type": "ready", "code": code, "workers": workers, **result})
     if not result["ok"]:
-        log.error("self-test failed: %s != %s", result["digest"], result["expected"]); return
+        log.error("self-test failed: %s != %s", result["digest"], result["expected"])
+        if not a.fake:
+            unregister(prefix)
+        return
     try:
         node.serve()
     finally:
@@ -394,6 +469,7 @@ def main() -> None:
             node._pool.shutdown(wait=False, cancel_futures=True)
         if not a.fake:
             reap(prefix)
+            unregister(prefix)
 
 
 if __name__ == "__main__":
