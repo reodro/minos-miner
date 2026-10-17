@@ -268,6 +268,7 @@ class SmallBatchRoutingTest(unittest.TestCase):
         d = ranges().defaults("gatk").params
         fast = _Session(host=None, workers=1, ready=True, rounds_ready={r.round_id}, solo_s=100.0)
         slow = _Session(host=None, workers=4, ready=True, rounds_ready={r.round_id}, solo_s=300.0)
+        slow.last_solo_ts = ex._now()                              # just measured: no probe due (tests.test_fleet_fixes)
         ex._sessions = {"fast": fast, "slow": slow}
         ex.submit([EvalJob("A", r, Config("gatk", {**d, "min_pruning": 3}), batch="small", priority=3)])
         self.assertIn("A", fast.jobs)                              # a fast node is free: the waited-for result goes there
@@ -382,6 +383,7 @@ class NodeHealthTest(unittest.TestCase):
         a = _Session(host=None, workers=1, ready=True, rounds_ready={r.round_id}, solo_s=100.0)
         b = _Session(host=None, workers=1, ready=True, rounds_ready={r.round_id}, solo_s=100.0)
         c = _Session(host=None, workers=2, ready=True, rounds_ready={r.round_id}, solo_s=400.0)   # > 3x the median
+        c.last_solo_ts = ex._now()                                 # just measured: no probe due (tests.test_fleet_fixes)
         ex._sessions = {"a": a, "b": b, "c": c}
         ex.submit([EvalJob("S1", r, Config("gatk", {**d, "min_pruning": 3}), batch="small", priority=3)])
         ex.submit([EvalJob("S2", r, Config("gatk", {**d, "min_pruning": 4}), batch="small", priority=3)])

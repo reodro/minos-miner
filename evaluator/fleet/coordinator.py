@@ -46,7 +46,10 @@ LOG_DIR = Path.home() / ".minos" / "fleet" / "logs"
 SPEEDS = Path.home() / ".minos" / "fleet" / "speeds.json"   # host -> measured solo time, so routing is right from the start
 SOLO_EMA = 0.3                # weight of each new solo-time sample in a node's running estimate
 PING_S = 20.0                 # a session's writer sends a ping when it has written nothing for this long
-LOST_MIN_S = 600.0            # a run is never called lost sooner than this
+LOST_MIN_S = 2400.0           # a run is never called lost sooner than this: past the node's own GATK timeout (1800 s,
+                              # GatkRunner) plus scoring. 600 s killed slow but healthy runs (big assembly jumps take
+                              # 15-25 min) and restarted them again and again (2026-10-17)
+PROBE_S = 300.0               # a node marked slow or sick gets one small batch at most this often, to measure it again
 # Tunable (common/tuning.py): evaluator.keep_rounds (rounds kept on main and nodes; a round with queued or running
 # jobs is never pruned), evaluator.overdue (a small batch running this many times its expected time is a straggler and
 # may be copied), evaluator.max_copy_share (most of the workers copies may hold at once), evaluator.lost_factor (a run
@@ -100,6 +103,7 @@ class _Session:
     logf: Optional[object] = None                            # the node's stderr, kept per host
     solo_s: float = SOLO_S                                   # measured: seconds one solo GATK run takes THERE (EMA)
     solo_samples: int = 0
+    last_solo_ts: float = 0.0                                # when solo_s last learned (0: never in this run)
 
     @property
     def name(self) -> str:
@@ -108,15 +112,17 @@ class _Session:
     def open_groups(self) -> int:
         return len(self.groups)
 
-    def note_group_done(self, units: float, seconds: float) -> None:
+    def note_group_done(self, units: float, seconds: float, now: Optional[float] = None) -> None:
         """A whole group came back after `seconds`: one solo-run-equivalent took seconds / units here. Learned
         from small groups only (at most a small batch's work): the cost table is least wrong there, and big
-        batches' errors made healthy nodes look 2-3x slower in the v4 fleet run."""
+        batches' errors made healthy nodes look 2-3x slower in the v4 fleet run. The first sample of a run replaces
+        the speed carried from the last run."""
         if units > batch_limit("small") + 1e-6:
             return
         sample = min(3600.0, max(0.05, seconds / max(units, 0.05)))
         self.solo_s = sample if self.solo_samples == 0 else (1 - SOLO_EMA) * self.solo_s + SOLO_EMA * sample
         self.solo_samples += 1
+        self.last_solo_ts = time.time() if now is None else now
 
     def send(self, msg: dict) -> bool:
         """Queue a message for the node. Writing happens on the session's writer thread, so a slow link never
@@ -314,7 +320,7 @@ class FleetExecutor:
             g.due -= 1
             if g.due <= 0:                                        # every result of the run came back from here
                 if not g.duplicate:                               # a copy's short time would teach the node it is faster than it is
-                    s.note_group_done(g.units, self._now() - g.t0)
+                    s.note_group_done(g.units, self._now() - g.t0, self._now())
                 s.gatk_runs_done += 1
                 del s.groups[gid]
                 if s.solo_samples % 10 == 1:
@@ -723,7 +729,10 @@ class FleetExecutor:
                     if s.ready and id(s) not in stuck and s.open_groups() < s.workers]
             able = [s for s in free if job.round.round_id in s.rounds_ready]
             big_only = False
-            if able and job.batch == "small":
+            due = [s for s in able if self._probe_due(s, fastest)] if job.batch == "small" else []
+            if due:
+                s = due[0]                                     # measure a slow or sick node again (see _probe_due)
+            elif able and job.batch == "small":
                 well = [s for s in able if s.solo_s <= sick]
                 fast = [s for s in well if s.solo_s <= tune("evaluator.slow_factor") * fastest]
                 if well:
@@ -738,6 +747,18 @@ class FleetExecutor:
                 break
             if not self._dispatch(s, big_only):
                 stuck.add(id(s))
+
+    def _probe_due(self, s: "_Session", fastest: float) -> bool:
+        """A node marked slow or sick takes one small batch, at most every PROBE_S, so its speed is measured again.
+        Its speed is learned from small batches only, and a sick node gets none, so a speed carried over from the last
+        run (speeds.json) or one bad stretch kept it sick for the whole run: on 2026-10-17 node 3 stayed at 1106 s per
+        run (last run's value, never updated) and its big batches buried it in scoring. The first measurement of a run
+        replaces the carried value. Lock held."""
+        if s.solo_s <= tune("evaluator.slow_factor") * fastest:
+            return False
+        if any(g.batch == "small" for g in s.groups.values()):
+            return False
+        return self._now() - s.last_solo_ts >= PROBE_S
 
     def _sick_limit(self, ready: List["_Session"]) -> float:
         """Solo time above which a node is sick (evaluator.sick_factor x the ready nodes' median)."""

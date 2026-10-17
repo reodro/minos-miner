@@ -252,6 +252,9 @@ class Node:
                                     if k in ("small", "big") and isinstance(v, (int, float)) and v >= 1.0}
         for group in msg["groups"]:
             jobs = [codec.job_from(d) for d in group]
+            # A job main sends again (it reclaimed a run this node had been told to drop) keeps its id: it is wanted
+            # now. Left in _dropped, its result was discarded here and main waited for it forever (2026-10-17).
+            self._dropped.difference_update(j.job_id for j in jobs)
             local = self._rounds.get(jobs[0].round.round_id)
             if local is None:                                 # never sent before round_ready; a safe answer anyway
                 for j in jobs:

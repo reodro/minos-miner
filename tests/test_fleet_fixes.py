@@ -118,11 +118,11 @@ class LostRunTest(unittest.TestCase):
         ex._now = lambda: 1000.0
         ex.submit([EvalJob("L", r, Config("gatk", dict(d)))])
         self.assertIn("L", a.jobs)
-        ex._now = lambda: 1000.0 + 500.0                           # long, but under the 10-minute floor
+        ex._now = lambda: 1000.0 + 2000.0                          # long, but under the 40-minute floor
         ex.poll(0)
         self.assertIn("L", a.jobs)
         b.workers = 1
-        ex._now = lambda: 1000.0 + 700.0                           # > 6 x 100 s and > 600 s: lost
+        ex._now = lambda: 1000.0 + 2500.0                          # > 6 x 100 s and > 2400 s: lost
         with unittest.mock.patch.object(C, "round_message",
                                         lambda h, rr, u, v: {"type": "round", "round": {"round_id": rr.round_id}}):
             ex.poll(0)
@@ -134,6 +134,39 @@ class LostRunTest(unittest.TestCase):
         cs = CallSet(r.round_id, Config("gatk", dict(d)).key, "/x.vcf.gz", "d", 1.0, job_id="L")
         ex._result(b, cs)
         self.assertEqual([c.job_id for c in ex.poll(0)], ["L"])
+
+
+class ProbeTest(unittest.TestCase):
+    def test_a_node_marked_sick_by_a_carried_speed_is_measured_again(self):
+        ex = _ex()
+        r = _round(1)
+        d = ranges().defaults("gatk").params
+        fast = _session(workers=4, rounds={r.round_id}, solo_s=200.0)
+        sick = _session(workers=4, rounds={r.round_id}, solo_s=1106.0)   # last run's speeds.json value
+        ex._sessions = {"fast": fast, "sick": sick}
+        ex._now = lambda: 1000.0
+        ex.submit([EvalJob("S1", r, Config("gatk", {**d, "min_pruning": 3}), batch="small"),
+                   EvalJob("S2", r, Config("gatk", {**d, "min_pruning": 4}), batch="small")])
+        self.assertIn("S1", sick.jobs)                               # one probe goes to the sick node ...
+        self.assertIn("S2", fast.jobs)                               # ... the next small batch to the fast one
+        ex._now = lambda: 1000.0 + 210.0
+        cs = CallSet(r.round_id, Config("gatk", {**d, "min_pruning": 3}).key, "/x.vcf.gz", "d", 1.0, job_id="S1")
+        ex._result(sick, cs)
+        self.assertAlmostEqual(sick.solo_s, 210.0)                  # the carried 1106 s is replaced at once
+        self.assertEqual(sick.last_solo_ts, 1210.0)
+
+    def test_no_second_probe_before_the_interval(self):
+        ex = _ex()
+        r = _round(1)
+        d = ranges().defaults("gatk").params
+        fast = _session(workers=4, rounds={r.round_id}, solo_s=200.0)
+        slow = _session(workers=4, rounds={r.round_id}, solo_s=900.0)
+        slow.last_solo_ts = 1000.0 - 100.0                            # measured 100 s ago
+        ex._sessions = {"fast": fast, "slow": slow}
+        ex._now = lambda: 1000.0
+        ex.submit([EvalJob("S1", r, Config("gatk", {**d, "min_pruning": 3}), batch="small")])
+        self.assertIn("S1", fast.jobs)
+        self.assertEqual(slow.jobs, {})
 
 
 class CopyCapTest(unittest.TestCase):
@@ -198,6 +231,18 @@ class NodeTest(unittest.TestCase):
         node.forget_rounds(set())
         got = [codec.callset_from(m["callset"]) for m in out if m.get("type") == "result"]
         self.assertEqual([(c.job_id, c.ok) for c in got], [("J2", False)])
+
+    def test_a_job_sent_again_after_a_drop_is_wanted_again(self):
+        node, out = self._node()
+        node._dropped.update({"J3", "J4"})                           # main had told this node to drop them
+        node._rounds["2026-01-01T00:00:00+00:00"] = None             # take_jobs only needs the key
+        from evaluator.fleet import codec
+        d = ranges().defaults("gatk").params
+        job = EvalJob("J3", _round(1), Config("gatk", dict(d)))
+        with unittest.mock.patch.object(node.executor, "submit"):
+            node.take_jobs({"groups": [[codec.job_to(job)]]})
+        self.assertNotIn("J3", node._dropped)                        # its result will be reported
+        self.assertIn("J4", node._dropped)
 
     def test_the_watchdog_waits_for_main_s_first_ping(self):
         import evaluator.fleet.node as N
