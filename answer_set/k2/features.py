@@ -2,6 +2,7 @@
 import bisect
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from collections import Counter
@@ -45,6 +46,9 @@ KG_HAPGENO = int(os.environ.get("MINOS_KG_HG", "0"))
 HC_EVIDENCE = int(os.environ.get("MINOS_HC", "0"))
 # 1000G rounds with the same GATK evidence (meta kg_hc = the hcrun.VERSION; build.py sets it, prepare.py --kg-hc)
 KG_HC = int(os.environ.get("MINOS_KG_HC", "0"))
+# the GATK run gets this long from the start of extraction (normally 35-90 s); past it the run is stopped and skipped,
+# and build.py uses the model's hc_fallback version (one trained without the GATK evidence)
+HC_BUDGET_S = 300
 # 1000G rounds: read-comparison candidates judged per SITE for indels >= 2 bp (meta kg_site_rule; build.py sets it).
 # In tandem repeats Minos's inserted indel shows up in the edited reads at several lengths, so no single length reaches
 # 25% of the reads or is the strongest at its spot (2026-10-09, 26 new-pattern rounds: 0.9 / 0.7 / 0.5 inserted
@@ -267,6 +271,39 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     chrom, a, b = parse_region(region)
+    # The GATK run (hcrun) needs only the BAM and the region, so it starts now and runs while the read scan, the
+    # originals' download, the read comparison and the genotyper do (2026-10-17: it was ~a third of a 1000G build,
+    # run after them). Its result is taken where it is used below; an error surfaces there, as before.
+    import concurrent.futures as _cf
+    _hc_pool = _cf.ThreadPoolExecutor(1) if (HC_EVIDENCE or KG_HC) else None
+    _hc_future, _hc_deadline = None, time.monotonic() + HC_BUDGET_S
+    if _hc_pool is not None:
+        from answer_set.k2 import hcrun as _hcrun
+        _hc_future = _hc_pool.submit(_hcrun.run, str(bam), str(ref_path(chrom)), chrom, a, b, workdir,
+                                     pieces=max(1, threads))
+    try:
+        return _extract(bam, region, workdir, threads, cand_vcf, reuse, chrom, a, b, (_hc_future, _hc_deadline))
+    finally:
+        if _hc_pool is not None:                 # a run that is still going was stopped (_hc_result); never wait on it
+            _hc_pool.shutdown(wait=bool(_hc_future is None or _hc_future.done()))
+
+
+def _hc_result(hc_job):
+    """The early GATK run's calls, or RuntimeError when it failed or ran past HC_BUDGET_S (its containers are stopped)."""
+    import concurrent.futures as _cf
+    future, deadline = hc_job
+    try:
+        return future.result(timeout=max(0.0, deadline - time.monotonic()))
+    except _cf.TimeoutError:
+        future.cancel()
+        ids = subprocess.run(["docker", "ps", "-q", "--filter", f"name=k2-hc-{os.getpid()}-"], capture_output=True,
+                             text=True).stdout.split()
+        if ids:
+            subprocess.run(["docker", "rm", "-f", *ids], capture_output=True)
+        raise RuntimeError(f"GATK run skipped: not done within {HC_BUDGET_S} s")
+
+
+def _extract(bam, region, workdir, threads, cand_vcf, reuse, chrom, a, b, hc_job):
     cached = workdir / "cand.raw.vcf.gz"
     if cand_vcf:
         raw = Path(cand_vcf)
@@ -549,7 +586,8 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
     if (HC_EVIDENCE and mode_giab) or (KG_HC and not mode_giab):
         from answer_set.k2 import hcrun
         try:
-            hc = hcrun.run(str(bam), str(ref_path(chrom)), chrom, a, b, workdir, pieces=max(1, threads))
+            hc = (_hc_result(hc_job) if hc_job[0] is not None else
+                  hcrun.run(str(bam), str(ref_path(chrom)), chrom, a, b, workdir, pieces=max(1, threads)))
         except Exception as e:  # noqa: BLE001  (never stuck: the model sees NaN for the run's measurements)
             rd_info["hc_error"] = str(e)[:500]
         if hc is not None:

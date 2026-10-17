@@ -337,5 +337,6 @@
   "trained_on": 78,
   "note": "clusterdec.py on 1000G: chooser + arbiter trained on 1000G clusters (kg_clusterdec_train.py)"
  },
- "cluster_decoder_of": "k038_20261017T0834 (1000G chooser/arbiter)"
+ "cluster_decoder_of": "k038_20261017T0834 (1000G chooser/arbiter)",
+ "hc_fallback": "k038_20261017T0834"
 }

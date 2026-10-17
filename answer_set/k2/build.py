@@ -127,6 +127,14 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     keys, X, info, donors, beds = extract(bam, region, out / "work", threads)
     t_feat = time.time() - t0
     track = tracks.track_of_info(info)
+    hc_fallback = None
+    vname0 = (track_versions or {}).get(track) or tracks.active_name(track)
+    meta0 = tracks.meta(track, vname0) if vname0 else {}
+    if (track == "kg" and meta0.get("kg_hc") and not info.get("hc_evidence") and meta0.get("hc_fallback")):
+        # the GATK run failed or was skipped (features.HC_BUDGET_S): this version needs it, so the round is built with
+        # its fallback, a version trained without the GATK evidence (all its measurements are in X already)
+        hc_fallback = meta0["hc_fallback"]
+        track_versions = dict(track_versions or {}, **{track: hc_fallback})
     # the format's own track: its own models, measurements, threshold and rules
     m_any, m_hom, meta, used = tracks.load(track, (track_versions or {}).get(track), exclude_round)
     thr = meta["threshold"]
@@ -361,7 +369,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
         "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok",
-        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "hom_repeat": n_hom_repeat, "call_dna": n_call_dna,
+        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "hom_repeat": n_hom_repeat, "call_dna": n_call_dna, "hc_fallback": hc_fallback,
     }
     (out / "report.json").write_text(json.dumps(report, indent=1))
     return report
