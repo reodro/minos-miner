@@ -35,6 +35,31 @@ CORE_BAND = 0.01               # the core and fp groups: core within this of the
 _TAG = re.compile(r"(2026\d{4}T\d{6,7})")
 
 
+GENERALISTS = Path(SETTINGS.data_dir) / "portfolio" / "generalists.json"
+
+
+def generalists(space, n: int, path: Path = GENERALISTS) -> List[Config]:
+    """The best cross-round configs (test/bench/generalist.py: a GA whose fitness is the mean score against each round's
+    field median over 9 earlier rounds), best first, snapped onto this round's space. Empty when there is no file.
+
+    2026-10-17: on 39 rounds the best opening seed was 0.2-0.6 below the field median, and none of our configs scored on
+    5+ rounds averaged above it; the miners that reach the top every round start from configs that generalise."""
+    if n <= 0 or not path.exists():
+        return []
+    try:
+        rows = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    out: List[Config] = []
+    for r in rows:
+        c = space._assemble(dict(r.get("params", r)))
+        if c is not None and all(c.key != x.key for x in out):
+            out.append(c)
+        if len(out) >= n:
+            break
+    return out
+
+
 def bam_profile(bam: str, chrom: str, start: int, end: int, reads: int = 300) -> Optional[str]:
     """"A" when most reads of the region are at least LONG_READS long, else "B"; None when the BAM cannot be read."""
     try:

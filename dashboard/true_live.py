@@ -37,7 +37,26 @@ def _read_out() -> dict:
         return {}
 
 
+# htsjdk and bgzip end every BGZF file with this empty block when they close it. A file still being written (GATK
+# writes the VCF in place; a node may be re-running the config, or an aborted duplicate left a cut-off file) lacks it.
+BGZF_EOF = bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000")
+
+
+def _complete(path: Path) -> bool:
+    """True when `path` is a whole BGZF file (it ends with the EOF block)."""
+    try:
+        size = path.stat().st_size
+        if size < len(BGZF_EOF):
+            return False
+        with open(path, "rb") as f:
+            f.seek(size - len(BGZF_EOF))
+            return f.read() == BGZF_EOF
+    except OSError:
+        return False
+
+
 def _indexed(path: str) -> str:
+    """Index our own copy (in WORK), never the evaluator's file next to a running GATK."""
     p = Path(path)
     if not Path(str(p) + ".tbi").exists() and not Path(str(p) + ".csi").exists():
         subprocess.run(["bcftools", "index", "-f", str(p)], check=True, timeout=120, capture_output=True)
@@ -45,29 +64,47 @@ def _indexed(path: str) -> str:
 
 
 def _pull(tag: str, key: str) -> str | None:
-    """The best config's VCF, from this machine or the fleet node that ran it."""
+    """The best config's VCF, from this machine or a fleet node that has a complete copy. Every copy lands in WORK
+    and is checked whole (BGZF end block) before it is indexed or scored; a cut-off copy is deleted and the next host
+    is tried. None: no complete copy yet (the next pass, 20 s later, tries again)."""
+    dest = WORK / tag / f"{key}_{FULL}.vcf.gz"
+    if _complete(dest):
+        return _indexed(str(dest))
+    dest.parent.mkdir(parents=True, exist_ok=True)
     local = Path(SETTINGS.cache_dir) / "callsets" / tag / f"{key}_{FULL}.vcf.gz"
-    if local.exists():
-        return _indexed(str(local))
+    if _complete(local):
+        tmp = dest.with_name(dest.name + ".part")
+        subprocess.run(["cp", str(local), str(tmp)], check=True, timeout=60)
+        if _complete(tmp):
+            os.replace(tmp, dest)
+            return _indexed(str(dest))
+        tmp.unlink(missing_ok=True)
     from evaluator.fleet.inventory import ensure_agent, load
     hosts = load()
     ensure_agent(hosts)
-    dest = WORK / tag / f"{key}_{FULL}.vcf.gz"
     for h in hosts:
         remote = f"{h.repo}/cache/callsets/{tag}/{key}_{FULL}.vcf.gz"
         probe = subprocess.run(h.ssh(f"test -f {shlex.quote(remote)}"), capture_output=True, timeout=30)
         if probe.returncode != 0:
             continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if h.local:
-            subprocess.run(["cp", "-a", remote, str(dest)], check=True, timeout=60)
-        else:
-            ssh = " ".join(["ssh", *h.ssh_opts()])
-            subprocess.run(
-                ["rsync", "-a", "--partial", "-e", ssh, f"{h.user}@{h.host}:{remote}", str(dest)],
-                check=True, timeout=180, capture_output=True)
-        if dest.exists():
+        tmp = dest.with_name(dest.name + ".part")
+        tmp.unlink(missing_ok=True)
+        try:
+            if h.local:
+                subprocess.run(["cp", remote, str(tmp)], check=True, timeout=60)
+            else:
+                ssh = " ".join(["ssh", *h.ssh_opts()])
+                subprocess.run(["rsync", "-a", "-e", ssh, f"{h.user}@{h.host}:{remote}", str(tmp)],
+                               check=True, timeout=180, capture_output=True)
+        except subprocess.SubprocessError:
+            tmp.unlink(missing_ok=True)
+            continue
+        if _complete(tmp):
+            os.replace(tmp, dest)
+            for stale in (Path(str(dest) + ".tbi"), Path(str(dest) + ".csi")):
+                stale.unlink(missing_ok=True)
             return _indexed(str(dest))
+        tmp.unlink(missing_ok=True)                            # still being written there: try the next host
     return None
 
 

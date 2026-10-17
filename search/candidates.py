@@ -1,8 +1,11 @@
 """Step A: candidates (search/DESIGN.md, Step A).
 
-    wave 0      the defaults, the official seed, the portfolio (up to candidates.portfolio_share of the workers: the
-                round's read-length profile first, deduplicated, never the round being replayed) and a Latin hypercube
-                for the rest; each point carries candidates.riders calling-threshold riders (one GATK run).
+    wave 0      the defaults, the official seed, validator-edge seeds (min_pruning 1, active 0.0001,
+                haplotypes 256/512, calling 0/20, contamination 0.15, ploidy 1/3, soft-clips on),
+                the portfolio (up to candidates.portfolio_share of the
+                workers: the round's read-length profile first, deduplicated, never the round being replayed)
+                and a Latin hypercube for the rest; each point carries candidates.riders calling-threshold
+                riders (one GATK run).
                 The default wait is candidates.launch_back. MINOS_FAST_HANDOFF=1 ends the opening once half
                 of it is back and the best score has stood still for 90 seconds. That flag is an experiment,
                 not the default.
@@ -14,11 +17,11 @@
                 generation 1 breeds within each group. MINOS_RF_UCB adds a forest share of that generation.
                 Generations 2 and 3 are not run.
     pick        the best score first, then the best of the fp, core and both groups in turn, each at least
-                candidates.min_distance (callset distance) from the ones taken. Step B climbs the first
-                n = max(1, workers // candidates.workers_per_candidate) at once.
-
-Wave 0 is bounded by candidates.max_min (20 minutes, scaled). Generation 1 then gets candidates.generation_min
-(12 minutes, scaled).
+                candidates.min_distance (callset distance) from the ones taken. The last opening seat is the
+                edge family (validator-legal values the published API does not propose), even when it is
+                up to 20 behind. Family A (PCR NONE/CONSERVATIVE × large assembly) is a local opt ~1.6
+                below the king on 20261010T044200Z; a PCR flip on this shelf is still this table.
+                Step B climbs the first n = max(1, workers // candidates.workers_per_candidate) at once.
 """
 from __future__ import annotations
 
@@ -41,7 +44,42 @@ log = logging.getLogger(__name__)
 PARENTS = 60          # parents are the best scores that stay at least the seat distance apart
 SEAT_GAP = 0.10        # a near seat must be within this of the best; the far seat (B27) may sit up to 1.0 below
 FAR_SEAT_FLOOR = 1.0   # same cap as climb.REPLACEMENT_FLOOR: a far seat further than this is not opened
+FAMILY_SEAT_FLOOR = 20.0  # edge seeds can open well below this shelf; 3.0 dropped family A, 1.0 drops everything
 ELITE_MIN_DIFFS = 4    # same as climb.SIMILAR_SETTINGS: an elite-anchored child must leave the elite's hill
+# Published API box. A reserved-seat config sits outside it on at least one of these axes.
+API_MIN_PRUNING = 2
+API_MIN_DANGLING = 2
+API_MIN_ACTIVE = 0.001
+API_MAX_HAPLOTYPES = 128
+API_MAX_CONTAM = 0.05
+API_MIN_CALLING = 30.0
+API_MAX_AR = 700
+API_MIN_READS = 25
+API_PLOIDY = 2
+# Scouts snap onto validator-edge rungs, not family A (PCR NONE/CONSERVATIVE × large assembly).
+EDGE_SCOUT_CHOICES = {
+    "min_pruning": (1,),
+    "min_dangling_branch_length": (1,),
+    "active_probability_threshold": (0.0001, 0.0002, 0.0005),
+    "max_num_haplotypes_in_population": (160, 192, 256, 384, 512),
+    "contamination_fraction_to_filter": (0.08, 0.15, 0.25, 0.5),
+    "standard_min_confidence_threshold_for_calling": (0.0, 10.0, 20.0),
+    "max_assembly_region_size": (800, 900, 1000),
+    "max_reads_per_alignment_start": (0,),
+    "sample_ploidy": (1, 3),
+    "dont_use_soft_clipped_bases": (True,),
+}
+EDGE_SCOUT_AXES = 4
+
+
+def n_seats(ctx) -> int:
+    """How many hills climb at once. Rank 1 needs the edge family beside the best B, so two seats
+    whenever there are at least two workers. `workers_per_candidate` only adds seats above that."""
+    cap = max(1, int(getattr(ctx, "cap", 1) or 1))
+    n = max(1, cap // int(tune("candidates.workers_per_candidate")))
+    if cap >= 2:
+        return max(2, n)
+    return n
 STEP_B_MUTATE_START = 0.3   # share of Step B children mutated at the start of the climb
 STEP_B_MUTATE_END = 0.7     # that share at the end of Step B; linear in between
 STEP_C_MUTATE = (0.3, 0.6)  # Step C generation 1, then generation 2
@@ -89,6 +127,8 @@ def _mutate_note(ctx) -> str:
 # The configuration that held a high score on 20261010T044200Z. It is the Step A
 # metric: after the interval is chosen from scored configs, record whether this
 # configuration lies inside it. It is not a seed and it does not set the interval.
+# The edge-family seeds below are built on it, so a replay of REFERENCE_ROUND skips them.
+REFERENCE_ROUND = "20261010T044200Z"
 REFERENCE_PEAK = {
     "min_base_quality_score": 24, "min_mapping_quality_score": 46, "base_quality_score_threshold": 33,
     "standard_min_confidence_threshold_for_calling": 80.0, "pcr_indel_model": "AGGRESSIVE", "min_pruning": 2,
@@ -109,6 +149,74 @@ OFFICIAL_SEED = {
     "phred_scaled_global_read_mismapping_rate": 45, "heterozygosity": 0.002154, "indel_heterozygosity": 0.000125,
     "contamination_fraction_to_filter": 0.04, "max_reads_per_alignment_start": 116,
 }
+def _edge_seed(**over) -> dict:
+    return {**REFERENCE_PEAK, **over}
+
+
+# Validator-legal values the published API does not propose. Family A (PCR NONE/CONSERVATIVE ×
+# large assembly) is a local opt on this shelf; those seeds stay in wave 0 via OFFICIAL_SEED only.
+INDEL_FAMILY_SEEDS = (
+    _edge_seed(min_pruning=1),
+    _edge_seed(active_probability_threshold=0.0001),
+    _edge_seed(max_num_haplotypes_in_population=256),
+    _edge_seed(max_num_haplotypes_in_population=512),
+    _edge_seed(contamination_fraction_to_filter=0.15),
+    _edge_seed(standard_min_confidence_threshold_for_calling=20.0),
+    _edge_seed(standard_min_confidence_threshold_for_calling=0.0),
+    _edge_seed(min_dangling_branch_length=1),
+    _edge_seed(max_assembly_region_size=1000),
+    _edge_seed(sample_ploidy=1),
+    _edge_seed(sample_ploidy=3),
+    _edge_seed(dont_use_soft_clipped_bases=True),
+    _edge_seed(max_reads_per_alignment_start=0),
+    _edge_seed(min_pruning=1, active_probability_threshold=0.0001,
+               max_num_haplotypes_in_population=256, dont_use_soft_clipped_bases=True,
+               standard_min_confidence_threshold_for_calling=20.0),
+)
+
+
+def in_indel_family(c: Config) -> bool:
+    """The reserved far-seat box: at least one setting outside the published API box."""
+    p = c.params
+    pruning = p.get("min_pruning")
+    if pruning is not None and pruning < API_MIN_PRUNING:
+        return True
+    dangling = p.get("min_dangling_branch_length")
+    if dangling is not None and dangling < API_MIN_DANGLING:
+        return True
+    active = p.get("active_probability_threshold")
+    if active is not None and active < API_MIN_ACTIVE - 1e-12:
+        return True
+    hap = p.get("max_num_haplotypes_in_population")
+    if hap is not None and hap > API_MAX_HAPLOTYPES:
+        return True
+    contam = p.get("contamination_fraction_to_filter")
+    if contam is not None and contam > API_MAX_CONTAM + 1e-12:
+        return True
+    calling = p.get("standard_min_confidence_threshold_for_calling")
+    if calling is not None and calling < API_MIN_CALLING - 1e-9:
+        return True
+    mx = p.get("max_assembly_region_size")
+    if mx is not None and mx > API_MAX_AR:
+        return True
+    reads = p.get("max_reads_per_alignment_start")
+    if reads is not None and reads < API_MIN_READS:
+        return True
+    ploidy = p.get("sample_ploidy")
+    if ploidy is not None and ploidy != API_PLOIDY:
+        return True
+    return p.get("dont_use_soft_clipped_bases") is True
+
+
+def left_the_rim(a: Config, b: Config) -> bool:
+    """True when `a` is the edge family and `b` is still inside the published API box.
+
+    A CONSERVATIVE clone of the AGGRESSIVE peak (gap 26, padding 5) is still this table.
+    Family A is a measured local opt. The reserved seat is the validator-edge box.
+    """
+    return in_indel_family(a) and not in_indel_family(b)
+
+
 ELITE_AXES = (
     "max_assembly_region_size", "phred_scaled_global_read_mismapping_rate", "base_quality_score_threshold",
     "standard_min_confidence_threshold_for_calling", "min_pruning", "min_mapping_quality_score",
@@ -137,8 +245,9 @@ class StepA:
     def pool(self) -> List[Point]:
         """Scored configs the breeder may use as parents.
 
-        Generation 1 stays inside the wave-0 peak interval. Step B clears `_bound_pool` before it breeds,
-        so a hill outside that interval is still a parent and the cores the compass leaves can breed.
+        The wave-0 peak interval is measured and logged, not enforced: `_select_range` clears `_bound_pool`.
+        Breeding inside it froze 15 of 19 settings on 044200Z (2026-10-16); 2,500 children were known callsets,
+        generation 1 sent 32 and Step B had one seat.
         """
         bound = getattr(self, "_bound_pool", True)
         out = []
@@ -208,15 +317,24 @@ class StepA:
         return chosen
 
     async def groups(self) -> Dict[str, List[Point]]:
+        """The both / core / fp parent groups, reused until the far parents change.
+
+        Each rebuild is about 20,000 callset distances; rebuilt on every GA pass it blocked the round loop for
+        seconds (one child per pass on 044200Z, 2026-10-16)."""
         pts = await self.far_parents(PARENTS)
         if not pts:
             return {"both": [], "core": [], "fp": []}
         size, band = int(tune("candidates.group_size")), float(tune("candidates.core_band"))
+        stamp = (tuple(p.config.key for p in pts), size, band)
+        if getattr(self, "_groups_stamp", None) == stamp:
+            return self._groups
         best_core = max(p.core for p in pts)
         near = [p for p in pts if p.core >= best_core - band]
-        return {"both": self.diverse(pareto_layers(pts, size), size),
-                "core": self.diverse(sorted(near, key=lambda p: (-p.core, p.fp)), size),
-                "fp": self.diverse(sorted(near, key=lambda p: (p.fp, -p.core)), size)}
+        self._groups = {"both": self.diverse(pareto_layers(pts, size), size),
+                        "core": self.diverse(sorted(near, key=lambda p: (-p.core, p.fp)), size),
+                        "fp": self.diverse(sorted(near, key=lambda p: (p.fp, -p.core)), size)}
+        self._groups_stamp = stamp
+        return self._groups
 
     # ---- breeding -----------------------------------------------------------------------------------------------
     def child(self, a: Config, b: Config) -> Optional[Config]:
@@ -385,19 +503,42 @@ class StepA:
 
     # ---- waves --------------------------------------------------------------------------------------------------
     def seeds(self) -> List[Config]:
+        """Defaults, official, the edge family and the portfolio. With islands (search/islands.py) the fixed seeds go
+        to island 0 and the portfolio is dealt by rank: island i of k takes ranks i, i + k, i + 2k, ..."""
         ctx = self.ctx
+        island = getattr(ctx, "island", None)
+        index, k = (island.index, island.k) if island is not None else (0, 1)
         out: List[Config] = []
-        for p in ({}, OFFICIAL_SEED):
+        own = portfolio.same_round(REFERENCE_ROUND, ctx.client.round.tag)
+        fixed = ({}, OFFICIAL_SEED, *(() if own else INDEL_FAMILY_SEEDS)) if index == 0 else ()
+        for p in fixed:
             c = ctx.space._assemble(dict(p))
             if c is not None and all(c.key != x.key for x in out):
                 out.append(c)
+        if own and index == 0:
+            ctx.say("seeds: the edge-family seeds are skipped; they are built on this round's best config")
+        families = len(out)
+        g_want = int(ctx.cap * float(tune("candidates.generalist_share")))
+        n_gen = 0
+        for c in portfolio.generalists(ctx.space, g_want * k)[index::k]:      # cross-round generalists first
+            if all(c.key != x.key for x in out):
+                out.append(c)
+                n_gen += 1
+        if n_gen:
+            ctx.say("seeds: %d cross-round generalists first", n_gen)
         want = int(ctx.cap * float(tune("candidates.portfolio_share")))
+        ranked = list(portfolio.pick(ctx.space, ctx.profile, want * k, exclude_round=ctx.client.round.tag))
         n = 0
-        for c in portfolio.pick(ctx.space, ctx.profile, want, exclude_round=ctx.client.round.tag):
+        for c in ranked[index::k]:
             if all(c.key != x.key for x in out):
                 out.append(c)
                 n += 1
-        ctx.say("seeds: defaults, the official seed and %d from the portfolio (profile %s)", n, ctx.profile or "unknown")
+        if index == 0:
+            ctx.say("seeds: defaults, official, %d edge-family seeds and %d from the portfolio (profile %s)",
+                    max(0, families - 2), n, ctx.profile or "unknown")
+        else:
+            ctx.say("seeds: island %d of %d: %d from the portfolio (ranks %d, %d, %d, ...; profile %s)",
+                    index, k, n, index + 1, index + 1 + k, index + 1 + 2 * k, ctx.profile or "unknown")
         return out
 
     def riders(self, c: Config, k: int) -> List[Config]:
@@ -582,7 +723,24 @@ class StepA:
         self._range = self._interval(elite)
         self._parents = None
         self._report_interval("selected", best, elite, used, self._range)
-        self.ctx.say("wave 0 at its limit: %d scored configs are inside the interval", len(self.pool()))
+        self._bound_pool = False
+        self.ctx.say("wave 0 at its limit: %d scored configs are inside the interval; generation 1 breeds from all",
+                     sum(1 for c, _ in self.ctx.scored() if self._inside(c)))
+
+    async def _open_pool_if_thin(self) -> None:
+        """Use the full scored set when the peak interval cannot supply two far parents.
+
+        Generation 1 needs a pair. Seats come from the same pool. On 20261012 and 20261014 the interval
+        held one parent, generation 1 sent nothing, and the seats sat in a box that later high scores
+        were outside of.
+        """
+        parents = await self.far_parents(2)
+        if len(parents) >= 2:
+            return
+        self._bound_pool = False
+        self._parents = None
+        self.ctx.say("step A: the peak interval has %d far parent(s); generation 1 and the seats use the full pool",
+                     len(parents))
 
     def _elite(self, margin: float = 0.05):
         """Configs within `margin` of the best score so far. Widens once if that set is a single config."""
@@ -1149,6 +1307,7 @@ class StepA:
             ctx.say("step A: the opening leaders go to step B; generation 1 is not run")
             return await self.pick()
         self._select_range()
+        await self._open_pool_if_thin()
         if separate_enabled():
             from search.separate import opening_scouts, place_dummies
             await place_dummies(ctx)
@@ -1356,7 +1515,7 @@ class StepA:
         if piles_enabled():
             return await self.pick_piles()
         ctx = self.ctx
-        n = max(1, ctx.cap // int(tune("candidates.workers_per_candidate")))
+        n = n_seats(ctx)
         pts = sorted(self.pool(), key=lambda p: -p.score)
         if not pts:
             ctx.say("step A: nothing scored; starting from the defaults")
@@ -1380,11 +1539,14 @@ class StepA:
             if await self._apart(p, taken, mc, ms):
                 taken.append(p)
         far_seat = None
+        rim_of = taken[0].config if taken else pts[0].config
         if n >= 2:
             for p in pts:
-                if best - p.score > FAR_SEAT_FLOOR:
+                if best - p.score > FAMILY_SEAT_FLOOR:
                     break
                 if any(t.config.key == p.config.key for t in taken):
+                    continue
+                if not left_the_rim(p.config, rim_of):
                     continue
                 if any(sum(p.config.params.get(nm) != t.config.params.get(nm) for nm in names) < ELITE_MIN_DIFFS
                        for t in taken):
@@ -1423,7 +1585,7 @@ class StepA:
         """One seat per callset pile, up to the climber cap. A pile with no fingerprint is not filled by a near copy."""
         from search.piles import refresh
         ctx = self.ctx
-        n = max(1, ctx.cap // int(tune("candidates.workers_per_candidate")))
+        n = n_seats(ctx)
         pts = list(self.pool())
         piles = refresh(ctx, [(p.config, p.score) for p in pts])
         ctx._piles = piles

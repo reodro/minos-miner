@@ -51,6 +51,14 @@ async def refine(ctx) -> None:
         ctx.say("step C: nothing left to fine-tune")
         return
     c, s = top
+    from search.candidates import in_indel_family
+    from search.climb import family_in_reach
+    if not in_indel_family(c):
+        fam = family_in_reach(ctx, s)
+        if fam is not None:
+            ctx.say("step C: this shelf is %.4f; remaining time climbs the edge family %s %.4f",
+                    s, fam[0].key[:8], fam[1])
+            c, s = fam
     ctx.phase = "C: fine-tune"
     ctx.say("step C: fine-tune %s opened at %.4f", c.key[:8], s)
     cl = Climber(ctx, len(ctx.climbers), c, s, origin="step C")

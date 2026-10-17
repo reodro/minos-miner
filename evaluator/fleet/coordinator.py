@@ -45,10 +45,14 @@ _UNSET = object()
 LOG_DIR = Path.home() / ".minos" / "fleet" / "logs"
 SPEEDS = Path.home() / ".minos" / "fleet" / "speeds.json"   # host -> measured solo time, so routing is right from the start
 SOLO_EMA = 0.3                # weight of each new solo-time sample in a node's running estimate
-KEEP_ROUNDS = 3               # rounds kept on main and nodes (older ones are pruned)
-# Tunable (common/tuning.py): evaluator.overdue (a small batch running this many times its expected time is a
-# straggler and may be copied), evaluator.slow_factor (a node slower than this times the fastest is "slow": small
-# batches prefer the fast ones), evaluator.small_batch / evaluator.big_batch (evaluator.local.batch_limit).
+PING_S = 20.0                 # a session's writer sends a ping when it has written nothing for this long
+LOST_MIN_S = 600.0            # a run is never called lost sooner than this
+# Tunable (common/tuning.py): evaluator.keep_rounds (rounds kept on main and nodes; a round with queued or running
+# jobs is never pruned), evaluator.overdue (a small batch running this many times its expected time is a straggler and
+# may be copied), evaluator.max_copy_share (most of the workers copies may hold at once), evaluator.lost_factor (a run
+# outstanding this many times its expected time is lost and queued again), evaluator.slow_factor (a node slower than
+# this times the fastest is "slow": small batches prefer the fast ones), evaluator.small_batch / evaluator.big_batch
+# (evaluator.local.batch_limit).
 
 
 @dataclass
@@ -123,8 +127,13 @@ class _Session:
         return True
 
     def writer(self, proc: subprocess.Popen) -> None:
+        """Writes queued messages, and a ping whenever nothing was written for PING_S: the agent stops (and kills
+        its GATK jobs) once main has been silent for its watchdog time, even if the ssh channel stays open."""
         while True:
-            line = self.outq.get()
+            try:
+                line = self.outq.get(timeout=PING_S)
+            except queue.Empty:
+                line = json.dumps({"type": "ping"}) + "\n"
             if line is None:
                 break
             try:
@@ -414,8 +423,8 @@ class FleetExecutor:
         with self._lock:
             self._rounds.pop(round.round_id, None)
             self._rounds[round.round_id] = _Published(round, None, bam_url, bai_url)
-            while len(self._rounds) > KEEP_ROUNDS:              # oldest first (dicts keep insertion order)
-                self._rounds.pop(next(iter(self._rounds)))
+            self._ended.discard(round.round_id)                 # published again (multi-round tools reopen rounds)
+            self._prune_rounds()
             sessions = [s for s in self._sessions.values() if s.ready]
         for s in sessions:
             threading.Thread(target=self._send_rounds, args=(s,), daemon=True).start()
@@ -433,12 +442,36 @@ class FleetExecutor:
         for s in sessions:
             threading.Thread(target=self._send_rounds, args=(s,), daemon=True).start()
 
+    def _round_busy(self, rid: str) -> bool:
+        """The round still has work here: a queued job, an unfinished job, or a run on a node. Lock held."""
+        if any(job.round.round_id == rid for job in self._inflight.values()):
+            return True
+        if any(r == rid and jobs for (r, _), jobs in self._by_branch.items()):
+            return True
+        return any(j.round.round_id == rid for s in self._sessions.values() for j in s.jobs.values())
+
+    def _prune_rounds(self) -> None:
+        """Keep at most evaluator.keep_rounds rounds: the oldest idle ones go first (dicts keep insertion order). A
+        round that still has queued or running jobs is never pruned - nodes delete a pruned round's BAM and callsets,
+        and its jobs would never come back. Lock held."""
+        limit = max(1, int(tune("evaluator.keep_rounds")))
+        if len(self._rounds) <= limit:
+            return
+        newest = next(reversed(self._rounds))
+        for rid in list(self._rounds):
+            if len(self._rounds) <= limit:
+                break
+            if rid != newest and not self._round_busy(rid):
+                self._rounds.pop(rid)
+        if len(self._rounds) > limit:
+            log.warning("keeping %d rounds (evaluator.keep_rounds %d): the older ones still have jobs",
+                        len(self._rounds), limit)
+
     def _send_rounds(self, s: _Session) -> None:
         """Ship to node `s` whatever it has not got yet: each kept round (once), then its answer set (once per
         version). Files go by rsync before the message; a failed shipment makes the round unservable there."""
         with self._lock:
             rounds = list(self._rounds.items())
-        keep = [rid for rid, _ in rounds]
         for rid, p in rounds:
             with self._lock:
                 if not s.ready:
@@ -448,7 +481,12 @@ class FleetExecutor:
                     s.rounds_sent.add(rid)
             if send_round:
                 try:
-                    s.send({**round_message(s.host, p.round, p.bam_url, p.bai_url), "keep": keep})
+                    msg = round_message(s.host, p.round, p.bam_url, p.bai_url)   # the BAM push can take minutes
+                    with self._lock:
+                        # `keep` is read when the message is queued, not when this thread started: a list taken
+                        # before a slow push reached the node after newer rounds' messages, and the node deleted
+                        # those rounds while their jobs ran (2026-10-17: 91 jobs never came back)
+                        s.send({**msg, "keep": list(self._rounds)})
                 except Exception as e:  # noqa: BLE001 - e.g. rsync failed: this node cannot serve the round
                     log.error("%s: could not ship round %s: %s", s.name, rid, e)
                     with self._lock:
@@ -527,6 +565,7 @@ class FleetExecutor:
     def poll(self, timeout: float) -> List[CallSet]:
         deadline = time.time() + timeout
         with self._cv:
+            self._reclaim_lost()
             self._speculate()                                     # main polls every second: the straggler check
             while not self._ready and time.time() < deadline:
                 self._cv.wait(max(0.0, deadline - time.time()))
@@ -632,14 +671,27 @@ class FleetExecutor:
                          rounds=len(s.rounds_ready), rejected=s.rejected, solo_s=round(s.solo_s, 1))
                     for n, s in self._sessions.items()]
 
-    def close(self) -> None:
-        """Stop every node (closing its stdin ends the agent, which kills its GATK containers)."""
+    def close(self, wait_s: float = 20.0) -> None:
+        """Stop every node (closing its stdin ends the agent, which kills its GATK containers), and wait up to
+        `wait_s` for the sessions to end: the writer threads are daemons, so a process that returned at once could
+        exit before any hang-up reached a node - the agents and their GATK jobs then kept running."""
         self._stopping = True
         with self._lock:
-            for s in self._sessions.values():
+            sessions = list(self._sessions.values())
+            for s in sessions:
                 s.closed = True
                 if s.proc and s.proc.poll() is None:
                     s.hang_up()
+        end = time.time() + wait_s
+        for s in sessions:
+            p = s.proc
+            if p is None:
+                continue
+            try:
+                p.wait(timeout=max(0.1, end - time.time()))
+            except subprocess.TimeoutExpired:
+                log.warning("%s: the agent did not stop within %.0f s - ending its ssh session", s.name, wait_s)
+                p.terminate()
 
     # ---- scheduling -------------------------------------------------------------------------------------------------
     def _peek(self) -> Optional[EvalJob]:
@@ -725,10 +777,16 @@ class FleetExecutor:
         wins; the other run is aborted. A copy is not started early just because a faster node is free.
         Lock held."""
         now = self._now()
+        ready = [s for s in self._sessions.values() if s.ready]
+        share = float(tune("evaluator.max_copy_share"))
+        cap = max(1, int(share * sum(s.workers for s in ready))) if share > 0 else 0
+        copies = sum(1 for s in ready for g in s.groups.values() if g.duplicate)
         for s in list(self._sessions.values()):
             if not s.ready:
                 continue
             for gid, g in list(s.groups.items()):
+                if copies >= cap:                                 # copies took ~5% of the fleet's runs (2026-10-17)
+                    return
                 if g.batch != "small" or g.twin is not None or g.duplicate or not g.jobs:
                     continue
                 rid = next(iter(g.jobs.values())).round.round_id
@@ -744,8 +802,50 @@ class FleetExecutor:
                 gid2 = self._send_group(f, jobs, g.units, duplicate=True, twin=(s, gid))
                 g.twin = (f, gid2)
                 self.speculated += 1
+                copies += 1
                 log.info("%s: small batch of %d jobs at %.0f s of %.0f expected - duplicated on %s (%.0f s there)",
                          s.name, len(jobs), elapsed, expected, f.name, fresh)
+
+    def _reclaim_lost(self) -> None:
+        """A run outstanding evaluator.lost_factor times its expected time there (and at least LOST_MIN_S) is lost:
+        the node will not report it (2026-10-17: a node had dropped a round and its finished callsets with it, and
+        the caller waited forever - resubmitting did not help, the same jobs were still 'in flight'). Its jobs go back
+        to the queue, unless its twin elsewhere is still computing them, and the node is told to drop the run.
+        Lock held."""
+        now, reclaimed, reship = self._now(), False, []
+        for s in list(self._sessions.values()):
+            if not s.ready:
+                continue
+            for gid, g in list(s.groups.items()):
+                expected = s.solo_s * max(g.units, 0.05)
+                if not g.jobs or now - g.t0 <= max(LOST_MIN_S, tune("evaluator.lost_factor") * expected):
+                    continue
+                running_elsewhere: set = set()
+                if g.twin is not None:
+                    other, ogid = g.twin
+                    og = other.groups.get(ogid)
+                    if og is not None:
+                        og.twin = None
+                        running_elsewhere = set(og.jobs)
+                for jid, job in g.jobs.items():
+                    s.jobs.pop(jid, None)
+                    s.job_group.pop(jid, None)
+                    if jid not in running_elsewhere and job_key(job) not in self._done:
+                        self._push(job)
+                del s.groups[gid]
+                s.send({"type": "abort_jobs", "job_ids": list(g.ids)})
+                log.warning("%s: a run of %d jobs outstanding %.0f s (expected %.0f s) - lost, queued again",
+                            s.name, len(g.jobs), now - g.t0, expected)
+                reclaimed = True
+                for rid in {j.round.round_id for j in g.jobs.values()}:   # the node may have dropped the round:
+                    s.rounds_ready.discard(rid)                         # ship it again; until it is ready there,
+                    s.rounds_sent.discard(rid)                          # its jobs go to the other nodes
+                if s not in reship:
+                    reship.append(s)
+        for s in reship:
+            threading.Thread(target=self._send_rounds, args=(s,), daemon=True).start()
+        if reclaimed:
+            self._pump()
 
     def _variant_frac(self, main: EvalJob, variant: EvalJob) -> Optional[float]:
         """Extra cost of `variant` inside `main`'s run, as a fraction of a solo run; None = cannot share it."""

@@ -162,9 +162,9 @@ def col_index(name):
     return FEATURES.index(name) if name in FEATURES else len(FEATURES) + ROUND_FEATS.index(name)
 
 
-def features_for(track, kg_readdiff=False, kg_hapgeno=False):
+def features_for(track, kg_readdiff=False, kg_hapgeno=False, kg_hc=False):
     other = KG_ONLY if track == "giab" else [f for f in GIAB_ONLY if not (kg_readdiff and f in RD_FEATS)
-                                             and not (kg_hapgeno and f in HG_SET)]
+                                             and not (kg_hapgeno and f in HG_SET) and not (kg_hc and f in HC_SET)]
     return [f for f in FEATURES if f not in other and f not in DROP]
 
 
@@ -230,7 +230,7 @@ def release(track, name):
         return dst
     dst.mkdir(parents=True, exist_ok=True)
     for f in list(RELEASE_FILES) + [x for x in ("window.joblib", "spelling.joblib", "cluster_chooser.joblib",
-                                                "cluster_arbiter.joblib") if (src / x).exists()]:
+                                                "cluster_arbiter.joblib", "cluster_resolver.joblib", "hom_repeat.joblib", "call_dna.joblib") if (src / x).exists()]:
         shutil.copy2(src / f, dst / f)
     return dst
 

@@ -162,6 +162,10 @@ class EvalClient:
     def in_flight(self) -> int:
         return len(self._pending)
 
+    def running(self) -> set:
+        """Keys of the configs with a job still in flight."""
+        return {config.key for _fut, config, _tag in self._pending.values()}
+
     def set_answer_set(self, answer_set: AnswerSet) -> None:
         """The round's first answer set: scoring can start."""
         self.answer_set = answer_set

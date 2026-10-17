@@ -1085,17 +1085,6 @@ async def aim_compass(ctx, cl, valley: bool = True) -> None:
     if range_open():
         note_range(ctx)
 
-    if not ready:
-        return
-    config, score, origin = list(ready)[:SEATS][0]
-    cl = Climber(ctx, len(ctx.climbers), config, score, origin=origin)
-    cl.climb_until = until
-    cl.compass_only = True
-    ctx.climbers.append(cl)
-    await aim_compass(ctx, cl)
-    ctx.say("step B: compass on %s %.4f until the fine-tune", cl.centre.key[:8], cl.score)
-    await cl.run(until, jumps=False)
-
 
 def best_grid_point(ctx, points: Sequence[Config], centre_score: float):
     """The best scored point of a finished grid, when it beats the centre. A child that opened the view is not a point."""

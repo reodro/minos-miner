@@ -117,11 +117,13 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         gmeta = tracks.meta("giab", gname)
         features.RD_1BP_FACTOR = gmeta.get("rd_1bp_factor", 1.0)
         features.HAP_GENOTYPER = int(gmeta.get("hap_genotyper", 0))      # True (g009) == 1
+        features.WINDOW_GENOTYPER = int(gmeta.get("window_genotyper", 0))
         features.HC_EVIDENCE = int(gmeta.get("hc_evidence", 0))
     kname = (track_versions or {}).get("kg") or tracks.active_name("kg")
     features.KG_READDIFF = int(tracks.meta("kg", kname).get("kg_readdiff", 0)) if kname else 0
     features.KG_HAPGENO = int(tracks.meta("kg", kname).get("kg_hapgeno", 0)) if kname else 0
     features.KG_SITE_RULE = int(tracks.meta("kg", kname).get("kg_site_rule", 0)) if kname else 0
+    features.KG_HC = int(tracks.meta("kg", kname).get("kg_hc", 0)) if kname else 0
     keys, X, info, donors, beds = extract(bam, region, out / "work", threads)
     t_feat = time.time() - t0
     track = tracks.track_of_info(info)
@@ -136,6 +138,17 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         X = X[:, [tracks.col_index(n) for n in meta["features"]]] if len(keys) else X
     p_any = m_any.predict_proba(X)[:, 1] if len(keys) else np.array([])
     p_hom = m_hom.predict_proba(X)[:, 1] if len(keys) else np.array([])
+    n_call_dna = None
+    if not info["mode_giab"] and meta.get("call_dna") and len(keys):
+        # non-person indel candidates: call decision from the model that also sees reads judged by DNA (calldna.py)
+        import joblib
+        from answer_set.k2 import calldna
+        m_cd = joblib.load(tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
+                           / "call_dna.joblib")
+        fa_c, bam_c = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
+        p_any, n_call_dna = calldna.apply(p_any, keys, X, X_full[:, FEATURES.index("gatk_person_called")], bam_c, fa_c,
+                                          chrom, m_cd)
+        fa_c.close(); bam_c.close()
     p_raw = p_any
     if len(keys) and meta.get("thr_class"):
         p_any = tracks.apply_class_thr(meta, keys, p_any)
@@ -143,6 +156,17 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         p_any = tracks.apply_source_thr(meta, X_full, p_any, p_raw)
     if len(keys) and meta.get("gt_from_gatk"):
         p_hom = tracks.apply_gt_rule(meta, X_full, p_hom)
+    n_hom_repeat = None
+    if not info["mode_giab"] and meta.get("hom_repeat") and len(keys):
+        # called indels of >= 2 bp in tandem repeats: het/hom from the repeat model (homrep.py)
+        import joblib
+        from answer_set.k2 import homrep
+        m_rep = joblib.load(tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
+                            / "hom_repeat.joblib")
+        fa_h, bam_h = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
+        p_hom, n_hom_repeat = homrep.apply(p_hom, keys, X, X_full[:, FEATURES.index("gatk_person_hom")], p_any, thr,
+                                           bam_h, fa_h, chrom, m_rep)
+        fa_h.close(); bam_h.close()
 
     donor = donors[info["mode_donor"]] if info["mode_giab"] else {}
     kg_own = None
@@ -175,11 +199,39 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         models_ = (joblib.load(vd_ / "cluster_chooser.joblib"), joblib.load(vd_ / "cluster_arbiter.joblib"))
         op_ = giab_origin.path(info["mode_donor"], chrom, a, b)
         recs, n_clusters = clusterdec.apply(recs, bam, ref_path(chrom), chrom, op_ if op_.exists() else None, donor,
-                                            out / "work", keys, p_any, p_hom, models_, meta["cluster_decoder"]["cut"])
+                                            out / "work", keys, p_any, p_hom, models_, meta["cluster_decoder"]["cut"],
+                                            joblib.load(vd_ / "cluster_resolver.joblib")
+                                            if meta["cluster_decoder"].get("resolver_cut") is not None else None,
+                                            meta["cluster_decoder"].get("resolver_cut", 0.7))
     if isinstance(kg_own, int):                       # 1000G: the model's calls are the inserted mutations, flagged
         recs = [r[:4] + (k_ not in donor,) + r[5:] for r in recs for k_ in [(r[0], r[1], r[2])]]  # as Minos does
+    if not info["mode_giab"] and meta.get("cluster_decoder") and isinstance(kg_own, int) and len(keys):
+        # 1000G: the same edit-based cluster decoder, against the person's public original reads (kg_origin)
+        import joblib
+        from answer_set.k2 import clusterdec, kg_origin
+        vd_ = tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
+        person = kgi.get("person")
+        op_ = kg_origin.path(person, chrom, a, b) if person else None
+        recs, n_clusters = clusterdec.apply(recs, bam, ref_path(chrom), chrom, op_ if op_ is not None and op_.exists()
+                                            else None, donor, out / "work", keys, p_any, p_hom,
+                                            (joblib.load(vd_ / "cluster_chooser.joblib"),
+                                             joblib.load(vd_ / "cluster_arbiter.joblib")),
+                                            meta["cluster_decoder"]["cut"])
+    if not info["mode_giab"] and meta.get("kg_one_spelling") and isinstance(kg_own, int):
+        # one spelling per edited haplotype (clusterdec.apply_one_spelling); the person's records stay
+        from answer_set.k2 import clusterdec, kg_origin
+        person = (info.get("kg") or {}).get("person")
+        op_ = kg_origin.path(person, chrom, a, b) if person else None
+        recs, n_clusters = clusterdec.apply_one_spelling(
+            recs, bam, ref_path(chrom), chrom, op_ if op_ is not None and op_.exists() else None, donor, out / "work")
+    wins = wm = hc_calls = lr_fn = respell_fn = None
+    wthr = meta.get("window_thr")
     n_windows = None
-    if info["mode_giab"] and meta.get("window_thr") is not None and (out / "work" / "hg_windows.pkl.gz").exists():
+    n_run_edge = None
+    win_path = out / "work" / "hg_windows_replace.pkl.gz"
+    if not win_path.exists():
+        win_path = out / "work" / "hg_windows.pkl.gz"
+    if info["mode_giab"] and meta.get("window_thr") is not None and win_path.exists():
         # window decisions: where the genotyper's whole-window answer replaces the per-variant one (hapwin.py)
         from answer_set.k2 import hapwin
         wm = tracks.load_window(track, (track_versions or {}).get(track) or tracks.active_name(track), exclude_round)
@@ -189,28 +241,89 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
             from answer_set.k2 import hcrun
             hp_ = out / "work" / "hc.norm.vcf.gz"
             hc_calls = hcrun.load_calls(hp_) if hp_.exists() else {}
-        wins = hapwin.load_windows(out / "work" / "hg_windows.pkl.gz")
+        wins = hapwin.load_windows(win_path)
         lr_fn = None
         if meta.get("window_lr"):                       # window model trained with lr_answer (hapwin.FEATS_LR)
             bam_lr, fa_lr = pysam.AlignmentFile(str(bam)), pysam.FastaFile(str(ref_path(chrom)))
             lr_fn = lambda s_, e_, w_, A_: hapwin.answer_lr(bam_lr, fa_lr, chrom, s_, e_, w_, A_)  # noqa: E731
         cands = hapwin.candidates(wins, answer, dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]], hc_calls, lr_fn)
+        wthr = dict(meta["window_thr_group"], default=meta["window_thr"]) if meta.get("window_thr_group") \
+            else meta["window_thr"]
+        vname = (track_versions or {}).get(track) or tracks.active_name(track)
+        sm = tracks.load_aux(track, vname, "spelling", exclude_round)
+        respell_fn = None
+        if sm is not None:                               # write replaced windows the way Minos most likely did
+            fa_ = pysam.FastaFile(str(ref_path(chrom)))
+            p_of = dict(zip(keys, p_raw))
+            respell_fn = lambda c: hapwin.respell(fa_, chrom, c[0], c[2], p_of, sm)  # noqa: E731
         if cands:
             pw = wm.predict_proba(np.vstack([c[5] for c in cands]))[:, 1]
-            vname = (track_versions or {}).get(track) or tracks.active_name(track)
-            sm = tracks.load_aux(track, vname, "spelling", exclude_round)
-            respell_fn = None
-            if sm is not None:                           # write replaced windows the way Minos most likely did
-                fa_ = pysam.FastaFile(str(ref_path(chrom)))
-                p_of = dict(zip(keys, p_raw))
-                respell_fn = lambda c: hapwin.respell(fa_, chrom, c[0], c[2], p_of, sm)  # noqa: E731
-            wthr = dict(meta["window_thr_group"], default=meta["window_thr"]) if meta.get("window_thr_group") \
-                else meta["window_thr"]
             recs, n_windows = hapwin.apply(recs, cands, pw, wthr, respell_fn)
         fa_emit = pysam.FastaFile(str(ref_path(chrom)))
         recs, n_sp, n_emit = hapwin.emit_from_called(recs, wins, donor, beds[info["mode_donor"]], fa_emit, chrom,
                                                      dict(zip(keys, p_raw)))
         n_windows = (n_windows or 0) + n_sp + n_emit
+    if info["mode_giab"]:
+        # Shorten a merged allele before the second-spelling pass. A one-base-longer indel
+        # sitting on a homozygous run is the run plus the real allele; dropping it first
+        # removes the real allele (chr16:76494085).
+        # Then drop a second overlapping indel the forest scored under the calling threshold,
+        # and an allele a confident window's haplotypes do not use.
+        from answer_set.k2 import clusterdec, hapwin
+        from answer_set.k2.util import trim
+        fa_fix = pysam.FastaFile(str(ref_path(chrom)))
+        recs = clusterdec.shorten_repeated(recs, fa_fix, chrom)
+        fa_fix.close()
+        recs = clusterdec.drop_second_spelling(recs, dict(zip(keys, p_any)), thr)
+        if win_path.exists():
+            imf = {}
+            cand_path = out / "work" / "cand.norm.vcf.gz"
+            if cand_path.exists():
+                import gzip
+                import re
+                with gzip.open(cand_path, "rt") as fh:
+                    for line in fh:
+                        if line[0] == "#":
+                            continue
+                        col = line.split("\t")
+                        m = re.search(r"IMF=([0-9.]+)", col[7])
+                        if not m:
+                            continue
+                        for alt in col[4].split(","):
+                            if alt in ("*", "<*>"):
+                                continue
+                            imf[trim(int(col[1]), col[3], alt)] = float(m.group(1))
+            recs = hapwin.drop_unneeded(recs, hapwin.load_windows(win_path), imf)
+        # Score the cleaned records. A window the model still places above its cutoff, and
+        # whose alleles are not the ones written, replaces them. Het/hom flips on the same
+        # alleles are left as the per-variant model called them.
+        if wins is not None and wm is not None and wthr is not None:
+            answer = {(r[0], r[1], r[2]): (r[3], r[4]) for r in recs}
+            cands = hapwin.candidates(wins, answer, dict(zip(keys, p_raw)), donor,
+                                      beds[info["mode_donor"]], hc_calls, lr_fn)
+            if cands:
+                pw = wm.predict_proba(np.vstack([c[5] for c in cands]))[:, 1]
+                keep, pk = hapwin.select_key_changes(cands, pw, wthr, answer)
+                if len(keep):
+                    recs, n_more = hapwin.apply(recs, keep, pk, wthr, respell_fn)
+                    n_windows = (n_windows or 0) + n_more
+        # A 2 bp insertion inside a long homopolymer is the run base at the left edge plus the
+        # other base. Write those two 1 bp records when the other base is an edit of several
+        # original reads.
+        fa_edge = pysam.FastaFile(str(ref_path(chrom)))
+        try:
+            recs, n_run_edge = clusterdec.spell_run_edge(
+                recs, bam, fa_edge, chrom, clusterdec.read_inputs(out / "work")[1],
+                out / "work" / "cand.norm.vcf.gz")
+        finally:
+            fa_edge.close()
+    n_guard = None
+    if info["mode_giab"] and meta.get("read_guard") and len(keys):
+        # later steps' inserted indels the reads do not carry are dropped (readguard.py)
+        from answer_set.k2 import readguard
+        fa_g, bam_g = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
+        recs, n_guard = readguard.apply(recs, bam_g, fa_g, chrom, dict(zip(keys, p_any)), thr)
+        fa_g.close(); bam_g.close()
     donor_raw = None
     if info["mode_giab"]:
         from answer_set.k2.util import donor_records
@@ -247,7 +360,8 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "clusters_replaced": n_clusters, "background_from_donor": len(donor), "model_calls": len(recs) - len(donor),
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
-        "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok", "windows_replaced": n_windows,
+        "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok",
+        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "hom_repeat": n_hom_repeat, "call_dna": n_call_dna,
     }
     (out / "report.json").write_text(json.dumps(report, indent=1))
     return report

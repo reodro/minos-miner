@@ -144,6 +144,7 @@ class LocalExecutor:
         self._ended = set()                        # round ids whose results are no longer wanted (end_round)
         self._dropped = set()                      # job ids whose results are no longer wanted (cancel_running)
         self._retried = set()                      # job ids whose batch died in GATK's own code (head rerun alone)
+        self._rider_lost = set()                   # riders of such a batch, queued again (a second loss: alone)
         self._lock = threading.Lock()
         self._wake = threading.Event()             # set by submit(): an idle poll() waits on it instead of spinning
         self.batches_run = 0
@@ -473,18 +474,25 @@ class LocalExecutor:
                     if job.round.round_id in self._ended or job.job_id in self._dropped:   # nobody wants it
                         self._forget(job)
                         continue
-                    if (not cs.ok and (cs.error or "").startswith("rc=3") and len(jobs) > 1
-                            and job.job_id not in self._retried):
+                    if not cs.ok and (cs.error or "").startswith("rc=3") and len(jobs) > 1:
                         # GATK died in its own code inside a batch (the patch's variant path, for some heads on some
-                        # regions; the same config passes on its own). The head runs again alone, still in flight;
-                        # its riders fail here (riders only exist inside a batch).
-                        self._retried.add(job.job_id)
-                        if job is jobs[0]:
+                        # regions; the same config passes on its own). Nobody in the batch has a result of its own:
+                        # the head runs again alone; every rider is queued again - batched once more without that
+                        # head, then alone - so a config never fails for another config's crash (on 044200Z, 412 of
+                        # 500 recorded failures were riders that never ran, and the engines learned them as crashes).
+                        if job is jobs[0] and job.job_id not in self._retried:
+                            self._retried.add(job.job_id)
                             self._solo.add(job.job_id)
                             self.retries += 1
                             heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
                             continue
-                        cs = replace(cs, error=(cs.error or "") + " | batch crashed; its head runs alone")
+                        if job is not jobs[0]:
+                            if job.job_id in self._rider_lost:
+                                self._solo.add(job.job_id)
+                            self._rider_lost.add(job.job_id)
+                            self.retries += 1
+                            heapq.heappush(self._queue, (-job.priority, next(self._seq), job))
+                            continue
                     if not cs.ok and cs.error == DIVERGED:
                         # its batch output was not exact: repair it if the runner can, else run it alone
                         # (still counts as in flight)

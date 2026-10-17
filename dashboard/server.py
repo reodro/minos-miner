@@ -102,6 +102,9 @@ def attach_climber_found(live: Optional[dict], cache: dict) -> None:
     Also the highest Step B GA (tag G) scores that are a different hill from every seated climber
     and from each other (fewer than four setting differences is the same hill), so the dashboard
     can show them while the live search process only publishes how many GA children are in flight.
+
+    Only this run's rows count, from the engine's started_ts on: the results store keeps every replay of a round,
+    and the same B{id} tags come back each run (044200Z, 2026-10-16: the live panel showed the last run's scores).
     """
     try:
         eng = live["search"]["engine"]
@@ -112,8 +115,11 @@ def attach_climber_found(live: Optional[dict], cache: dict) -> None:
     if not isinstance(basins, list) or not tag:
         return
     path = Path(SETTINGS.cache_dir) / "results" / f"{tag}.sqlite"
+    started = eng.get("started_ts")
+    since = float(started) - 5.0 if isinstance(started, (int, float)) and not isinstance(started, bool) else None
+    where, args = (" and created >= ?", (since,)) if since is not None else ("", ())
     now = time.time()
-    if cache.get("path") != str(path) or now - cache.get("at", 0) > 2:
+    if cache.get("path") != str(path) or cache.get("since") != since or now - cache.get("at", 0) > 2:
         by_tag: dict = {}
         ga_ranked: list = []
         params_by_key: dict = {}
@@ -122,12 +128,13 @@ def attach_climber_found(live: Optional[dict], cache: dict) -> None:
             con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
                 for row_tag, score in con.execute(
-                        "select tag, max(score) from results where score is not null and tag like 'B%' group by tag"):
+                        "select tag, max(score) from results where score is not null and tag like 'B%'" + where
+                        + " group by tag", args):
                     if isinstance(score, (int, float)):
                         by_tag[row_tag] = float(score)
                 for key, score in con.execute(
-                        "select config_key, max(score) from results where tag='G' and score is not null "
-                        "group by config_key order by max(score) desc limit 80"):
+                        "select config_key, max(score) from results where tag='G' and score is not null" + where
+                        + " group by config_key order by max(score) desc limit 80", args):
                     if key and isinstance(score, (int, float)):
                         ga_ranked.append({"key": key, "score": round(float(score), 4)})
                 need = [row["key"] for row in ga_ranked] + climber_keys
@@ -148,6 +155,7 @@ def attach_climber_found(live: Optional[dict], cache: dict) -> None:
             params_by_key = cache.get("params_by_key") or {}
         cache["path"], cache["at"], cache["by_tag"], cache["ga_ranked"], cache["params_by_key"] = (
             str(path), now, by_tag, ga_ranked, params_by_key)
+        cache["since"] = since
     by_tag = cache.get("by_tag") or {}
     params_by_key = cache.get("params_by_key") or {}
     held_keys, held_scores = set(), set()

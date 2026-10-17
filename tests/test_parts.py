@@ -568,6 +568,26 @@ class SpaceTest(unittest.TestCase):
         from search.space import bam_caps
         self.assertEqual(bam_caps("/nonexistent.bam", "chr20", 1, 10), {})
 
+    def test_validator_edges_assemble_and_stay_off_the_dense_ladder(self):
+        from search.space import Space
+        from search.steps import Ladders
+        from search.candidates import in_indel_family
+        sp = Space(ranges())
+        edge = sp._assemble({"min_pruning": 1, "active_probability_threshold": 0.0001,
+                             "max_num_haplotypes_in_population": 256, "dont_use_soft_clipped_bases": True})
+        self.assertIsNotNone(edge)
+        self.assertEqual(edge.params["min_pruning"], 1)
+        self.assertEqual(edge.params["max_num_haplotypes_in_population"], 256)
+        self.assertTrue(in_indel_family(edge))
+        ladders = Ladders(sp)
+        self.assertIn(1, ladders.rungs["min_pruning"])
+        self.assertIn(256, ladders.rungs["max_num_haplotypes_in_population"])
+        self.assertNotIn(129, ladders.rungs["max_num_haplotypes_in_population"])
+        self.assertIn(0.0001, ladders.rungs["active_probability_threshold"])
+        self.assertTrue(edge.params["dont_use_soft_clipped_bases"])
+        self.assertNotIn("sample_ploidy", sp.names)
+        self.assertNotIn("dont_use_soft_clipped_bases", sp.names)
+
     def test_a_round_bam_replaces_three_ranges_with_the_groups_it_can_tell_apart(self):
         import random as _r
         from search.bamgroups import BQST, MBQ, MRPAS, BamFacts, bam_bounds, bounds_from
@@ -614,15 +634,18 @@ class SpaceTest(unittest.TestCase):
         bounds = bounds_from(facts, ranges())
         self.assertNotIn(CONT, bounds.groups)                 # allowed would encode an off-ladder fraction as rung 0
         self.assertIn(f"{CONT} 21 -> {len(reps)}", bounds.report)
+        from search.space import EDGE_RUNGS
         sp = Space(ranges(), bounds=bounds)
-        self.assertEqual(Ladders(sp).rungs[CONT], list(reps))
+        dense = [r for r in Ladders(sp).rungs[CONT] if r <= 0.05 + 1e-12]
+        self.assertEqual(dense, list(reps))
+        self.assertTrue(set(EDGE_RUNGS[CONT]) <= set(Ladders(sp).rungs[CONT]))
         self.assertEqual(sp._assemble({CONT: 0.01}).params[CONT], 0.0)
         self.assertEqual(sp._assemble({CONT: 0.01875}).params[CONT], 0.01875)
         self.assertEqual(snap(facts, CONT, 0.005, mmq=0, lo=0.0, hi=0.05), 0.0)
         shallow = BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13, frozenset(range(1, 11)))
         one = bounds_from(shallow, ranges())
         fixed = Space(ranges(), bounds=one)
-        self.assertEqual(Ladders(fixed).rungs[CONT], [0.0])    # depth 10 removes nothing anywhere on the ladder
+        self.assertEqual([r for r in Ladders(fixed).rungs[CONT] if r <= 0.05 + 1e-12], [0.0])
         self.assertEqual(fixed._assemble({CONT: 0.04}).params[CONT], 0.0)
 
     def test_snapping_keeps_every_class_the_bam_can_tell_apart(self):
@@ -794,11 +817,40 @@ class CrashRetryTest(unittest.TestCase):
                 got[cs.job_id] = cs
             if len(got) == 3:
                 break
-        self.assertEqual(calls, [("batch", 3), ("solo", 1)])
-        self.assertTrue(got["j0"].ok)                                        # the head, rerun alone
-        self.assertEqual([got[j].ok for j in ("j1", "j2")], [False, False])  # the riders fail with the batch
-        self.assertIn("batch crashed; its head runs alone", got["j1"].error)
-        self.assertEqual(ex.stats()["retries"], 1)
+        # the head reruns alone; the riders are batched again without it (that batch dies too here), then its new
+        # head runs alone and the rider lost twice runs alone: every config gets a result of its own
+        self.assertEqual(calls, [("batch", 3), ("solo", 1), ("batch", 2), ("solo", 1), ("solo", 1)])
+        self.assertTrue(all(got[j].ok for j in ("j0", "j1", "j2")))
+        self.assertEqual(ex.stats()["retries"], 5)
+
+        class OneBad(FakeRunner):                          # one rider crashes GATK wherever it runs
+            def run_batch(self, round, configs, fidelity=FULL):
+                calls2.append(len(configs))
+                if any(c.params[conf] == 50.0 for c in configs):
+                    return [CallSet(round.round_id, c.key, "", "", 0.1, ok=False, fidelity=fidelity,
+                                    error="rc=3 java.lang.IllegalStateException: boom") for c in configs]
+                return super().run_batch(round, configs, fidelity)
+
+            def run(self, round, config, fidelity=FULL):
+                calls2.append(1)
+                if config.params[conf] == 50.0:
+                    return CallSet(round.round_id, config.key, "", "", 0.1, ok=False, error="rc=3 boom",
+                                   fidelity=fidelity)
+                return super().run(round, config, fidelity)
+
+        calls2 = []
+        ex = LocalExecutor(OneBad(r, batching=True), workers=1)
+        jobs = [EvalJob(f"b{i}", ROUND, Config("gatk", {**d, conf: c})) for i, c in enumerate((30.0, 40.0, 50.0, 60.0))]
+        ex.submit(jobs)
+        got = {}
+        for _ in range(60):
+            for cs in ex.poll(0.2):
+                got[cs.job_id] = cs
+            if len(got) == 4:
+                break
+        self.assertEqual(sorted(got), ["b0", "b1", "b2", "b3"])                # every job answered, no endless retry
+        self.assertEqual([got[j].ok for j in ("b0", "b1", "b2", "b3")], [True, True, False, True])
+        self.assertLessEqual(len(calls2), 8)
 
         class Always(FakeRunner):                          # a config that crashes on its own is a failure
             def run(self, round, config, fidelity=FULL):

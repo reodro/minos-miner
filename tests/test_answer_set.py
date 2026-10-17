@@ -597,5 +597,225 @@ class K2EndToEndTest(unittest.TestCase):
         self.assertGreaterEqual(2 * p * rc / (p + rc), 0.998)                      # measured 0.9991
 
 
+class K2ClassCostTest(unittest.TestCase):
+    """An extra 1000G call is charged 3.75/N, N that round's mutations.vcf count."""
+
+    def _round(self, n):
+        import numpy as np
+        return {"name": "r", "info": {} if n is None else {"n_targets": n},
+                "X": np.zeros((1, 1)), "y_any": np.array([0]), "y_hom": np.array([0]),
+                "pos": np.array([100]), "ref": np.array(["A"]), "alt": np.array(["AT"])}
+
+    def test_real_n_costs_more_than_580_on_a_small_round(self):
+        from answer_set.k2 import train_track
+        r = self._round(349)
+        oof = {"r": (__import__("numpy").array([0.9]), __import__("numpy").array([0.1]))}
+        truths = {"r": {}}
+        small = train_track.class_points([r], oof, truths, "ind1", 0.5, "kg")
+        wide = train_track.class_points([self._round(580)], oof, truths, "ind1", 0.5, "kg")
+        old = train_track.class_points([self._round(None)], oof, truths, "ind1", 0.5, "kg")
+        self.assertAlmostEqual(wide - small, 3.75 / 349 / 70 - 3.75 / 580 / 70)
+        self.assertAlmostEqual(old, wide)
+
+
+class K2SecondSpellingTest(unittest.TestCase):
+    """GIAB: two overlapping indels under the calling threshold become the higher-scoring one, homozygous.
+    A donor record is left as published. Two alleles the forest already accepted both stay."""
+
+    def test_collapses_the_lower_copy_to_one_hom(self):
+        from answer_set.k2 import clusterdec
+        low = (17855882, "TTTTGAG", "T", "het", True, 0.08)
+        high = (17855883, "TTTGAG", "T", "het", True, 0.47)
+        donor = (17855800, "A", "G", "het", False, 2.0)
+        p = {(low[0], low[1], low[2]): 0.081, (high[0], high[1], high[2]): 0.467}
+        got = clusterdec.drop_second_spelling([donor, low, high], p, 0.5)
+        self.assertEqual(got, [donor, (17855883, "TTTGAG", "T", "hom", True, 0.47)])
+
+    def test_drops_a_low_indel_on_top_of_the_donor(self):
+        from answer_set.k2 import clusterdec
+        donor = (26271921, "CT", "C", "hom", False, 2.0)
+        extra = (26271921, "CTT", "C", "het", True, 0.0)
+        got = clusterdec.drop_second_spelling([donor, extra], {extra[:3]: 0.0}, 0.5)
+        self.assertEqual(got, [donor])
+
+    def test_keeps_two_alleles_the_forest_accepted(self):
+        from answer_set.k2 import clusterdec
+        a = (100, "AAA", "A", "het", True, 0.95)
+        b = (101, "AA", "A", "het", True, 0.91)
+        got = clusterdec.drop_second_spelling([a, b], {a[:3]: 0.95, b[:3]: 0.91}, 0.5)
+        self.assertEqual(got, [a, b])
+
+
+class K2ShortenRepeatTest(unittest.TestCase):
+    """A homozygous run insertion is already on both copies. The heterozygous allele that
+    writes those bases again is shortened. A donor allele is not rewritten."""
+
+    def test_strips_the_hom_run_from_the_het_allele(self):
+        import tempfile
+        import pysam
+        from answer_set.k2 import clusterdec
+        seq = "GGGCTCAAAAAAAAAAAAAACCAAGGG"
+        with tempfile.TemporaryDirectory() as d:
+            with open(f"{d}/chrT.fa", "w") as fh:
+                fh.write(">chrT\n" + seq + "\n")
+            pysam.faidx(f"{d}/chrT.fa")
+            fa = pysam.FastaFile(f"{d}/chrT.fa")
+            hom = (6, "C", "CAA", "hom", False, 2.0)
+            het = (12, "A", "AAATT", "het", True, 0.9)
+            donor_het = (12, "A", "AAA", "het", False, 2.0)
+            got = clusterdec.shorten_repeated([hom, het], fa, "chrT")
+            self.assertEqual(got, [hom, (12, "A", "ATT", "het", True, 0.9)])
+            self.assertEqual(clusterdec.shorten_repeated([hom, donor_het], fa, "chrT"), [hom, donor_het])
+            # donor C>CT and a longer T>TTA: shorten first, or the second-spelling pass
+            # drops TTA and the true T>TA is never written
+            seq2 = "AAAGCTTTTTAAAA"
+            with open(f"{d}/chrU.fa", "w") as fh:
+                fh.write(">chrU\n" + seq2 + "\n")
+            pysam.faidx(f"{d}/chrU.fa")
+            fa2 = pysam.FastaFile(f"{d}/chrU.fa")
+            donor_ct = (5, "C", "CT", "hom", False, 1.0)
+            longer = (6, "T", "TTA", "het", True, 0.2)
+            shortened = clusterdec.shorten_repeated([donor_ct, longer], fa2, "chrU")
+            self.assertEqual([r[:4] for r in shortened], [(5, "C", "CT", "hom"), (6, "T", "TA", "het")])
+            kept = clusterdec.drop_second_spelling(shortened, {(6, "T", "TA"): 0.2, (6, "T", "TTA"): 0.2}, 0.5)
+            self.assertEqual([r[:4] for r in kept], [(5, "C", "CT", "hom"), (6, "T", "TA", "het")])
+            fa2.close()
+            fa.close()
+
+
+class K2RunEdgeTest(unittest.TestCase):
+    """A 2 bp insertion inside a long homopolymer is the run base at the left edge plus the
+    other base. It is written that way when several original reads carry the other base.
+    A donor allele is not rewritten, and a weak edit is not called."""
+
+    def _fixture(self, d, seq, hap, n_reads, insert_at, vcf_pos):
+        import pysam
+        fa_path = f"{d}/chrT.fa"
+        with open(fa_path, "w") as fh:
+            fh.write(">chrT\n" + seq + "\n")
+        pysam.faidx(fa_path)
+        header = pysam.AlignmentHeader.from_dict({
+            "HD": {"VN": "1.0", "SO": "coordinate"},
+            "SQ": [{"SN": "chrT", "LN": len(seq)}],
+        })
+        bam_path = f"{d}/in.bam"
+        with pysam.AlignmentFile(bam_path, "wb", header=header) as out:
+            for i in range(n_reads):
+                a = pysam.AlignedSegment(header)
+                a.query_name = f"r{i}"
+                a.query_sequence = hap
+                a.flag = 0
+                a.reference_id = 0
+                a.reference_start = 0
+                a.mapping_quality = 60
+                a.cigar = [(0, insert_at), (1, 2), (0, len(seq) - insert_at)]
+                a.next_reference_id = -1
+                a.next_reference_start = -1
+                out.write(a)
+        pysam.index(bam_path)
+        vcf_path = f"{d}/cand.vcf"
+        with open(vcf_path, "w") as fh:
+            fh.write("##fileformat=VCFv4.2\n##contig=<ID=chrT,length=%d>\n" % len(seq))
+            fh.write("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n")
+            fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts\n")
+            fh.write(f"chrT\t{vcf_pos}\t.\tA\tAAT\t.\t.\t.\tGT\t0/1\n")
+        return fa_path, bam_path, vcf_path
+
+    def test_writes_the_run_base_at_the_left_edge(self):
+        import tempfile
+        import pysam
+        from answer_set.k2 import clusterdec
+        # 10 bases of pad, then C + 16 A's. The insertion sits on the 9th A.
+        seq = "GGGGGGGGGG" + "CCCAAAAAAAAAAAAAAAAGG" + "CCCCCCCCCC"
+        insert_at = 21
+        hap = seq[:insert_at] + "AT" + seq[insert_at:]
+        with tempfile.TemporaryDirectory() as d:
+            fa_path, bam_path, vcf_path = self._fixture(d, seq, hap, 8, insert_at, insert_at + 1)
+            fa = pysam.FastaFile(fa_path)
+            donor = (1, "G", "A", "het", False, 2.0)
+            rd = {(21, "A", "AAT"): (6, 8, 5)}
+            got, n = clusterdec.spell_run_edge([donor], bam_path, fa, "chrT", rd, vcf_path)
+            self.assertEqual(n, 2)
+            self.assertEqual(got[0], donor)
+            self.assertEqual(sorted(r[:5] for r in got[1:]),
+                             [(13, "C", "CA", "hom", True), (21, "A", "AT", "hom", True)])
+            quiet, n0 = clusterdec.spell_run_edge([donor], bam_path, fa, "chrT",
+                                                   {(21, "A", "AAT"): (6, 8, 1)}, vcf_path)
+            self.assertEqual((quiet, n0), ([donor], 0))
+            # the edge position already carries a different allele: leave the run alone
+            blocked = [(13, "C", "CG", "het", False, 2.0)]
+            same, n1 = clusterdec.spell_run_edge(blocked, bam_path, fa, "chrT", rd, vcf_path)
+            self.assertEqual((same, n1), (blocked, 0))
+            fa.close()
+
+
+class K2WindowDropTest(unittest.TestCase):
+    """A second synthetic allele, or a long indel few reads carry, is dropped when the
+    window's two haplotypes are already explained without it."""
+
+    def test_drops_the_shorter_allele_the_window_does_not_use(self):
+        from answer_set.k2 import hapwin
+        ref = "AAAA"
+        short = (1, "A", "AA", "het", True, 0.8)
+        long = (1, "A", "AAA", "het", True, 0.9)
+        w = {"ref": ref, "pair": ("AAAA", "AAAAAA"), "post": 1.0}
+        got = hapwin.drop_unneeded([short, long], [(1, 4, w)], {})
+        self.assertEqual(got, [long])
+
+    def test_drops_a_long_indel_few_reads_carry(self):
+        from answer_set.k2 import hapwin
+        ref = "AAAAAAAAAAGT"
+        deletion = (1, "AAAAAAAAA", "A", "het", True, 0.7)
+        snp = (11, "G", "C", "hom", True, 0.99)
+        changed = ref[:10] + "C" + ref[11:]
+        w = {"ref": ref, "pair": (changed, changed), "post": 1.0}
+        self.assertEqual(hapwin.drop_unneeded([deletion, snp], [(1, 12, w)], {deletion[:3]: 0.10}), [snp])
+        self.assertEqual(hapwin.drop_unneeded([deletion, snp], [(1, 12, w)], {deletion[:3]: 0.25}),
+                         [deletion, snp])
+
+    def test_key_change_requires_a_different_allele(self):
+        import numpy as np
+        from answer_set.k2 import hapwin
+        key = (10, "A", "AT")
+        other = (12, "C", "CA")
+        answer = {key: ("hom", True)}
+        same = (0, 20, {}, [(key, "hom")], {key: "het"}, None)
+        changed = (0, 20, {}, [(key, "hom")], {other: "hom", key: "hom"}, None)
+        keep, pk = hapwin.select_key_changes([same, changed], np.array([0.9, 0.95]), 0.75, answer)
+        self.assertEqual(len(keep), 1)
+        self.assertEqual(set(keep[0][4]), {other, key})
+        self.assertAlmostEqual(pk[0], 0.95)
+
+
+class K2OneSpellingTest(unittest.TestCase):
+    """1000G: two minimal spellings of one edited haplotype become the one with more read support.
+    A haplotype the answer never called is not added."""
+
+    def test_keeps_the_supported_spelling_of_the_same_dna(self):
+        import tempfile
+        import pysam
+        from answer_set.k2 import clusterdec
+        ref = "ACGTACGTACGTACGTACGT"
+        with tempfile.TemporaryDirectory() as d:
+            with open(f"{d}/chrT.fa", "w") as fh:
+                fh.write(">chrT\n" + ref + "\n")
+            pysam.faidx(f"{d}/chrT.fa")
+            fa = pysam.FastaFile(f"{d}/chrT.fa")
+            low = ((3, "G", "A"), (4, "T", "C"))
+            hap = clusterdec._apply_events(ref, 1, low)
+            spellings, _ = clusterdec.spellings(ref, hap, 1, fa, "chrT")
+        self.assertIn(low, spellings)
+        high = ((1, "A", "ACA"), (2, "CGT", "C"))
+        self.assertIn(high, spellings)
+        rd = {e: (8, 10, 8) for e in high}
+        rd.update({e: (1, 10, 1) for e in low})
+        copy = {"hap": hap, "reads": 8, "edit": 6, "orig": 0, "unk": 0, "n_ori": 2, "spellings": list(spellings)}
+        base = {"s": 1, "copies": [copy], "hom": False, "donor_in": []}
+        got = clusterdec.spelling_replacement(dict(base, ours={k: "het" for k in low}), rd, ref)
+        self.assertEqual(got, {k: "het" for k in high})
+        self.assertIsNone(clusterdec.spelling_replacement(dict(base, ours={}), rd, ref))
+        self.assertIsNone(clusterdec.spelling_replacement(dict(base, ours={(3, "G", "T"): "het"}), rd, ref))
+
+
 if __name__ == "__main__":
     unittest.main()
