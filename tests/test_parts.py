@@ -568,6 +568,26 @@ class SpaceTest(unittest.TestCase):
         from search.space import bam_caps
         self.assertEqual(bam_caps("/nonexistent.bam", "chr20", 1, 10), {})
 
+    def test_validator_edges_assemble_and_stay_off_the_dense_ladder(self):
+        from search.space import Space
+        from search.steps import Ladders
+        from search.candidates import in_indel_family
+        sp = Space(ranges())
+        edge = sp._assemble({"min_pruning": 1, "active_probability_threshold": 0.0001,
+                             "max_num_haplotypes_in_population": 256, "dont_use_soft_clipped_bases": True})
+        self.assertIsNotNone(edge)
+        self.assertEqual(edge.params["min_pruning"], 1)
+        self.assertEqual(edge.params["max_num_haplotypes_in_population"], 256)
+        self.assertTrue(in_indel_family(edge))
+        ladders = Ladders(sp)
+        self.assertIn(1, ladders.rungs["min_pruning"])
+        self.assertIn(256, ladders.rungs["max_num_haplotypes_in_population"])
+        self.assertNotIn(129, ladders.rungs["max_num_haplotypes_in_population"])
+        self.assertIn(0.0001, ladders.rungs["active_probability_threshold"])
+        self.assertTrue(edge.params["dont_use_soft_clipped_bases"])
+        self.assertNotIn("sample_ploidy", sp.names)
+        self.assertNotIn("dont_use_soft_clipped_bases", sp.names)
+
     def test_a_round_bam_replaces_three_ranges_with_the_groups_it_can_tell_apart(self):
         import random as _r
         from search.bamgroups import BQST, MBQ, MRPAS, BamFacts, bam_bounds, bounds_from
@@ -576,11 +596,9 @@ class SpaceTest(unittest.TestCase):
         facts = BamFacts(frozenset({2, 3, 4, 5, 6, 10, 20, 30}), frozenset(range(61)), 74)
         bounds = bounds_from(facts, ranges())
         self.assertEqual(bounds.groups[MBQ], (10, 11, 20, 21, 30))
-        self.assertEqual(bounds.count[BQST], 25)          # finest list, at mapping quality 0; 31 (above Q30) calls nothing
-        self.assertEqual(bounds.caps[BQST], 30)
-        self.assertEqual(max(bounds.groups[BQST]), 30)
+        self.assertEqual(bounds.count[BQST], 26)          # finest list, at mapping quality 0
         self.assertEqual(bounds.count[MRPAS], 50)         # 25..74; everything above 74 is 74
-        self.assertIn("1/81", bounds.report)              # 41 x 45 x 276 -> 5 x 25 x 50
+        self.assertIn("1/78", bounds.report)
         sp = Space(ranges(), bounds=bounds)
         rng = _r.Random(0)
         got = [c for c in (sp.random(rng) for _ in range(80)) if c]
@@ -593,7 +611,6 @@ class SpaceTest(unittest.TestCase):
         self.assertEqual(snapped.params[BQST], 11)        # at mapping quality 59 the 26 collapse toward 5
         self.assertEqual(snapped.params[MRPAS], 74)
         self.assertEqual(sp._assemble({MBQ: 45}).params[MBQ], 30)
-        self.assertEqual(sp._assemble({BQST: 45}).params[BQST], 30)   # every base lowered to 6 would call nothing
         nothing = bounds_from(BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13), ranges())
         fixed = Space(ranges(), bounds=nothing)
         self.assertNotIn(MRPAS, fixed.names)              # no start has 25 reads, so the axis is one value
@@ -617,15 +634,18 @@ class SpaceTest(unittest.TestCase):
         bounds = bounds_from(facts, ranges())
         self.assertNotIn(CONT, bounds.groups)                 # allowed would encode an off-ladder fraction as rung 0
         self.assertIn(f"{CONT} 21 -> {len(reps)}", bounds.report)
+        from search.space import EDGE_RUNGS
         sp = Space(ranges(), bounds=bounds)
-        self.assertEqual(Ladders(sp).rungs[CONT], list(reps))
+        dense = [r for r in Ladders(sp).rungs[CONT] if r <= 0.05 + 1e-12]
+        self.assertEqual(dense, list(reps))
+        self.assertTrue(set(EDGE_RUNGS[CONT]) <= set(Ladders(sp).rungs[CONT]))
         self.assertEqual(sp._assemble({CONT: 0.01}).params[CONT], 0.0)
         self.assertEqual(sp._assemble({CONT: 0.01875}).params[CONT], 0.01875)
         self.assertEqual(snap(facts, CONT, 0.005, mmq=0, lo=0.0, hi=0.05), 0.0)
         shallow = BamFacts(frozenset({2, 10, 20, 30}), frozenset(range(61)), 13, frozenset(range(1, 11)))
         one = bounds_from(shallow, ranges())
         fixed = Space(ranges(), bounds=one)
-        self.assertEqual(Ladders(fixed).rungs[CONT], [0.0])    # depth 10 removes nothing anywhere on the ladder
+        self.assertEqual([r for r in Ladders(fixed).rungs[CONT] if r <= 0.05 + 1e-12], [0.0])
         self.assertEqual(fixed._assemble({CONT: 0.04}).params[CONT], 0.0)
 
     def test_snapping_keeps_every_class_the_bam_can_tell_apart(self):

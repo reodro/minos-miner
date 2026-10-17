@@ -117,8 +117,6 @@ def remember(ctx, pile_no: int, config: Config, score: float) -> None:
 
 def seal_peak(climber) -> None:
     """The climber found this fingerprint's peak. The history keeps it, so a similar pile is not opened."""
-    if not enabled():
-        return
     centre = getattr(climber, "centre", None)
     if centre is None:
         return
@@ -440,8 +438,6 @@ def follow(ctx, climber, config: Config, score: float) -> bool:
 
     A higher score becomes the fingerprint. Any pile that fingerprint overlaps is merged into this one.
     """
-    if not enabled():
-        return True
     piles = getattr(ctx, "_piles", None)
     if not piles:
         return True
@@ -464,8 +460,6 @@ def follow(ctx, climber, config: Config, score: float) -> bool:
 
 def centre_allowed(climber, config: Config) -> bool:
     """A climber may take `config` as its centre when it is within 0.10 of this pile's fingerprint."""
-    if not enabled():
-        return True
     ctx = climber.ctx
     piles = list(getattr(ctx, "_piles", None) or [])
     if not piles:

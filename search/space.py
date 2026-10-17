@@ -39,6 +39,44 @@ PINNED = {"gatk": {"emit_ref_confidence": "NONE",
 # padding 0-4 reached the top 200 of 7,067 true-scored (best 85.67 against 85.84 at padding 13).
 FLOORS = {"gatk": {"assembly_region_padding": 5}}
 
+# Live /scoring/parameter-ranges is tighter than the validator GATK template (templates.tool_params).
+# Local GATK scores the template bounds. Family A (PCR NONE/CONSERVATIVE × large assembly) peaked ~81.1
+# on 20261010T044200Z against king 82.78. These are the remaining unclimbed values: template-legal,
+# outside that published box. Adaptive-pruning floats stay PINNED: HaplotypeCaller does not read them
+# without a switch, and that switch is not a published parameter.
+VALIDATOR_EDGES = {
+    "gatk": {
+        "min_pruning": {"min": 1},
+        "min_dangling_branch_length": {"min": 1},
+        "active_probability_threshold": {"min": 0.0001},
+        "max_num_haplotypes_in_population": {"max": 512},
+        "contamination_fraction_to_filter": {"max": 0.5},
+        "standard_min_confidence_threshold_for_calling": {"min": 0.0},
+        "max_assembly_region_size": {"max": 1000},
+        "max_reads_per_alignment_start": {"min": 0},
+        "sample_ploidy": {"min": 1, "max": 10, "allowed": ()},
+        "dont_use_soft_clipped_bases": {"allowed": ()},
+    }
+}
+
+# Sparse rungs outside the published box. Dense ladders stay on the API range so certify does not
+# grow by hundreds of neighbors (haplotypes 129–512, contamination 0.05–0.5).
+EDGE_RUNGS = {
+    "min_pruning": (1,),
+    "min_dangling_branch_length": (1,),
+    "active_probability_threshold": (0.0001, 0.0002, 0.0005),
+    "max_num_haplotypes_in_population": (160, 192, 256, 384, 512),
+    "contamination_fraction_to_filter": (0.08, 0.10, 0.15, 0.25, 0.5),
+    "standard_min_confidence_threshold_for_calling": (0.0, 10.0, 20.0),
+    "max_assembly_region_size": (800, 900, 1000),
+    "max_reads_per_alignment_start": (0,),
+    "sample_ploidy": (1, 3),
+    "dont_use_soft_clipped_bases": (True,),
+}
+
+# Assemble and seed these; leave them out of names so setting-distance stays on the published axes.
+SEED_ONLY = frozenset({"sample_ploidy", "dont_use_soft_clipped_bases"})
+
 
 def bam_caps(bam: str, chrom: str, start: int, end: int, reads: int = 20000) -> Dict[str, object]:
     """Bounds the round's data sets: min_base_quality_score above the BAM's highest base quality keeps no base and
@@ -58,9 +96,7 @@ def bam_caps(bam: str, chrom: str, start: int, end: int, reads: int = 20000) -> 
                     break
     except Exception:  # noqa: BLE001 - no BAM, no index, no pysam: no caps
         return {}
-    # base_quality_score_threshold above that maximum lowers every base below any allowed min_base_quality_score:
-    # also nothing called (search/bamgroups.py, bounds_from).
-    return {"min_base_quality_score": int(top), "base_quality_score_threshold": max(int(top), 6)} if n else {}
+    return {"min_base_quality_score": int(top)} if n else {}
 
 # Copied from evaluator.gatk.BRANCH groups. Search must not import evaluator (CONTRIBUTING.md).
 GENOTYPING_PARAMS = ("standard_min_confidence_threshold_for_calling", "indel_heterozygosity",
@@ -113,14 +149,58 @@ class Space:
             self.specs[n] = sp
         self.pinned = dict(PINNED.get(tool, {}) if pinned is None else pinned)
         self.reductions = None                       # set by the engine: caps and flat thresholds learned from runs
-        self.names: List[str] = [n for n, s in sorted(self.specs.items()) if not self._fixed(s) and n not in self.pinned]
+        # Published API box, before validator-edge widening. Ladders stay dense here; EDGE_RUNGS add the rest.
+        self.api = {n: {"min": s.min, "max": s.max, "allowed": s.allowed, "type": s.type}
+                    for n, s in self.specs.items()}
+        self._widen(tool)
+        self.names: List[str] = [n for n, s in sorted(self.specs.items())
+                                 if not self._fixed(s) and n not in self.pinned and n not in SEED_ONLY]
+
+    def _widen(self, tool: str) -> None:
+        """Open validator-template bounds the published API left closed, and keep client/submit in sync."""
+        extra = VALIDATOR_EDGES.get(tool, {})
+        published = self.ranges.tools.get(tool, {})
+        for n, over in extra.items():
+            s = self.specs.get(n)
+            if s is None:
+                continue
+            # A BAM whose starts never reach the published min makes max_reads one run. 0 is that same run.
+            if n == "max_reads_per_alignment_start" and self._fixed(s):
+                continue
+            kw: Dict[str, object] = {}
+            if "min" in over and (s.min is None or over["min"] < s.min):
+                kw["min"] = over["min"]
+            if "max" in over and (s.max is None or over["max"] > s.max):
+                kw["max"] = over["max"]
+            if "allowed" in over:
+                kw["allowed"] = tuple(over["allowed"])
+            elif s.allowed:
+                merged = list(s.allowed)
+                for v in EDGE_RUNGS.get(n, ()):
+                    if v not in merged:
+                        merged.append(v)
+                if len(merged) != len(s.allowed):
+                    kw["allowed"] = tuple(merged)
+            if not kw:
+                continue
+            new = dataclasses.replace(s, **kw)
+            self.specs[n] = new
+            if n in published:
+                published[n] = new
 
     @staticmethod
     def _fixed(s: ParamSpec) -> bool:
         return (s.allowed and len(s.allowed) == 1) or (s.type in ("int", "float") and s.min == s.max)
 
     def _log(self, s: ParamSpec) -> bool:
-        return s.type == "float" and s.min is not None and s.min > 0 and s.max / s.min >= 100 - 1e-9
+        pub = self.api.get(s.name) if getattr(self, "api", None) else None
+        if pub and pub["min"] is not None and pub["max"] is not None:
+            lo, hi = float(pub["min"]), float(pub["max"])
+        elif s.min is not None and s.max is not None:
+            lo, hi = float(s.min), float(s.max)
+        else:
+            return False
+        return s.type == "float" and lo > 0 and hi / lo >= 100 - 1e-9
 
     # ---- config <-> features -------------------------------------------------------------------------------
     def encode(self, config: Config) -> List[float]:
@@ -136,13 +216,20 @@ class Space:
         return snap(self.bounds.facts, name, value, mmq=mmq, lo=lo, hi=hi)
 
     def _to_unit(self, s: ParamSpec, v) -> float:
-        if s.allowed:
-            if v not in s.allowed and s.name in self.groups:
+        pub = self.api.get(s.name) if getattr(self, "api", None) else None
+        allowed = pub["allowed"] if pub else s.allowed
+        typ = pub["type"] if pub else s.type
+        lo = pub["min"] if pub else s.min
+        hi = pub["max"] if pub else s.max
+        if allowed:
+            if v not in allowed and s.name in self.groups:
                 v = self._snap(s.name, v, self._mmq_floor)
-            return s.allowed.index(v) / max(len(s.allowed) - 1, 1) if v in s.allowed else 0.0
-        if s.type == "bool":
+            return allowed.index(v) / max(len(allowed) - 1, 1) if v in allowed else 0.0
+        if typ == "bool":
             return 1.0 if v else 0.0
-        lo, hi, x = float(s.min), float(s.max), float(v)
+        lo, hi, x = float(lo), float(hi), float(v)
+        if hi == lo:
+            return 0.0
         if self._log(s):
             return (math.log(x) - math.log(lo)) / (math.log(hi) - math.log(lo))
         return (x - lo) / (hi - lo)

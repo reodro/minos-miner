@@ -20,20 +20,27 @@ import math
 from typing import Dict, List, Optional
 
 from common.types import Config
+from search.space import EDGE_RUNGS
 
 FLOAT_STEP = {"active_probability_threshold": 0.001, "contamination_fraction_to_filter": 0.0025,
               "standard_min_confidence_threshold_for_calling": 1.0}
 FLOAT_LOG_PER_DECADE = {"heterozygosity": 10, "indel_heterozygosity": 10}
 
 
-def ladder(space, name: str) -> list:
+def _dense_ladder(space, name: str) -> list:
+    """Rungs of the published API box. Validator-edge values are merged on afterwards."""
+    api = getattr(space, "api", None) or {}
+    pub = api.get(name)
     s = space.specs[name]
-    if s.allowed:
-        return list(s.allowed)
-    if s.type == "bool":
+    if pub:
+        allowed, lo, hi, typ = pub["allowed"], pub["min"], pub["max"], pub["type"]
+    else:
+        allowed, lo, hi, typ = s.allowed, s.min, s.max, s.type
+    if allowed:
+        return list(allowed)
+    if typ == "bool":
         return [False, True]
-    lo, hi = s.min, s.max
-    if s.type == "int":
+    if typ == "int":
         return list(range(int(lo), int(hi) + 1))
     if name in FLOAT_STEP:
         step = FLOAT_STEP[name]
@@ -51,6 +58,16 @@ def ladder(space, name: str) -> list:
         return [float(f"{lo * 10 ** (i / k):.4g}") for i in range(int(round(math.log10(hi / lo) * k)) + 1)]
     n = 50                                          # a float with no agreed resolution: 50 rungs
     return [round(lo + (hi - lo) * i / (n - 1), 6) for i in range(n)]
+
+
+def ladder(space, name: str) -> list:
+    rungs = _dense_ladder(space, name)
+    for v in EDGE_RUNGS.get(name, ()):
+        if v not in rungs:
+            rungs.append(v)
+    if rungs and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in rungs):
+        rungs.sort()
+    return rungs
 
 
 class Ladders:

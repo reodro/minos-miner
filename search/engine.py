@@ -1,5 +1,11 @@
 """Search engine v9.28 (search/DESIGN.md): A candidates -> B climb hills -> C one fine-tune.
 
+    Every tag, 2026-10-16: one independent search per islands.workers workers (search/islands.py; 810 workers is
+    two islands of 405, each a whole A -> B -> C run on its own share, and the pick is the best island's). Each
+    climber also sends centre jumps with its grids: one read-pass or assembly setting moved 2 or more rungs, chosen
+    by a bandit over setting x distance that learns from the jumps' results (search/leaps.py); a peak is named only
+    after one jump per distance class and direction, then two-setting jumps.
+
     v9.28: while a grid is walking, a new high in the pile does not replace the fingerprint or the centre.
     The grid writes the setting it found.
     v9.27: an elite probe is sent even when it is within four settings of another probe already in flight.
@@ -51,7 +57,8 @@
                                   the GA. Grids start once a free GA score beats the lowest climber, or after
                                   climb.ga_open_min. After that a free GA that is on a near climber's hill
                                   goes to the lowest near seat that it beats; a far seat takes only a GA that
-                                  is far from every near centre. A GA child already sitting
+                                  is still in the edge family (a higher AGGRESSIVE child that differs in
+                                  four genotyping settings is this shelf, not a second hill). A GA child already sitting
                                   on a climber is skipped. It does not wait for a grid to end.
                                   A value that has already tied a config's exact score is not sent again.
                                   An untried value of that setting still is.
@@ -62,10 +69,9 @@
                                   (long ladders 1, 2, 3, 5), 20 random jumps at a stall. When a hill is found,
                                   that seat climbs the next Step A result. When none of those is far from
                                   the climbers still seated, the best scored config that is far takes the seat.
-                                  One of the opening seats is that far hill even when it is more than 0.10 behind
-                                  (v9.16 / B27), as long as it is within 1.0 of the best. When nothing scored is
-                                  far, scouts start at the far parent ends (core and fewest-FP), not the best
-                                  centre, and move six settings far enough to clear the seat distance. Leftover
+                                  One of the opening seats is the edge family (validator-legal values the
+                                  published API does not propose), even when it is up to 20 behind. Family A
+                                  is a measured local opt on this shelf. Scouts snap onto the edge box. Leftover
                                   GA children are half elite-anchored (v9.17 / B26): the current best is one
                                   parent, and the child must differ in at least four searched settings.
                                   Leftover cores take GA children on the same pass as the compass (v9.18 / B29);
@@ -92,15 +98,16 @@ import random
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from common.limits import VALIDATOR_RUN_S
 from common.params import ParamRanges
 from common.tuning import tune
 from common.types import FULL, Config
-from search import far, portfolio
+from search import far, islands, portfolio
 from search.bamgroups import bam_bounds
 from search.base import Strategy
 from search.candidates import StepA
-from search.client import EvalClient
+from search.client import EvalClient, Outcome
+from search.crashguard import CrashGuard
+from search.duplicates import PARKED, DuplicateGuard
 from search.climb import Climber, occupy
 from search.distance import Distance
 from search.engine_tag import VERSION
@@ -133,6 +140,17 @@ async def settled_capacity(client: EvalClient, workers: int, wait_s: float = 60.
     return cap or workers or 8
 
 
+SWEEP_MAX = 60                  # riders per trade-off sweep (genotyping ~1% of a run each, PairHMM ~12%)
+SWEEP_EVERY_S = 60.0
+_NOT_CRASH = ("cancel", "timeout", "timed out", "lost", "killed", "worker", "shutdown")
+
+
+def _not_a_crash(error: Optional[str]) -> bool:
+    """A failure that says nothing about the config (the run was cancelled, timed out, or its worker went away)."""
+    e = (error or "").lower()
+    return any(w in e for w in _NOT_CRASH)
+
+
 class Context:
     """What the steps share: the client, the round's space and ladders, distances, the clock, proposing and waiting."""
 
@@ -160,6 +178,15 @@ class Context:
         self.last_publish = -1e18
         self.tied = TiedCallsets(space.names)
         self.repeat_skips = 0
+        self.failures: Dict[str, int] = {}             # failed runs by source (wave 0, GA, scout, climber kind)
+        self.fail_reasons: Dict[str, int] = {}
+        self.guard = CrashGuard(space, self.ladders)  # learns this round's GATK crashes; fresh() asks it
+        self.dups = DuplicateGuard(space.names, random.Random(17))   # parks predicted repeats of a callset
+        self._top: Optional[float] = None            # best score so far (the duplicate guard's "near the best")
+        self._released: list = []                    # parked configs to send now (a broken rule, a near twin)
+        self._sweep_next: Optional[Config] = None    # the newest best still to sweep (climb.tradeoff_sweep)
+        self._swept: Set[str] = set()
+        self._sweep_at = -1e18
         client.on_result.append(self._learn_score)
 
     # ---- time ------------------------------------------------------------------------------------------------------
@@ -177,20 +204,39 @@ class Context:
         return t is not None and t <= 0
 
     # ---- configs ---------------------------------------------------------------------------------------------------
+    def note_failure(self, source: str, reason: str) -> None:
+        """One failed run, by source; the reason is kept up to its first ' | '."""
+        self.failures[source] = self.failures.get(source, 0) + 1
+        why = (reason or "unknown").split(" | ")[0][:90]
+        self.fail_reasons[why] = self.fail_reasons.get(why, 0) + 1
+
     def _learn_score(self, outcome) -> None:
         r = outcome.result
+        if r is None and getattr(outcome, "error", None):
+            tag = getattr(outcome, "tag", "") or ""
+            if not tag.startswith("B"):                    # climbers count their own, by kind (Climber.drop_failed)
+                self.note_failure({"A": "step A", "G": "GA", "F": "scout"}.get(tag, tag or "other"), outcome.error)
+            if outcome.config is not None and not _not_a_crash(outcome.error):
+                self.guard.note(outcome.config.params, True, outcome.config.key)
+        elif r is not None and outcome.config is not None:
+            self.guard.note(outcome.config.params, False, outcome.config.key)
         score = getattr(r, "score", None)
         if score is None or getattr(r, "gate_passed", True) is False or outcome.config is None:
             return
         self.tied.note(outcome.config.key, outcome.config.params, score)
+        if self._top is None or score > self._top:
+            self._top = score
+            self._sweep_next = outcome.config
+        self._released.extend(self.dups.note_score(outcome.config, score, self._top))
 
     def fresh(self, c: Optional[Config]) -> bool:
         if c is None or c.key in self.proposed or (c.key, FULL) in self.client.latest:
             return False
-        if self.tied.holds(c.params):
-            self.repeat_skips += 1
-            if self.repeat_skips == 1 or self.repeat_skips % 500 == 0:
-                self.say("callset already scored; %d configs not sent", self.repeat_skips)
+        if self.guard.blocks(c):
+            n = len(self.guard.skipped)
+            if n == 1 or (n % 200 == 0 and n != getattr(self, "_guard_said", 0)):
+                self._guard_said = n
+                self.say("crash guard: %d configs not sent (predicted to crash)", n)
             return False
         return True
 
@@ -220,10 +266,92 @@ class Context:
         return top
 
     def propose(self, batch: Sequence[Config], tag: str, batches: Sequence[str], priority: int = 0) -> List[asyncio.Future]:
-        """One GATK run's worth: a head and its riders. A higher priority is taken first."""
-        for c in batch:
+        """One GATK run's worth: a head and its riders. A higher priority is taken first.
+
+        A config the duplicate guard predicts to repeat a callset is parked (search/duplicates.py): its future is
+        done at once with a PARKED outcome, and the guard sends it later if the prediction breaks or could matter.
+        Nothing is parked while the pick is certified."""
+        batch, batches = list(batch), list(batches)
+        park = not str(self.phase).startswith("C: certify")
+        out: List[Optional[asyncio.Future]] = [None] * len(batch)
+        keep = []
+        for i, c in enumerate(batch):
             self.proposed.add(c.key)
-        return self.client.propose_many(list(batch), tag=tag, batches=list(batches), priority=priority)
+            if park and self.dups.decide(c, tag, self._top):
+                fut = asyncio.get_event_loop().create_future()
+                fut.set_result(Outcome(c, None, PARKED, tag))
+                out[i] = fut
+            else:
+                keep.append(i)
+        if keep:
+            labels = [batches[i] for i in keep]
+            if keep[0] != 0 and batches:
+                labels[0] = batches[0]                    # the first config sent leads the run the head would have
+            fs = self.client.propose_many([batch[i] for i in keep], tag=tag, batches=labels, priority=priority)
+            for i, f in zip(keep, fs):
+                out[i] = f
+                self.dups.note_sent(batch[i])
+        return out  # type: ignore[return-value]
+
+    def sweep_riders(self, centre: Config) -> List[Config]:
+        """The trade-off sweep of one config: every genotyping setting within 4 rungs and at every 4th rung of its
+        ladder, every PairHMM setting within 2 rungs; nothing already scored, running or parked."""
+        from search.space import GENOTYPING_PARAMS, PAIRHMM_PARAMS
+        out: List[Config] = []
+        for n in GENOTYPING_PARAMS + PAIRHMM_PARAMS:
+            if n not in self.space.names or not self.ladders.movable(n):
+                continue
+            rungs = self.ladders.rungs[n]
+            i = int(round(self.ladders.index(n, centre.params.get(n))))
+            near = 4 if n in GENOTYPING_PARAMS else 2
+            idx = set(range(i - near, i + near + 1))
+            if n in GENOTYPING_PARAMS:
+                idx |= set(range(0, len(rungs), 4))
+            for j in sorted(idx, key=lambda j: (abs(j - i), j)):
+                if 0 <= j < len(rungs) and j != i:
+                    c = self.space._assemble({**centre.params, n: rungs[j]})
+                    if c is not None and c.key != centre.key and self.fresh(c) and all(c.key != x.key for x in out):
+                        out.append(c)
+        return out[:SWEEP_MAX]
+
+    def send_sweep(self) -> None:
+        """climb.tradeoff_sweep: the round's newest best gets one batch of cheap riders over the settings that trade
+        core for false positives (2026-10-17: around every recent pick the calling threshold had been tried at 1 of 74
+        values; the 7th place's last step was a two-setting genotyping jump). At most one sweep a minute, Step B and C
+        only; a higher result moves a climber the way a GA child does."""
+        c = self._sweep_next
+        if c is None or not int(tune("climb.tradeoff_sweep")) or self.over():
+            return
+        if not (str(self.phase).startswith("B") or str(self.phase).startswith("C")) or c.key in self._swept:
+            return
+        if self.clock() - self._sweep_at < SWEEP_EVERY_S:
+            return
+        self._sweep_next = None
+        self._swept.add(c.key)
+        self._sweep_at = self.clock()
+        riders = self.sweep_riders(c)
+        if not riders:
+            return
+        fs = self.propose(riders, "S", ["big"] * len(riders), priority=1)
+        for r in riders:
+            self.ga_keys.add(r.key)
+        self.ga_futs.extend(fs)
+        self.say("trade-off sweep: %d riders around the best %s", len(riders), c.key[:8])
+
+    def send_released(self) -> None:
+        """Parked configs whose prediction broke, or whose twin scored near the best: sent now. A higher one moves a
+        climber the way a GA child does (adopt_ga_best)."""
+        if not self._released:
+            return
+        todo, self._released = self._released, []
+        send = [c for c, _ in todo if (c.key, FULL) not in self.client.latest]
+        if not send:
+            return
+        fs = self.client.propose_many(send, tag="D", batches=["big"] * len(send), priority=1)
+        for c in send:
+            self.ga_keys.add(c.key)
+            self.dups.note_sent(c)
+        self.ga_futs.extend(fs)
 
     async def wait_share(self, futs: Sequence[asyncio.Future], share: float, until: float) -> None:
         """Until `share` of `futs` are done, `until` passes, or the search's time is over."""
@@ -246,6 +374,9 @@ class Context:
 
     # ---- telling -----------------------------------------------------------------------------------------------------
     def say(self, msg: str, *args) -> None:
+        island = getattr(self, "island", None)
+        if island is not None:
+            msg = f"[i{island.index}] " + msg
         log.info("engine: " + msg, *args)
         try:
             text = msg % args if args else msg
@@ -259,15 +390,13 @@ class Context:
         top = self.best()
         if top is not None and top[0].key != self.client.pick_key:
             self.client.pick_key = top[0].key
-            if top[0].key in getattr(self.client, "slow", ()):
-                cs = self.client.callsets.get((top[0].key, FULL))
-                self.say("WARNING: the pick %s ran %.0f s here, over the validator's %d s limit per run",
-                         top[0].key[:8], getattr(cs, "runtime_s", 0) or 0, VALIDATOR_RUN_S)
             self.picked = {"key": top[0].key, "score": round(top[1], 4), "at_s": round(self.elapsed(), 1)}
             self.say("pick %s (%.4f) at t+%.1fm", top[0].key, top[1], self.elapsed() / 60)
 
     def publish(self, force: bool = False) -> None:
         """client.notes["engine"]: what main and the review read (the basins ledger)."""
+        self.send_released()
+        self.send_sweep()
         now = self.clock()
         if now >= self.pick_at():                    # a climb still waiting for its wave must not miss the pick
             self.name_pick()
@@ -297,6 +426,15 @@ class Context:
                 "piles": _pile_rows(self),
                 "step_c": list(self.c_log),
                 "pick": self.picked,
+                "failures": dict(self.failures),
+                "head_reserve_ws": round(getattr(self, "reserve_ws", 0.0), 1),
+                "duplicates": {"parked": self.dups.n_parked, "audits": self.dups.n_audits, "near": self.dups.n_near,
+                               "rules_broken": self.dups.n_broken, "released": self.dups.n_released,
+                               "still_parked": self.dups.still_parked()},
+                "crash_guard": {"crashes": len(self.guard.crashed), "completed": len(self.guard.ok),
+                                "not_sent": len(self.guard.skipped), "fitted": self.guard.model is not None,
+                                "audits": self.guard.n_audits, "audits_crashed": self.guard.n_audit_crashed,
+                                "rules_off": self.guard.n_off},
                 "events": list(self.events[-200:]),
             }
         except Exception:  # noqa: BLE001 - the notes must never end the round
@@ -321,112 +459,190 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
         bounds = bam_bounds(r.bam, ranges, tool) if r.bam else None
         caps = {} if bounds is not None else (bam_caps(r.bam, r.chrom, r.start, r.end) if r.bam else {})
         profile = portfolio.bam_profile(r.bam, r.chrom, r.start, r.end) if r.bam else None
+        # One Space for every island: building a second one widens the shared ranges again (Space._widen).
         space = Space(ranges, tool, caps=caps, bounds=bounds)
         if bounds is not None:
             log.info("engine: bam groups: %s", bounds.report)
-        ctx = Context(client, space, rng, profile)
-        ctx.cap = await settled_capacity(client, workers)
-        ctx.say("%s: %d workers, %d settings searched, a %d-minute round (schedule x%.2f)", VERSION, ctx.cap,
-                len(space.names), round(ctx.length / 60), ctx.scale)
-
-        # ---- Step A ----------------------------------------------------------------------------------------------------
-        # SEARCH_START is a one-replay override: climb that frozen config and skip the GA. The normal path is unchanged.
-        ctx.phase = "A: candidates"
-        ctx.step_a = StepA(ctx)
-        forced = os.environ.get("SEARCH_START")
-        known_score: Dict[str, float] = {}
-        if forced:
-            raw = json.loads(open(forced).read())
-            seat = space._assemble(raw["params"])
-            starts = [seat] if seat is not None else []
-            if seat is not None and seat.key == raw.get("key"):
-                known_score[seat.key] = float(raw["score"])
-            ctx.say("step A skipped: climbing frozen seat %s opened at %.4f (%s)",
-                    seat.key[:8] if seat is not None else "?", float(raw.get("score") or 0), raw.get("group") or "")
-        else:
-            try:
-                starts = await ctx.step_a.run()
-            except Exception:  # noqa: BLE001 - a bug in a step must not end the round
-                log.exception("engine: step A failed")
-                top = ctx.best()
-                starts = [top[0]] if top else []
-            else:
-                from search.separate import enabled as separate_enabled, gate
-                if separate_enabled() and starts:
-                    try:
-                        starts = await gate(ctx, list(starts))
-                    except Exception:  # noqa: BLE001
-                        log.exception("engine: the valley gate failed")
-        ctx.marks["a"] = ctx.elapsed()
-        ctx.publish(force=True)
-        if os.environ.get("MINOS_ONLY_WAVE0"):
-            ctx.say("generation 1 is inside the peak interval; step B and step C are not run")
-            ctx.phase = "picked"
-            ctx.name_pick()
-            ctx.publish(force=True)
-            while not ctx.over() and client.in_flight:
-                await asyncio.sleep(0 if hasattr(client.executor, "now") else TICK_S)
-                ctx.name_pick()
-                ctx.publish()
+        cap = await settled_capacity(client, workers)
+        polish = os.environ.get("MINOS_POLISH")
+        if polish:                                     # a test-only focused search from given centres (search/polish.py)
+            from search import polish as fleet_polish
+            await fleet_polish.run(client, space, polish)
             return
+        probe = os.environ.get("MINOS_PROBE")
+        if probe:                                      # a test-only fleet probe of the jump policies; no search
+            from search import probe as fleet_probe
+            await fleet_probe.run(client, space, probe)
+            return
+        k = islands.count(cap)
+        if k <= 1:
+            await search_one(client, space, profile, rng, cap)
+            return
+        log.info("engine: %d islands on %d workers (%s); each is a whole search on its own share", k, cap,
+                 " + ".join(str(q) for q in islands.quotas(cap, k)))
+        await islands.run(client, cap, k, lambda view, island: search_one(
+            view, space, profile, random.Random(seed * 1000 + 1 + island.index), view.quota, island))
 
-        # ---- Step B ----------------------------------------------------------------------------------------------------
-        # The first seats climb at once. When one finds its hill, it climbs the next Step A result.
-        # They keep the seats until the fine-tune. A peaked seat goes to the best candidate.
-        ctx.phase = "B: climbing"
-        end_b = far.fine_tune_at(ctx)
-        if end_b < ctx.clock():
-            end_b = ctx.clock()
-        ctx.b_span = (ctx.clock(), end_b)
-        ready: List[Tuple[Config, float, str]] = []
-        for c in starts:
-            s = ctx.score(c)
-            if s is None:
-                s = known_score.get(c.key)
-            if s is not None:
-                if c.key in known_score:
-                    origin = "frozen seat"
-                else:
-                    row = next((r for r in (getattr(ctx.step_a, "picked", None) or []) if r.get("key") == c.key), None)
-                    group = (row or {}).get("group") or ""
-                    if group.startswith("pile"):
-                        origin = group
-                    else:
-                        origin = "far" if group == "far" else "step A"
-                ready.append((c, s, origin))
-        from search import excess
-        lanes_task = asyncio.ensure_future(excess.run_lanes(ctx, end_b))   # beside the seats (search/excess.py)
-        try:
-            await occupy(ctx, ready, end_b)
-        except Exception:  # noqa: BLE001 - Step B failing must not skip Step C
-            log.exception("engine: step B failed")
-        if not lanes_task.done():
-            lanes_task.cancel()
-        try:
-            await lanes_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001 - a lane must not stop the round
-            pass
-        ctx.marks["b"] = ctx.elapsed()
-        ctx.say("step B done at t+%.1fm: %s", ctx.elapsed() / 60,
-                " | ".join(f"c{d.id} {d.opened:.4f} -> {d.score:.4f} ({d.state}, {d.iteration} it)"
-                           for d in ctx.climbers) or "no climber")
-        ctx.publish(force=True)
+    return run
 
-        # ---- Step C: one fine-tune of the best config. The climbers have already used the time before it. ------------
-        try:
-            await far.refine(ctx)
-        except Exception:  # noqa: BLE001
-            log.exception("engine: step C failed")
-        ctx.marks["c"] = ctx.elapsed()
-        ctx.publish(force=True)
 
-        # ---- the pick --------------------------------------------------------------------------------------------------
+def arms_path() -> str:
+    from common.settings import SETTINGS
+    return os.path.join(SETTINGS.data_dir, "search", "jump_arms.json")
+
+
+def carry_arms(client, arms) -> None:
+    """Keep this round's centre-jump arms for the next round's priors (search/leaps.py). A simulated round
+    (an executor with a virtual clock) keeps nothing."""
+    if arms is None or not carry_enabled(client):
+        return
+    from search.leaps import save_arms
+    try:
+        save_arms(arms, arms_path())
+    except Exception:  # noqa: BLE001 - the round's result does not depend on this file
+        log.exception("engine: saving the jump arms failed")
+
+
+def round_arms(client):
+    """The arms a round starts from: earlier rounds' counts when a real round can read them, plain priors otherwise."""
+    from search.leaps import Arms, load_arms
+    if not carry_enabled(client):
+        return Arms()
+    return load_arms(arms_path())
+
+
+def carry_enabled(client) -> bool:
+    """Arms are carried between real rounds. Not in a simulation, and not with MINOS_ARMS_CARRY=0 (replays of one
+    round: a replay must not learn from the previous replay of the same round)."""
+    if hasattr(getattr(client, "executor", None), "now"):
+        return False
+    return os.environ.get("MINOS_ARMS_CARRY", "1") != "0"
+
+
+async def search_one(client, space: Space, profile: Optional[str], rng: random.Random, cap: int,
+                     island: Optional["islands.Island"] = None) -> None:
+    """One whole search: Step A, Step B, Step C and the pick. With islands, `client` is the island's view."""
+    ctx = Context(client, space, rng, profile)
+    ctx.island = island
+    if island is not None:
+        ctx.climber_base = 100 * island.index
+        if getattr(island, "arms", None) is not None:
+            ctx._jump_arms = island.arms                   # the islands learn their centre jumps together
+    else:
+        ctx._jump_arms = round_arms(client)
+    ctx.cap = cap
+    ctx.say("%s: %d workers, %d settings searched, a %d-minute round (schedule x%.2f)", VERSION, ctx.cap,
+            len(space.names), round(ctx.length / 60), ctx.scale)
+
+    # ---- Step A ----------------------------------------------------------------------------------------------------
+    # SEARCH_START is a one-replay override: climb that frozen config and skip the GA. The normal path is unchanged.
+    ctx.phase = "A: candidates"
+    ctx.step_a = StepA(ctx)
+    forced = os.environ.get("SEARCH_START")
+    known_score: Dict[str, float] = {}
+    if forced:
+        raw = json.loads(open(forced).read())
+        seat = space._assemble(raw["params"])
+        starts = [seat] if seat is not None else []
+        if seat is not None and seat.key == raw.get("key"):
+            known_score[seat.key] = float(raw["score"])
+        ctx.say("step A skipped: climbing frozen seat %s opened at %.4f (%s)",
+                seat.key[:8] if seat is not None else "?", float(raw.get("score") or 0), raw.get("group") or "")
+    else:
+        try:
+            starts = await ctx.step_a.run()
+        except Exception:  # noqa: BLE001 - a bug in a step must not end the round
+            log.exception("engine: step A failed")
+            top = ctx.best()
+            starts = [top[0]] if top else []
+        else:
+            from search.separate import enabled as separate_enabled, gate
+            if separate_enabled() and starts:
+                try:
+                    starts = await gate(ctx, list(starts))
+                except Exception:  # noqa: BLE001
+                    log.exception("engine: the valley gate failed")
+    if island is not None:
+        starts = island.apart(ctx, starts)
+    ctx.marks["a"] = ctx.elapsed()
+    ctx.publish(force=True)
+    if os.environ.get("MINOS_ONLY_WAVE0"):
+        ctx.say("generation 1 is inside the peak interval; step B and step C are not run")
         ctx.phase = "picked"
         ctx.name_pick()
         ctx.publish(force=True)
-        while not ctx.over() and client.in_flight:      # what is still running may still be submitted by main
+        while not ctx.over() and client.in_flight:
             await asyncio.sleep(0 if hasattr(client.executor, "now") else TICK_S)
             ctx.name_pick()
             ctx.publish()
+        return
 
-    return run
+    # ---- Step B ----------------------------------------------------------------------------------------------------
+    # The first seats climb at once. When one finds its hill, it climbs the next Step A result.
+    # They keep the seats until the fine-tune. A peaked seat goes to the best candidate.
+    ctx.phase = "B: climbing"
+    end_b = far.fine_tune_at(ctx)
+    if end_b < ctx.clock():
+        end_b = ctx.clock()
+    ctx.b_span = (ctx.clock(), end_b)
+    ready: List[Tuple[Config, float, str]] = []
+    for c in starts:
+        s = ctx.score(c)
+        if s is None:
+            s = known_score.get(c.key)
+        if s is not None:
+            if c.key in known_score:
+                origin = "frozen seat"
+            else:
+                row = next((r for r in (getattr(ctx.step_a, "picked", None) or []) if r.get("key") == c.key), None)
+                group = (row or {}).get("group") or ""
+                if group.startswith("pile"):
+                    origin = group
+                else:
+                    origin = "far" if group == "far" else "step A"
+            ready.append((c, s, origin))
+    try:
+        await occupy(ctx, ready, end_b)
+    except Exception:  # noqa: BLE001 - Step B failing must not skip Step C
+        log.exception("engine: step B failed")
+    ctx.marks["b"] = ctx.elapsed()
+    ctx.say("step B done at t+%.1fm: %s", ctx.elapsed() / 60,
+            " | ".join(f"c{d.id} {d.opened:.4f} -> {d.score:.4f} ({d.state}, {d.iteration} it)"
+                       for d in ctx.climbers) or "no climber")
+    ctx.publish(force=True)
+
+    # ---- Step C: one fine-tune of the best config. The climbers have already used the time before it. ------------
+    try:
+        await far.refine(ctx)
+    except Exception:  # noqa: BLE001
+        log.exception("engine: step C failed")
+    try:
+        from search.local_opt import certify_round
+        await certify_round(ctx)
+    except Exception:  # noqa: BLE001
+        log.exception("engine: 1-rung certify failed")
+    ctx.marks["c"] = ctx.elapsed()
+    ctx.publish(force=True)
+
+    if island is None:
+        carry_arms(client, getattr(ctx, "_jump_arms", None))
+    if ctx.failures:
+        ctx.say("failed runs by source: %s | reasons: %s", ", ".join(f"{k} {v}" for k, v in sorted(ctx.failures.items())),
+                "; ".join(f"{v} x {k}" for k, v in sorted(ctx.fail_reasons.items(), key=lambda kv: -kv[1])[:3]))
+    if ctx.guard.summary():
+        ctx.say("%s", ctx.guard.summary())
+    if ctx.dups.summary():
+        ctx.say("%s", ctx.dups.summary())
+    if getattr(ctx, "reserve_ws", 0.0) > 0:
+        span = max(1.0, ctx.marks.get("b", ctx.elapsed()) - ctx.marks.get("a", 0.0))
+        ctx.say("head reserve kept %.0f worker-minutes free (%.1f workers on average over Step B)",
+                ctx.reserve_ws / 60, ctx.reserve_ws / span)
+
+    # ---- the pick --------------------------------------------------------------------------------------------------
+    ctx.phase = "picked"
+    ctx.name_pick()
+    ctx.publish(force=True)
+    while not ctx.over() and client.in_flight:      # what is still running may still be submitted by main
+        await asyncio.sleep(0 if hasattr(client.executor, "now") else TICK_S)
+        ctx.name_pick()
+        ctx.publish()

@@ -66,19 +66,25 @@ def setting_distance(space, a: Config, b: Config) -> float:
 
 
 class Distance:
-    """Distances between configs the client has evaluated; sketches decoded once per config."""
+    """Distances between configs the client has evaluated; sketches decoded once per config.
+
+    Only a found sketch is kept. A GA child is compared with the climbers before it is sent, when it has no calls
+    yet; keeping that miss judged it by settings for the rest of the round (044200Z, 2026-10-16: every far seat was
+    "far" by setting distance and called the plateau's variants)."""
 
     def __init__(self, client, space):
         self.client, self.space = client, space
-        self._decoded: Dict[str, Optional[dict]] = {}
+        self._decoded: Dict[str, dict] = {}
 
     def sketch(self, c: Config) -> Optional[dict]:
-        if c.key not in self._decoded:
+        hit = self._decoded.get(c.key)
+        if hit is None:
             cs = self.client.callsets.get((c.key, FULL))
             sk = getattr(cs, "sketch", None) if cs is not None else None
-            self._decoded[c.key] = None if not sk else {"k": sk.get("k", 128),
-                                                         "h": {cls: _unpack(v) for cls, v in sk["h"].items()}}
-        return self._decoded[c.key]
+            if not sk:
+                return None
+            hit = self._decoded[c.key] = {"k": sk.get("k", 128), "h": {cls: _unpack(v) for cls, v in sk["h"].items()}}
+        return hit
 
     def between(self, a: Config, b: Config) -> Tuple[float, str]:
         """(distance, "callset" | "settings")."""

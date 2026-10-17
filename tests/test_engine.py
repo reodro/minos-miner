@@ -9,14 +9,16 @@ import tempfile
 import unittest
 import unittest.mock
 
+from common.tuning import TUNING
 from common.types import AnswerSet, Config, Regime, Round, Variant
 from evaluator import FakeRunner, FakeScorer, SimExecutor
 from evaluator.sketch import callset_sketch
 from main import DryRunSubmitter, LoopSettings, run_round
 from search import engine, far, lines
-from search.candidates import Point, StepA, pareto_layers
-from search.climb import (Climber, adopt_ga_best, far_replacement, far_scouts, held_by_climber, held_by_ga,
-                          next_probes, submit_ga)
+from search.candidates import (INDEL_FAMILY_SEEDS, OFFICIAL_SEED, REFERENCE_PEAK, Point, StepA,
+                               in_indel_family, left_the_rim, n_seats, pareto_layers)
+from search.climb import (Climber, adopt_ga_best, family_allows, ensure_far_seat, far_replacement, far_scouts, held_by_climber,
+                          held_by_ga, next_probes, submit_ga)
 from search.repeats import TiedCallsets
 from search.lines import single
 from search.distance import callset_distance, setting_distance
@@ -136,6 +138,29 @@ class DistanceTest(unittest.TestCase):
         self.assertEqual(callset_distance(unpacked(sa), unpacked(sb)), 0.0)
         self.assertEqual(callset_distance(unpacked(sa), unpacked(sc)), 1.0)
 
+    def test_a_config_looked_up_before_its_run_gets_callset_distance_once_the_run_is_back(self):
+        """A GA child is compared with the climbers before it is sent; that early miss must not stick."""
+        from common.types import FULL
+        from search.distance import Distance
+        space = Space(ranges())
+        a = space._assemble({})
+        b = space._assemble({"min_pruning": space.specs["min_pruning"].max})
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.vcf.gz")
+            vcf(path, [(100 + i, "A", "G", "0/1") for i in range(50)])
+            sk = callset_sketch(path)
+
+        class _CallSet:
+            sketch = sk
+
+        class _Client:
+            callsets = {(a.key, FULL): _CallSet()}
+
+        dist = Distance(_Client(), space)
+        self.assertEqual(dist.between(a, b)[1], "settings")         # b has not run yet
+        _Client.callsets[(b.key, FULL)] = _CallSet()                  # its run comes back with a sketch
+        self.assertEqual(dist.between(a, b), (0.0, "callset"))
+
     def test_setting_distance(self):
         space = Space(ranges())
         d = space._assemble({})
@@ -149,12 +174,105 @@ def unpacked(sk):
     return {"k": sk["k"], "h": {c: _unpack(v) for c, v in sk["h"].items()}}
 
 
+def off_rim(ctx, params):
+    """The reserved edge family: four named settings outside the published API box."""
+    out = dict(params)
+    out["min_pruning"] = 1
+    out["active_probability_threshold"] = 0.0001
+    out["max_num_haplotypes_in_population"] = 256
+    out["standard_min_confidence_threshold_for_calling"] = 20.0
+    out["dont_use_soft_clipped_bases"] = True
+    return out
+
+
+def same_rim_unused(ctx, params):
+    """Four settings away on axes that stay inside the published API box."""
+    out = dict(params)
+    for name in ("max_alternate_alleles", "min_mapping_quality_score",
+                 "heterozygosity", "indel_heterozygosity"):
+        v = ctx.ladders.shift(name, out[name], 4) or ctx.ladders.shift(name, out[name], -4)
+        if v is not None:
+            out[name] = v
+    return out
+
+
+def same_pcr_assembly(ctx, params):
+    """Three rim axes moved, same PCR: still this table."""
+    out = dict(params)
+    for name in ("pair_hmm_gap_continuation_penalty", "min_assembly_region_size", "max_assembly_region_size"):
+        v = ctx.ladders.shift(name, out[name], 4) or ctx.ladders.shift(name, out[name], -4)
+        if v is not None:
+            out[name] = v
+    return out
+
+
 class CandidatesTest(unittest.TestCase):
     def test_pareto_layers_take_the_front_first(self):
         c = Config("gatk", {})
         pts = [Point(c, 90, 0.95, 400), Point(c, 91, 0.94, 100), Point(c, 80, 0.90, 300), Point(c, 85, 0.96, 900)]
         front = pareto_layers(pts, 3)
         self.assertEqual(sorted(p.score for p in front), [85, 90, 91])      # 80 is dominated by 91
+
+    def test_left_the_rim_is_the_edge_family_not_a_pcr_flip_on_this_shelf(self):
+        space = Space(ranges())
+        ladders = Ladders(space)
+
+        class _Ctx:
+            pass
+
+        ctx = _Ctx()
+        ctx.ladders = ladders
+        shelf = space._assemble({"pcr_indel_model": "AGGRESSIVE", "pair_hmm_gap_continuation_penalty": 26,
+                                 "max_assembly_region_size": 610, "assembly_region_padding": 5})
+        pcr_only = space._assemble({**shelf.params, "pcr_indel_model": "CONSERVATIVE"})
+        family = space._assemble(off_rim(ctx, shelf.params))
+        unused = space._assemble(same_rim_unused(ctx, shelf.params))
+        self.assertFalse(in_indel_family(shelf))
+        self.assertFalse(in_indel_family(pcr_only))
+        self.assertTrue(in_indel_family(family))
+        self.assertTrue(left_the_rim(family, shelf))
+        self.assertFalse(left_the_rim(pcr_only, shelf))
+        self.assertFalse(left_the_rim(unused, shelf))
+        self.assertFalse(left_the_rim(shelf, shelf))
+
+    def test_edge_family_seeds_sit_outside_the_published_api_box(self):
+        space = Space(ranges())
+        self.assertFalse(in_indel_family(space._assemble(dict(OFFICIAL_SEED))))
+        self.assertFalse(in_indel_family(space._assemble(dict(REFERENCE_PEAK))))
+        for p in INDEL_FAMILY_SEEDS:
+            c = space._assemble(dict(p))
+            self.assertIsNotNone(c)
+            self.assertTrue(in_indel_family(c))
+
+    def test_edge_family_seeds_are_skipped_on_the_round_they_come_from(self):
+        from search.candidates import REFERENCE_ROUND
+        space = Space(ranges())
+
+        def seeds_for(tag):
+            class _Ctx:
+                pass
+
+            ctx = _Ctx()
+            ctx.space, ctx.cap, ctx.profile = space, 0, None
+            ctx.say = lambda *a: None
+            ctx.client = type("Client", (), {"round": type("Rnd", (), {"tag": tag})()})()
+            return {c.key for c in StepA(ctx).seeds()}
+
+        family = {space._assemble(dict(p)).key for p in INDEL_FAMILY_SEEDS}
+        self.assertTrue(family & seeds_for("20261012T115400Z"))
+        self.assertFalse(family & seeds_for(REFERENCE_ROUND))
+
+    def test_two_workers_open_the_indel_family_beside_the_best(self):
+        class _Ctx:
+            pass
+
+        ctx = _Ctx()
+        ctx.cap = 16
+        self.assertEqual(n_seats(ctx), 2)
+        ctx.cap = 1
+        self.assertEqual(n_seats(ctx), 1)
+        ctx.cap = 500
+        self.assertEqual(n_seats(ctx), 2)
 
 
 class ClimbTest(unittest.TestCase):
@@ -278,12 +396,11 @@ class ClimbTest(unittest.TestCase):
         self.assertTrue(moved)
         self.assertLessEqual(len(moved), 5)
 
-    def test_a_live_grid_keeps_the_centre_when_a_higher_score_arrives(self):
+    def _step_c_with_higher_best(self):
         ctx, cl = self.climber()
         cl.origin = "step C"
         cl.batch_live = True
         cl.pending = [cl.centre]
-        start = cl.centre.key
         higher = self.space._assemble({"min_pruning": 9, "assembly_region_padding": 90})
         ctx.best = lambda: (higher, cl.score + 5)
         ctx.client = type("C", (), {"idle_slots": staticmethod(lambda: 0)})()
@@ -297,7 +414,18 @@ class ClimbTest(unittest.TestCase):
             return ticks["n"] > 4
 
         ctx.over = over
+        return ctx, cl, called
+
+    def test_a_live_step_c_wave_gives_way_to_a_higher_round_best_at_once(self):
+        ctx, cl, called = self._step_c_with_higher_best()
         asyncio.run(cl.run_filled(1e9, None, False))
+        self.assertTrue(called)                             # move at once (2026-10-16): no waiting for the wave
+
+    def test_without_move_at_once_a_live_grid_keeps_the_centre(self):
+        ctx, cl, called = self._step_c_with_higher_best()
+        start = cl.centre.key
+        with unittest.mock.patch.dict(TUNING.values, {"climb.move_at_once": 0}):
+            asyncio.run(cl.run_filled(1e9, None, False))
         self.assertEqual(called, [])
         self.assertEqual(cl.centre.key, start)
 
@@ -422,6 +550,45 @@ class ClimbTest(unittest.TestCase):
         self.assertEqual(won(short, 2, 1), (1, 2))
         self.assertEqual(won(short, 2, 2), (1, 3))
         self.assertEqual(won(short, 2, 3), (1, 4))
+
+    def test_a_far_seat_leaves_its_box_only_for_a_score_above_the_other_seats(self):
+        """044200Z islands, 2026-10-16: island 1's far seat found 82.5627 with min_pruning 2 (inside the API box)
+        while the other seat was at 82.4066; the lock kept it on 82.3514."""
+        ctx = FakeCtx(self.space, self.peak)
+        inside = self.space._assemble({"min_pruning": 1, "assembly_region_padding": 50})
+        outside = self.space._assemble({"min_pruning": 2, "assembly_region_padding": 50})
+        self.assertTrue(in_indel_family(inside))
+        self.assertFalse(in_indel_family(outside))
+        far_seat = Climber(ctx, 1, inside, 82.3514, origin="far")
+        other = Climber(ctx, 0, self.space._assemble({"min_pruning": 6, "assembly_region_padding": 300}), 82.60)
+        ctx.climbers = [other, far_seat]
+        far_seat.move(outside, 82.5627, "grid")                      # below the other seat: it keeps its box
+        self.assertEqual(far_seat.centre.key, inside.key)
+        self.assertFalse(getattr(far_seat, "released", False))
+        other.score = other.found = 82.4066
+        far_seat.move(outside, 82.5627, "grid")                      # above every other seat: the lock is released
+        self.assertEqual(far_seat.centre.key, outside.key)
+        self.assertTrue(far_seat.released)
+        self.assertTrue(family_allows(far_seat, self.space._assemble({"min_pruning": 3})))
+
+    def test_a_ga_best_on_another_climbers_hill_becomes_that_climbers_centre(self):
+        """044200Z islands, 2026-10-16: 82.5737 sat on climber 101's hill and "stayed there" while it climbed 82.35."""
+        ctx, low = self.climber()
+        high_start = self.space._assemble({"min_pruning": 6, "assembly_region_padding": 55})
+        high = Climber(ctx, 1, high_start, 90.0)
+        near = dict(high_start.params)
+        near["min_pruning"] = ctx.ladders.shift("min_pruning", near["min_pruning"], 1)
+        near["assembly_region_padding"] = ctx.ladders.shift("assembly_region_padding", near["assembly_region_padding"], 2)
+        ga = self.space._assemble(near)                              # two settings from high's centre: its hill
+        ctx.climbers = [low, high]
+        ctx.ga_keys = {ga.key}
+        ctx.best = lambda: (ga, 100.0)
+        low.score = low.found = 10.0
+        high.score = high.found = 90.0
+        self.assertTrue(adopt_ga_best(ctx, [low, high]))
+        self.assertEqual(high.centre.key, ga.key)
+        self.assertEqual(high.score, 100.0)
+        self.assertEqual(low.centre.key, low.start.key)
 
     def test_the_lowest_climber_takes_a_ga_best(self):
         ctx, low = self.climber()
@@ -617,8 +784,9 @@ class ClimbTest(unittest.TestCase):
         ctx.ga_keys = {near.key}
         ctx.best = lambda: (near, 100.0)
         low.score, high.score = 10.0, 90.0
-        self.assertFalse(adopt_ga_best(ctx, [low, high]))
-        self.assertEqual(low.centre.key, low.start.key)
+        self.assertTrue(adopt_ga_best(ctx, [low, high]))             # the hill's own climber takes it
+        self.assertEqual(low.centre.key, low.start.key)              # the low climber is not sent there
+        self.assertEqual(high.centre.key, near.key)
         low.pending = [near]
         low._submit_head()
         self.assertEqual(ctx.sent, [])
@@ -674,6 +842,77 @@ class ClimbTest(unittest.TestCase):
         self.assertEqual(far.centre.key, ga.key)
         self.assertEqual(high.centre.key, high.start.key)
 
+    def test_a_far_family_seat_does_not_take_this_shelf_ga(self):
+        ctx, high = self.climber()
+        high.id = 0
+        high.centre = high.start = self.space._assemble({
+            "pcr_indel_model": "AGGRESSIVE", "pair_hmm_gap_continuation_penalty": 30,
+            "max_assembly_region_size": 102, "assembly_region_padding": 15, "min_pruning": 2,
+            "max_num_haplotypes_in_population": 91, "active_probability_threshold": 0.022})
+        high.score = high.found = 82.0
+        family = self.space._assemble(off_rim(ctx, high.centre.params))
+        self.assertTrue(in_indel_family(family))
+        self.assertFalse(in_indel_family(high.centre))
+        far = Climber(ctx, 1, family, 80.0, origin="far")
+        ga_params = dict(high.centre.params)
+        for name in ("min_pruning", "min_base_quality_score", "min_mapping_quality_score",
+                     "max_num_haplotypes_in_population", "active_probability_threshold"):
+            v = ctx.ladders.shift(name, ga_params[name], 4) or ctx.ladders.shift(name, ga_params[name], -4)
+            if v is not None:
+                ga_params[name] = v
+        ga = self.space._assemble(ga_params)
+        self.assertIsNotNone(ga)
+        self.assertFalse(in_indel_family(ga))
+        self.assertGreaterEqual(sum(ga.params.get(n) != high.centre.params.get(n) for n in ctx.space.names), 4)
+        ctx.climbers = [high, far]
+        ctx.ga_keys = {ga.key}
+        ctx.best = lambda: (ga, 81.9)
+        self.assertFalse(adopt_ga_best(ctx, [high, far]))
+        self.assertEqual(far.centre.key, family.key)
+        self.assertEqual(high.centre.key, high.start.key)
+        step_c = Climber(ctx, 2, family, 80.0, origin="step C")
+        ctx.best = lambda: (ga, 81.9)
+        self.assertFalse(step_c.follow_best())
+        self.assertEqual(step_c.centre.key, family.key)
+
+        space = self.space
+
+        class _Dist:
+            def between(self, a, b):
+                return setting_distance(space, a, b), "settings"
+
+            def far(self, a, b, min_callset, min_settings):
+                return setting_distance(space, a, b) >= min_settings
+
+        alt = self.space._assemble({**family.params, "pair_hmm_gap_continuation_penalty": 12,
+                                    "max_assembly_region_size": 300})
+        self.assertTrue(in_indel_family(alt))
+        ctx.dist = _Dist()
+        ctx.scored = lambda: [(high.start, 82.0), (ga, 81.9), (alt, 80.1)]
+        ctx.best = lambda: (high.start, 82.0)
+        far.start = ga
+        far.centre = ga
+        far.score = far.found = 81.9
+        high.centre = ga
+        high.score = high.found = 81.9
+        released = Climber(ctx, 3, high.start, 82.0)
+        released.released = True
+        ctx.climbers = [high, far, released]
+        self.assertFalse(ensure_far_seat(ctx, [high, far]))          # a released far seat: the box had its seat
+        ctx.climbers = [high, far]
+        self.assertTrue(ensure_far_seat(ctx, [high, far]))
+        self.assertTrue(in_indel_family(far.centre))
+        self.assertFalse(in_indel_family(high.centre))
+
+    def test_step_c_climbs_the_edge_family_only_when_it_is_within_reach(self):
+        from search.climb import FAMILY_REACH, family_in_reach
+        ctx, cl = self.climber()
+        family = self.space._assemble({"min_pruning": 1, "assembly_region_padding": 50})
+        self.assertTrue(in_indel_family(family))
+        ctx.climbers = [Climber(ctx, 5, family, 82.40)]
+        self.assertIsNone(family_in_reach(ctx, 82.65))                # 0.25 below the best: not worth the fine-tune
+        self.assertEqual(family_in_reach(ctx, 82.40 + FAMILY_REACH / 2)[0].key, family.key)
+
     def test_the_parents_skip_a_higher_score_that_is_close(self):
         ctx, cl = self.climber()
         centre = cl.centre
@@ -728,13 +967,12 @@ class ClimbTest(unittest.TestCase):
         ctx.cap = 500
         centre = cl.centre
         near = self.space._assemble({**centre.params, "min_pruning": centre.params["min_pruning"] + 1})
-        moved = dict(centre.params)
-        for name in ("min_pruning", "min_dangling_branch_length", "assembly_region_padding",
-                     "heterozygosity", "active_probability_threshold", "min_base_quality_score"):
-            moved[name] = ctx.ladders.shift(name, centre.params[name], 4) or ctx.ladders.shift(name, centre.params[name], -4)
-        far_cfg = self.space._assemble(moved)
+        unused = self.space._assemble(same_rim_unused(ctx, centre.params))
+        assembly = self.space._assemble(same_pcr_assembly(ctx, centre.params))
+        far_cfg = self.space._assemble(off_rim(ctx, centre.params))
         step = StepA(ctx)
         step.pool = lambda: [Point(centre, 50.0, 0.9, 10.0), Point(near, 49.95, 0.9, 11.0),
+                             Point(assembly, 49.8, 0.88, 9.0), Point(unused, 49.7, 0.85, 8.0),
                              Point(far_cfg, 49.5, 0.7, 5.0)]
         space = self.space
 
@@ -999,12 +1237,10 @@ class ClimbTest(unittest.TestCase):
         ctx.climbers = [cl]
         ctx.best = lambda: (centre, 50.0)
         near = self.space._assemble({**centre.params, "min_pruning": centre.params["min_pruning"] + 1})
-        moved = dict(centre.params)
-        for name in ("min_pruning", "min_dangling_branch_length", "assembly_region_padding",
-                     "heterozygosity", "active_probability_threshold", "min_base_quality_score"):
-            moved[name] = ctx.ladders.shift(name, centre.params[name], 4) or ctx.ladders.shift(name, centre.params[name], -4)
-        far_cfg = self.space._assemble(moved)
-        low = self.space._assemble({**moved, "max_alternate_alleles": 12})
+        unused = self.space._assemble(same_rim_unused(ctx, centre.params))
+        assembly = self.space._assemble(same_pcr_assembly(ctx, centre.params))
+        far_cfg = self.space._assemble(off_rim(ctx, centre.params))
+        low = self.space._assemble({**far_cfg.params, "max_alternate_alleles": 12})
 
         space = self.space
 
@@ -1017,12 +1253,14 @@ class ClimbTest(unittest.TestCase):
 
         ctx.dist = _Dist()
         self.assertIsNotNone(far_cfg)
-        ctx.scored = lambda: [(centre, 50.0), (near, 49.9), (far_cfg, 49.4), (low, 40.0)]
+        self.assertIsNotNone(unused)
+        ctx.scored = lambda: [(centre, 50.0), (near, 49.9), (assembly, 49.7), (unused, 49.6),
+                              (far_cfg, 49.4), (low, 40.0)]
         got = far_replacement(ctx)
         self.assertIsNotNone(got)
         self.assertEqual(got[0].key, far_cfg.key)
         self.assertEqual(got[2], "far (scored)")
-        ctx.scored = lambda: [(centre, 50.0), (near, 49.9)]
+        ctx.scored = lambda: [(centre, 50.0), (near, 49.9), (assembly, 49.7), (unused, 49.6)]
         self.assertIsNone(far_replacement(ctx))
         scouts = far_scouts(ctx, 2)
         self.assertEqual(len(scouts), 2)
@@ -1031,6 +1269,7 @@ class ClimbTest(unittest.TestCase):
         for c in scouts:
             self.assertGreaterEqual(setting_distance(self.space, c, centre), ms)
             self.assertGreater(sum(c.params.get(n) != centre.params.get(n) for n in ctx.space.names), 2)
+            self.assertTrue(left_the_rim(c, centre))
 
     def test_a_small_loss_steps_past_the_rung_and_a_loss_of_0_10_closes_the_side(self):
         ctx, cl = self.climber()
@@ -1178,6 +1417,154 @@ class ClimbTest(unittest.TestCase):
         self.assertTrue(getattr(step, "_bound_pool", True))
         self.assertTrue(any(not step._inside(c) for c in sent))
 
+    def test_generation_1_breeds_when_the_peak_interval_has_one_parent(self):
+        """A one-parent interval used to skip generation 1 and seat only that box. The seats then miss later hills."""
+        from common.types import FULL
+        ctx, cl = self.climber()
+        centre = cl.centre
+        moved = dict(centre.params)
+        for name in ("min_pruning", "min_dangling_branch_length", "assembly_region_padding",
+                     "heterozygosity", "active_probability_threshold", "min_base_quality_score"):
+            moved[name] = ctx.ladders.shift(name, centre.params[name], 4) or ctx.ladders.shift(name, centre.params[name], -4)
+        far_cfg = self.space._assemble(moved)
+        self.assertGreaterEqual(setting_distance(self.space, centre, far_cfg), 0.05)
+        step = StepA(ctx)
+        step._range = {n: [centre.params.get(n)] for n in ctx.space.names if ctx.ladders.movable(n)}
+        self.assertFalse(step._inside(far_cfg))
+
+        class _Row:
+            def __init__(self, score, core, fp):
+                self.score, self.core, self.region_fp, self.gate_passed = score, core, fp, True
+
+        class _Client:
+            latest = {(centre.key, FULL): _Row(50.0, 0.9, 10), (far_cfg.key, FULL): _Row(49.0, 0.8, 20)}
+            configs = {centre.key: centre, far_cfg.key: far_cfg}
+
+        class _Dist:
+            def between(self, a, b):
+                return setting_distance(self_space, a, b), "settings"
+
+            def far(self, a, b, min_callset, min_settings):
+                return setting_distance(self_space, a, b) >= min_settings
+
+        self_space = self.space
+        ctx.client = _Client()
+        ctx.dist = _Dist()
+        ctx.step_a = step
+        ctx.best = lambda: (centre, 50.0)
+        self.assertEqual(len(step.pool()), 1)
+        self.assertEqual(asyncio.run(step.breed(1, 8)), [])
+        asyncio.run(step._open_pool_if_thin())
+        self.assertFalse(getattr(step, "_bound_pool", True))
+        self.assertEqual(len(step.pool()), 2)
+        children = asyncio.run(step.breed(1, 8))
+        self.assertTrue(children)
+        self.assertTrue(any(not step._inside(c) for c in children))
+
+    def test_the_peak_interval_is_measured_but_does_not_limit_the_parents(self):
+        """044200Z, 2026-10-16: breeding inside the interval froze 15 of 19 settings and sent 32 children."""
+        from common.types import FULL
+        ctx, cl = self.climber()
+        centre = cl.centre
+        moved = dict(centre.params)
+        for name in ("min_pruning", "min_dangling_branch_length", "assembly_region_padding",
+                     "heterozygosity", "active_probability_threshold", "min_base_quality_score"):
+            moved[name] = ctx.ladders.shift(name, centre.params[name], 4) or ctx.ladders.shift(name, centre.params[name], -4)
+        far_cfg = self.space._assemble(moved)
+
+        class _Row:
+            def __init__(self, score, core, fp):
+                self.score, self.core, self.region_fp, self.gate_passed = score, core, fp, True
+
+        class _Client:
+            latest = {(centre.key, FULL): _Row(50.0, 0.9, 10), (far_cfg.key, FULL): _Row(45.0, 0.8, 20)}
+            configs = {centre.key: centre, far_cfg.key: far_cfg}
+
+        ctx.client = _Client()
+        ctx.scored = lambda: iter([(centre, 50.0), (far_cfg, 45.0)])
+        step = StepA(ctx)
+        step._select_range()
+        self.assertTrue(step._range)
+        self.assertFalse(step._inside(far_cfg))
+        self.assertIn(far_cfg.key, [p.config.key for p in step.pool()])
+
+    def test_one_rung_neighbors_change_a_single_setting(self):
+        from search.climb import one_rung_neighbors
+        ctx, cl = self.climber()
+        neighbors = one_rung_neighbors(ctx, cl.centre)
+        self.assertGreater(len(neighbors), 10)
+        for config in neighbors:
+            diffs = [n for n in self.space.names if config.params.get(n) != cl.centre.params.get(n)]
+            self.assertEqual(len(diffs), 1)
+
+    def test_a_centre_with_all_neighbors_scored_flat_is_a_one_rung_local_optimum(self):
+        from search.climb import is_one_rung_local_opt
+        ctx = FakeCtx(self.space, lambda c: 50.0)
+        centre = self.space._assemble({"min_pruning": 7, "assembly_region_padding": 60})
+        self.assertTrue(is_one_rung_local_opt(ctx, centre, 50.0))
+
+    def test_an_improving_one_rung_neighbor_is_not_a_local_optimum(self):
+        from search.climb import is_one_rung_local_opt, one_rung_neighbors
+        centre = self.space._assemble({"min_pruning": 2, "assembly_region_padding": 50})
+        neighbors = one_rung_neighbors(FakeCtx(self.space, lambda c: 0.0), centre)
+        better = neighbors[0]
+
+        def f(config):
+            return 50.1 if config.key == better.key else 50.0
+
+        ctx = FakeCtx(self.space, f)
+        self.assertFalse(is_one_rung_local_opt(ctx, centre, 50.0))
+
+    def test_stall_declares_a_one_rung_local_optimum_when_every_neighbor_is_scored(self):
+        from search.climb import Climber
+        ctx = FakeCtx(self.space, lambda c: 50.0)
+        start = self.space._assemble({"min_pruning": 7, "assembly_region_padding": 60})
+        cl = Climber(ctx, 0, start, 50.0)
+        asyncio.run(cl.jumps(1e9))
+        self.assertEqual(cl.state, "peak")
+
+    def test_certify_round_logs_a_local_optimum_when_the_best_is_already_certified(self):
+        from search.local_opt import certify_round
+        centre = self.space._assemble({"min_pruning": 7, "assembly_region_padding": 60})
+        ctx = FakeCtx(self.space, lambda c: 50.0)
+        ctx.best = lambda: (centre, 50.0)
+        ctx.pick_at = lambda: 1e9
+        ctx.climbers = []
+        asyncio.run(certify_round(ctx))
+        self.assertEqual(ctx.best()[0].key, centre.key)
+
+    def test_certify_round_ends_when_a_neighbor_can_never_be_scored(self):
+        """A crashed neighbor is settled, not untried: the old loop made a climber per pass until the pick."""
+        from search.climb import one_rung_neighbors
+        from search.local_opt import certify_round
+        centre = self.space._assemble({"min_pruning": 7, "assembly_region_padding": 60})
+        crashed = one_rung_neighbors(FakeCtx(self.space, lambda c: 0.0), centre)[0]
+        ctx = FakeCtx(self.space, lambda c: None if c.key == crashed.key else 50.0)
+        ctx.fresh = lambda c: c is not None and c.key != crashed.key
+        ctx.best = lambda: (centre, 50.0)
+        ctx.pick_at = lambda: 1e4
+        ticks = itertools.count()
+        ctx.clock = lambda: float(next(ticks))
+        said = []
+        ctx.say = lambda fmt, *a: said.append(fmt % a)
+        asyncio.run(certify_round(ctx))
+        self.assertLessEqual(len(ctx.climbers), 1)
+        self.assertTrue(any("have no score" in s for s in said), said)
+
+    def test_certify_round_moves_to_a_scored_higher_neighbor(self):
+        from search.climb import one_rung_neighbors
+        from search.local_opt import certify_round
+        centre = self.space._assemble({"min_pruning": 7, "assembly_region_padding": 60})
+        better = one_rung_neighbors(FakeCtx(self.space, lambda c: 0.0), centre)[0]
+        ctx = FakeCtx(self.space, lambda c: 50.1 if c.key == better.key else 50.0)
+        ctx.best = lambda: (centre, 50.0)
+        ctx.pick_at = lambda: 1e9
+        said = []
+        ctx.say = lambda fmt, *a: said.append(fmt % a)
+        asyncio.run(certify_round(ctx))
+        self.assertTrue(any("becomes the centre" in s for s in said), said)
+        self.assertIn(better.key[:8], said[-1])
+
 
 class StepCTest(unittest.TestCase):
     def setUp(self):
@@ -1270,9 +1657,26 @@ class VirtualRoundTest(unittest.TestCase):
         self.assertTrue(first["best_key"] and first["first_key"])
         self.assertGreaterEqual(round(out.best.score, 4), first["best"])
         labels = [w["label"] for w in eng["waves"]]
-        self.assertNotIn("generation 1", labels)
+        self.assertIn("generation 1", labels)               # Step A breeds one generation (search/DESIGN.md, A3)
         self.assertNotIn("generation 2", labels)
         self.assertNotIn("generation 3", labels)
+
+    def test_step_b_keeps_the_fleet_until_the_fine_tune(self):
+        """044200Z, 2026-10-16: the one seat peaked at t+29.6m and Step B returned with half the round left."""
+        r = ranges()
+        runner = FakeRunner(r, seed=0, batching=True, hills=1)
+        ex = SimExecutor(runner, 300, duration=lambda job: 150.0)
+        searcher = engine.searcher(r, 300)
+        seen = []
+
+        async def wrapped(client):
+            seen.append(client)
+            await searcher(client)
+
+        run_round(ROUND, Stub(), ex, FakeScorer(runner), wrapped, DryRunSubmitter(), r,
+                  LoopSettings(stop_before_deadline_s=60), baselines=[r.defaults("gatk")], deadline_ts=72 * 60)
+        schedule = seen[0].notes["engine"]["schedule"]
+        self.assertGreaterEqual(schedule["b_done_s"], schedule["b_end_s"] - 150.0)
 
 
 class PileTest(unittest.TestCase):

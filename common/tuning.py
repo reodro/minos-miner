@@ -88,14 +88,19 @@ def fmt(x: float) -> str:
 GROUPS = {
     "candidates": "Step A: candidates (wave 0, the genetic generations, the pick)",
     "climb": "Step B: each candidate's grid climb",
+    "islands": "Islands: independent searches sharing one fleet",
+    "dups": "Duplicate callsets: predicted repeats are parked, audited and released",
     "far": "Step C: what Step B's grid did not look at, and the pick",
-    "excess": "Step B: lanes that climb on core above the run's core-vs-FP curve, then on the score",
     "evaluator": "Evaluator: batches and routing on the fleet",
     "main": "Main: submissions",
     "answer_set": "Answer set: the targets the local score divides by",
 }
 
 KNOBS_LIST: List[Knob] = [
+    Knob("candidates.generalist_share", 0.0, 0.0, 1.0, ROUND, "share",
+         "Share of wave 0 seeded with the cross-round seed portfolio ($DATA_DIR/portfolio/generalists.json, from "
+         "test/bench/portfolio_eval.py), before the portfolio. 0 (default since 2026-10-17): none - on six unseen rounds "
+         "it was only +0.04 per config better than our existing seeds, and on 20261016T130600Z its best was -1.15."),
     Knob("candidates.portfolio_share", 0.4, 0.0, 1.0, ROUND, "share",
          "Share of wave 0 taken by portfolio seeds (the round's read-length profile first, never the round being "
          "replayed); the rest is a hypercube."),
@@ -131,18 +136,54 @@ KNOBS_LIST: List[Knob] = [
          "Settings in each grid (every combination at -d, 0, +d: 3^n points)."),
     Knob("climb.accept_min", 0.005, 0.0, 0.1, LIVE, "score",
          "An iteration gaining less than this has failed; both grid kinds failing in a row is a stall."),
-    Knob("climb.plateau_interval", 1, 0, 1, LIVE, "flag",
-         "1: on an exact score tie, the plateau probe centres on the tied config nearest the per-setting intervals "
-         "and sends the rung toward each interval first (search/plateau.py). It never accepts a move."),
-    Knob("climb.tie_walk", 4, 0, 10, LIVE, "rungs",
-         "A grid that gains nothing walks each one-setting line that tied the centre exactly, every untried rung out "
-         "to this many rungs, in one more wave (lines toward search/plateau.py's interval first). 0: off (v9.18.2)."),
     Knob("climb.random_jumps", 20, 0, 500, LIVE, "count",
          "At a stall: random local jumps (2-4 settings, 2-5 rungs each); one that gains climb.accept_min resumes the grid."),
+    Knob("climb.leap_share", 0.25, 0.0, 1.0, LIVE, "share",
+         "Starting share of each climber's workers that send centre jumps with every grid (one read-pass or assembly "
+         "setting moved 2+ rungs, chosen by a bandit). It doubles after three waves with a jump win and halves after "
+         "two without (0.1-0.5). Before a peak: one jump per distance class and direction, then two-setting jumps. "
+         "0: none."),
+    Knob("climb.own_hill_adopt", 1, 0, 1, LIVE, "count",
+         "1: a higher GA config on a climber's own hill becomes that climber's centre. 0: it is left there (before "
+         "2026-10-16). For a fleet A/B: it made the fastest early climb, and maybe a lower final peak."),
+    Knob("dups.enabled", 1, 0, 1, LIVE, "count",
+         "1: a config predicted to repeat a callset already sent is parked, audited, and sent the moment the "
+         "prediction breaks or its twin scores near the best (search/duplicates.py). 0: every config is sent."),
+    Knob("dups.min_ties", 5, 1, 100, LIVE, "count",
+         "Ties (and no different score) before a one-setting change is predicted to repeat a callset. 3 lost two "
+         "better configs in the v4 replay; 5 lost none."),
+    Knob("dups.audit", 0.1, 0.0, 1.0, LIVE, "share",
+         "Share of predicted repeats sent anyway, so a wrong rule breaks and releases what it parked."),
+    Knob("dups.near", 0.2, 0.0, 5.0, LIVE, "score",
+         "A predicted repeat whose twin scores within this of the island's best is sent anyway: only those could "
+         "move the round's best."),
+    Knob("climb.tradeoff_sweep", 0, 0, 1, LIVE, "count",
+         "1: the round's newest best (Step B and C) gets one batch of cheap riders over the genotyping and PairHMM "
+         "settings (search/engine.py Context.send_sweep), at most once a minute. 0: off."),
+    Knob("climb.model_filter", 1, 1, 10, LIVE, "count",
+         "k > 1: the GA breeds k times as many children and sends the 1/k a per-class score model of the round ranks "
+         "highest (search/model_filter.py). 1: every child is sent (before 2026-10-17)."),
+    Knob("climb.stall_waves", 2, 0, 20, LIVE, "count",
+         "Finished grids in a row, each below climb.accept_min, after which a climber certifies its peak (every "
+         "untried one-rung neighbour and its centre jumps in one wave). 0: only when every group is flat (before "
+         "2026-10-16)."),
+    Knob("climb.head_reserve", 24, 0, 200, LIVE, "count",
+         "Workers the GA leaves free for a climber's next heads once its wave is half back (at most this many per "
+         "climber). 0: the GA fills every free worker."),
+    Knob("islands.workers", 324, 50, 100000, ROUND, "count",
+         "One independent search per this many workers (810: two islands of 405). Below twice this, one search."),
+    Knob("islands.min_settings", 8, 0, 30, LIVE, "count",
+         "A Step A seat that differs in fewer settings than this from another island's seat is passed over "
+         "while the island has another."),
     Knob("climb.wait_riders", 0, 0, 1, LIVE, "count",
          "1: a wave decides once its riders are back too. 0: once its grid points are back; riders that come back "
          "later count at the next decision."),
-    Knob("climb.quorum", 1.0, 0.5, 1.0, LIVE, "share", "A wave counts as back at this share."),
+    Knob("climb.quorum", 0.8, 0.5, 1.0, LIVE, "share",
+         "A wave counts as back at this share: the slowest fifth no longer holds the next wave (their scores still "
+         "count when they return). 1.0 before 2026-10-16."),
+    Knob("climb.move_at_once", 1, 0, 1, LIVE, "count",
+         "1: a run that beats the centre by climb.accept_min moves it at once (the wave closes early; no cube on the "
+         "old centre once a compass point clears the bar). 0: the climber moves only when its whole wave is back."),
     Knob("climb.end_min", 55.0, 10.0, 72.0, LIVE, "min",
          "No longer the cut. Step B runs until the fine-tune, eight scaled minutes before the pick. "
          "Kept so an older override still loads."),
@@ -158,20 +199,6 @@ KNOBS_LIST: List[Knob] = [
          "Step C: a second high point on a setting's profile within this of the peak is refined and climbed."),
     Knob("far.landings", 3, 0, 20, LIVE, "count", "Step C: second high points per peak that get a short climb."),
     Knob("far.landing_iterations", 2, 1, 10, LIVE, "count", "Step C: grids in a short climb."),
-    Knob("excess.lanes", 0, 0, 4, LIVE, "count",
-         "Step B climbers that climb on core above the run's core-vs-FP curve, then on the score (search/excess.py). "
-         "0 (default): off, the engine is v9.18.1."),
-    Knob("excess.start_far", 0.2, 0.0, 1.0, LIVE, "distance",
-         "An excess lane starts at least this far in settings from the best config and from the other lanes."),
-    Knob("excess.band_low", 0.95, 0.5, 1.0, LIVE, "x FP",
-         "Excess measure: a config below this x the best score's FP is compared with the curve at this FP."),
-    Knob("excess.band_high", 1.05, 1.0, 2.0, LIVE, "x FP",
-         "Excess measure: a config above this x the best score's FP is compared with the curve here, minus the score's "
-         "own price of the extra FP (x over_scale)."),
-    Knob("excess.over_scale", 1.0, 0.0, 10.0, LIVE, "x",
-         "Excess measure: multiplies the score's own price of FP above band_high (1 = exactly the score's exchange rate)."),
-    Knob("excess.convert", 1, 0, 1, LIVE, "flag",
-         "1: an excess lane climbs on the score from its J peak; 0: it stops at the J peak."),
     Knob("far.pick_s", 90.0, 10.0, 600.0, LIVE, "s",
          "The highest-scoring config is named this many seconds before the search ends (not scaled)."),
     Knob("evaluator.small_batch", 1.3, 1.0, 3.0, LIVE, "runs",

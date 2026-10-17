@@ -385,94 +385,129 @@ Built in v9.30. One climber finishes a compass on the highest score. The other c
 
 **How to tell it worked.** Three rounds, TRUE, rank, and the gap to first. On each round the log shows a finished compass and, when two faces won, a finished cube. The hill lane reports its best far fingerprint even when the valley drops it. A climb that gains under 0.10 while the hill lane never produced a fingerprint 0.10 away is a failed opening, and that is the number that matters.
 
+## Islands and centre jumps (2026-10-16, every tag)
+
+**Why.** 044200Z, four clean replays: each run settles on one region in its first 15-20 minutes and every climber
+ends there (810 workers: three climbers at 82.632-82.633; 1056: four at 82.638). The two 324-worker runs found a region
+that reaches 82.6953. More workers only got a run to the top of its region sooner: the 810 run made no gain in its last
+28 minutes (17,531 runs). The regions are 11-17 settings apart but only 0.030-0.045 apart in callsets, under the 0.05
+that separates seats, so the engine saw one hill. Near the top, a move of one to three settings beat the best 1.5% of
+the time and a GA child seven or more settings away 0.02%, yet 90% of the near-top runs went to moves of four or more.
+
+**Islands** (`search/islands.py`, `islands.workers` 324). One whole search (A, B, C, certify) per 324 workers, each on
+its own view of the client: it sees only the configs it proposed and keeps to its share of the workers. The portfolio
+seeds are dealt by rank, the defaults and official go to island 0, each island has its own random stream, and a Step A
+seat within `islands.min_settings` (8) settings of another island's seat is passed over while another remains. The
+pick is the best island's pick. 324 workers is one search, as before.
+
+**Centre jumps** (`search/leaps.py`, `climb.leap_share` 0.25). With every grid, a climber sends jumps on one
+read-pass or assembly setting, after its heads and packs and before the GA. v2 chooses each jump by Thompson sampling
+over (setting, distance class 2-3, 4-8, 9-21, 22+ rungs) arms whose win rate and gain per win start from this round's
+four runs and learn from every jump's result (shared by an island's climbers). From one-rung peaks at 82.3+, further out
+on mapping quality and haplotypes won 5.6% of runs at 2 rungs and 11-13% at 4-21 (gain per run 17x at 14-21); the
+smooth settings' peaks held (0-14% beaten). Inside a class, half the picks follow expected value (TPE's l/g), half are
+random: expected value alone ranked the 17:06 jump 1416th of 2631. A peak is named only after one jump per (setting,
+class, direction) and then two-setting jumps on the leading arms (stagnation detection). Each climber's share doubles
+after three grid waves with a jump win (at most 0.5) and halves after two without (at least 0.1), as TuRBO's counters.
+v3: an arm is (setting, class, direction): in the first two runs with jumps, mapping quality won 7 times, always going
+down, and max assembly region 4 times, always up. A winning jump is repeated first from the new centre, then at twice
+the size (MADS's last-direction poll); the islands share one set of arms; the rugged 2-3 rung prior is 10%; and the two region sizes are rugged (they gave 7 of
+the 19 winning jumps and over half of the jumps' gain, though the line survey had called them smooth).
+
+**Two climber fixes found on the islands run** (2026-10-16). A higher GA config on another climber's own hill becomes
+that climber's centre; before, "it stays there" left it for good (22 times in that run, 82.5737 against a centre of
+82.3514). And a far seat's edge-family lock is released when the seat finds a config outside the box that scores
+above every other climbing seat of its search; below that, the lock holds and the refusal is logged once per config
+(island 1's far seat sat on 82.3514 for its 82.5627, logged as +0.0000). A wave moves to its best result the seat may
+take. With islands, the round's pick is the highest score among every island's pick and best.
+
+**v4 (2026-10-16, built and unit-tested locally, not yet on the fleet).** From the execution traces of the two island runs:
+
+- Crashes: a crashed or gate-failed run leaves the climber's waiting list; a crashed jump is a loss for its arm and marks
+  a crash edge per (setting, direction), so no jump from a nearby centre goes past it; a head next to an edge goes
+  without riders. The engine counts failed runs by source and logs the top reasons. (All failures were GATK's "Graph
+  must have ref source and sink vertices"; they rose from 1.8% to 3.6-3.9% with jumps, mostly padding jumped down and
+  max region size jumped up, because a crash never reached the arms.)
+- Speed: the GA leaves up to `climb.head_reserve` (24) workers free for a climber's next heads once its wave is half
+  back; the GA opening ends as soon as a free GA score beats the lowest seat; the jump share stays at or under 0.25.
+- Step C: the fine-tune's idle workers take jumps, then two- and three-setting moves of the leading arms, until 150 s
+  before the pick (Step C kept 6-34% of Step B's cores busy). Step C and certify climb the edge family only within 0.05
+  of the best.
+- Peaks: the certificate is one pass (one jump per class and direction, two-setting jumps, and path relinking: the
+  centre plus 2-4 of the differences toward the best configs within 0.10, the other islands' bests included).
+- Seats: an island's best start always stays; no far seat opens in the last 20 scaled minutes of Step B; no seat is
+  refilled into the edge family after a far seat was released; a run from an earlier wave that beats the centre takes
+  it at once, even mid-wave. `climb.own_hill_adopt` switches the same-hill adoption for a fleet A/B.
+- Arms carry from round to round (data_dir/search/jump_arms.json): counts halved each round, at most 20 tries per arm.
+
+v5 (after the v4 fleet run, 82.6994, rank 21: failures 4.9%, mostly GA children; climber 101 took 8 returned runs in a
+row; last gain at t+48.2 but the certificate at t+60.1):
+- Crash guard (`search/crashguard.py`): a depth-5 scikit-learn decision tree on this round's crashed configs against
+  its completed ones (ladder positions), refitted every 150 outcomes once there are 40 crashes. `Context.fresh` does
+  not send a config whose leaf crashes 60% of the time or more, and a climber sends a head at 30% or more without
+  riders. Cancelled, timed-out and lost runs are not crashes.
+- Stall: `climb.stall_waves` (2) finished grids in a row below `climb.accept_min` start the certificate, which scores
+  every untried one-rung neighbour at once.
+- Takes: a wave a take began is not cut short by another take; its late runs wait for it to close.
+- Logs: "it stays there" only when the GA best is above that climber's best; a jump won through a returned run logs
+  "centre jump cN (returned)". The notes and the log carry the head reserve's idle worker-seconds.
+
+Move at once (2026-10-16, after four latest-round runs). A better result sat 35-41 minutes per run in total before its
+climber moved (13 on the slowest round): about half waiting for the rest of its own wave (a wave is as slow as its
+slowest run; the slowest node took 220-298 s per run), a third for a cube on the old centre. Gain per climber wave was
+0.013-0.017 on every round, so the weak rounds lost on the number of waves (22-36 against 47).
+- `Climber.early_gain`: a run of the live wave that beats the centre by `climb.accept_min` closes the wave at once
+  (close_wave moves there). Its other runs stay owed and are taken when they beat the new centre (claim_higher). In
+  Step C a higher round best does the same. `climb.move_at_once` 0 restores waiting for the whole wave.
+- No cube on the old centre once a compass point clears the bar: the next compass, from the new centre, tries the
+  other live settings. The cube stays for faces that beat the centre by less than the bar.
+- `climb.quorum` 0.8: a grid wave counts as back at four fifths; a certificate (jumps) wave still waits for every
+  neighbour before a peak is named.
+- The v5 rule "a wave a take began is not cut short by another take" is gone: takes may chain, each on a real gain.
+
+Crash-guard audits (2026-10-17). The guard withheld 5,224 configs on 20261016T130600Z while 349 runs crashed, unchecked.
+Now 10% of what it would withhold is sent anyway; a tree leaf whose audited configs crash less than 30% of the time
+(after 5 audits) stops blocking until the next fit, and audited outcomes train that fit. Withheld configs are never
+marked proposed, so the search can send them once their rule is off.
+
+Cross-round generalists (2026-10-17, `candidates.generalist_share` 0.1). On 39 stored rounds the best wave-0 seed was
+0.2-0.6 below the field median, and none of our 12,039 configs scored on 5+ rounds averaged above it (best -0.79); the
+public "minimal competitive" config is 4.1 below. test/bench/generalist.py tunes configs for the mean score against the
+field median over 9 earlier rounds (a GA on 3, re-tested on 3 + 3; the test round and later are held out); the ranking
+goes to $DATA_DIR/portfolio/generalists.json and wave 0 seeds it first (search/portfolio.generalists).
+
+Model feasibility (2026-10-17, test/bench/model_feasibility.py, 84,975 configs of 20261016T130600Z). Gradient boosting per
+class (tp/fp/fn of six classes + region FP, the score rebuilt with the validator's formula) beats a direct score model:
+near-top Spearman 0.92 vs 0.81 on a random split, 0.74 vs 0.28 trained on the 7th-place run and tested on the later
+polish runs; near-top error 0.02-0.04 (4-8 calls, one call ~0.005). Good to rank and filter candidates, not to pick
+the last call.
+
+Duplicate callsets (`search/duplicates.py`, 2026-10-16). In v4, 4,188 of 27,809 GATK runs (117 of 752 core-hours,
+15.6%) returned only callsets already returned (91% by the same climber); duplicate riders inside useful runs cost
+about 1 core-hour. A remembered tie is a prediction (882 one-setting changes tied on one centre and differed on
+another), so nothing is dropped on it:
+- Exact: a config already scored or running is not sent again. The learned refusal in `Context.fresh`
+  (TiedCallsets.holds, combinations of tied values) is gone; it refused 2 configs in v4.
+- Park: a config one established change (`dups.min_ties` 5 ties, never a difference) from a config already sent is
+  parked, not dropped. `dups.audit` (0.1) of them are sent anyway; any pair that differs breaks the rule and sends what
+  it parked; a config whose twin scores within `dups.near` (0.2) of the island's best is sent at once (when parked, or
+  when the twin returns). Nothing is parked while the pick is certified. A sent-back config moves a climber like a GA
+  child. Parked futures are done at once with a "parked" outcome: no wave waits, no crash, no loss.
+- Replay of v4's own send order (test/bench/duplicates_replay.py, 3 seeds): 9.6-9.9 core-hours of whole GATK runs
+  avoided (7.7-8.0% of the redundant runs, 1.3% of the round); no config that stayed parked would have beaten its
+  twin. Without the near rule: 18-20 core-hours, but 1-5 better configs (up to +0.02) stayed parked; with 3 ties per
+  rule: 2 (up to +0.06). Most redundant runs are near the top, where nothing may stay parked.
+
+Trade-off sweep (`Context.send_sweep`, 2026-10-17, `climb.tradeoff_sweep`, default 0 until its fleet A/B). The
+genotyping settings (calling threshold, contamination, indel/SNP heterozygosity, max alt alleles) trade core for false
+positives and cost ~1% of a run as riders, yet around recent picks the calling threshold had been tried at 1 of 74
+values. Each new round best in Step B or C (at most one a minute) gets one batch: every genotyping rung within 4 and
+every 4th rung of the ladder, every PairHMM rung within 2, nothing already scored or running, at most 60 riders,
+priority 1. The riders count as GA children, so a higher one moves a climber.
+
 ## Evaluation (PROPOSED)
 
 - Replays on several released rounds, v9 vs v4.22. The same config count matters more than the same wall time
   (legacy).
 - Run-to-run noise is 0.04–0.08 TRUE, so one pair of runs on one round decides nothing: at least 3 rounds.
 - Report: final TRUE, rank, gap to #1, and per step (A: best candidate TRUE; B: gain per candidate; C: gain).
-
-## Plateau second score (v9.18.1, 2026-10-14)
-
-`search/plateau.py`, setting `climb.plateau_interval` (1; 0 = the v9.18 probe). The blended score stays the only number
-that accepts a move. On an exact score tie (a flat) a second score orders the plateau probe: the probe centres on the
-tied config with the highest second score, and on each locked setting the rung toward that setting's interval goes
-first, the opposite rung after every first rung (sent when a worker is free). Settings without an interval keep the
-nearest untried rung (Brockhoff et al. 2009: a second measure removes a flat and helps only when it points at the exit).
-
-Second score: per setting, slices of one-setting lines (every other setting fixed) whose scores span more than 0.10;
-per rung, its gain over the slice's centre (the slice's median score: stored runs do not say which config a line was
-sent from); the interval = rungs whose average gain is within 0.05 of the best; the score = minus the rungs outside
-each interval over the ladder length, summed over settings that have one.
-
-Warnings:
-- It only reorders probes on exact ties; it points at where one-setting moves already raised the score, so it cannot
-  reach a higher region no one-setting move has reached. Our audit (2026-10-13) puts the gap to the field there: the
-  competent field reaches a better core-at-FP curve than every config our searches scored.
-- Exact ties are rare outside plateaus like 20261012T115400Z's 89.9983; on most rounds this changes nothing.
-- The slice centre is an interpretation (median), not the config a line was actually sent from.
-## Excess lane (v9.18.2, 2026-10-14; off by default)
-
-`search/excess.py`, settings group `excess`. Off by default (`excess.lanes` 0): v9.18.2 with the lane off is v9.18.1.
-Turn it on with `excess.lanes` 1 to test it against v9.18.1 on the same code.
-
-**Why.** The whole competent field, not one king, reaches more true indels at the same false positives than our
-search: on 18 truth rounds 98-100% of field ranks 1-20 sit above our core-vs-FP curve (+0.003-0.004 core), at matched
-FP their SNP calls equal ours, and our evaluation is exact (30/30 configs byte-identical to stock GATK 4.5.0.0;
-plain-defaults submissions score identical to ours). The score blends core and FP, so a better trade-off can sit
-behind a score dip that a score-only climb never crosses (Brockhoff et al. 2009; Knowles, Watson and Corne 2001).
-Evidence: on 20261010T044200Z a climb on core-above-our-curve (test/niche_climb) reached core 0.8723 at FP 1353
-(the king: 0.8703 at 1232), +0.0040 above our curve, while its score went 82.7 -> 81.9 -> 82.2.
-
-**The measure.** J = core - the run's curve at FP clamped to [0.95, 1.05] x the best score's FP - the score's own price
-of each % of FP above that band, in core ((30 / 8N) exp(-FP / 8N) points per FP, 70 points per unit of core; about
-0.0009 core per % at 044200Z). The curve excludes the lane's own results.
-
-**Use.** `excess.lanes` lanes run beside Step B's seats: each starts at the best-J config at least
-`excess.start_far` (0.2) apart in settings from the best config, climbs on J (every setting +-1, 2, 4, 8 rungs; best
-single move or top-3 / top-6 combination), then climbs on the score from its J peak. Its results go to the store; the
-pick is still the highest score.
-
-**Warnings.**
-- Tight band (2026-10-14, test/conversion_sweep): with 0.90-1.15 and a token 0.0003 core per % above it, climbs
-  settled at 1.2x our FP (+0.0040 above our curve at 044200Z, score 82.24); cutting FP with the calling threshold, BQST
-  and contamination reached only 82.39 (our best 82.73) and halved the edge. The field's edge exists at our own FP
-  (82% of its top 40 within 0.97-1.03x our FP are above our curve, +0.0018), so J now looks there. Untested on a fleet.
-- The curve is dense only near the best score's FP. Comparing a config with the curve at its own FP far away let
-  climbs drift to FP 700-780 and look +0.01 to +0.08 "above" a thin curve; ranking out-of-band configs below the band
-  regardless of core made climbs trade any core for FP (test/region_hunt). The band-edge rule is the version that held.
-- The lane's gain on our side is shown on one round only (044200Z). On the binned (20261009T164200Z) and HG005
-  (20261012T033000Z) rounds a 4-pass hunt found no region above our curve (closest -0.001 / -0.002).
-- The lane spends fleet workers (one-setting passes of ~150 configs at GA priority). Its score conversion is a plain
-  greedy climb; whether it turns +0.0040 of J into points above our best is not yet measured on a real round.
-- Simulator (tests/test_excess.py): a lane started at J -0.0144 climbed to +0.0132 and its score to 94.65 (round best
-  94.71). The simulator's landscape is not GATK's.
-
-## Tie walk (v9.18.3, 2026-10-15)
-
-`search/climb.py` (`Climber.tie_walk_heads`), setting `climb.tie_walk` (4 rungs; 0 = v9.18.2). The blended score still
-accepts every move. A grid wave that gains nothing (no head, line point or rider above the centre) walks each
-one-setting line whose head tied the centre exactly: every untried rung on that line out to `climb.tie_walk` rungs from
-the centre goes in one more wave, before the grid closes and its settings count as flat. A rung that already scored
-differently ends its line. Lines on the side of search/plateau.py's interval go first (the v9.18.1 second score now
-steers a walk across the flat, as in Brockhoff et al. 2009, not only the order of one-rung probes).
-
-**Why.** Before, `land()` stepped past a tied rung only on the next visit to that setting; a grid with no gain marked its
-settings flat, and once every setting was flat the climber jumped at random or stopped. A flat exit 2-4 rungs out was
-rarely reached. The v9.18.1 tie-break never acted in the 20261014T213000Z fleet run (0 centre moves): with 324 workers
-every one-rung probe goes in the same wave, so ordering alone changes nothing.
-
-**Evidence (20261014T213000Z, scored against the released truth).** Around our two peaks (v9.18.2 final 87.616, the
-bridge test's best 87.624), 25 of 69 one-rung neighbours tied exactly: 16 byte-identical VCFs, 9 with the same calls and
-genotypes (only QUAL moved, by <= 0.03 on average), none with a different call. So no second score computed from the
-output (core and FP, call counts, QUAL) can order those ties; the second score has to come from the settings.
-Extending every tied line 2-4 rungs (test/wide_flat, 210 configs): 8 higher, best +0.017 (max haplotypes 17 -> 13) and
-+0.027 (mmq 3 -> 4, two rungs on the ladder; FP 1085 -> 1078); 196 still tied; none of 135 pairs of tied moves rose.
-
-**Warnings.**
-- Expected gain is small: about +0.01 to +0.03 per round. The gap to the field on that round is 0.17 and sits on a
-  different hill (test/local_peak: both peaks are local peaks; no one-rung move gains more than +0.007).
-- Cost: one extra wave per failed grid that had a tie, up to about 3 x (tied lines) runs. On a small fleet that is time
-  the climb does not spend elsewhere.
-- Pairs of tied moves gained nothing on the one round measured, so the walk stays on one setting at a time.
-- Measured on one round only.

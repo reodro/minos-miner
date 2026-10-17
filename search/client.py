@@ -17,7 +17,6 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from common.limits import VALIDATOR_RUN_S, over_validator_limit
 from common.params import ParamRanges
 from common.store import ResultStore
 from common.types import FULL, AnswerSet, CallSet, Config, EvalJob, Round, ScoreResult
@@ -163,6 +162,10 @@ class EvalClient:
     def in_flight(self) -> int:
         return len(self._pending)
 
+    def running(self) -> set:
+        """Keys of the configs with a job still in flight."""
+        return {config.key for _fut, config, _tag in self._pending.values()}
+
     def set_answer_set(self, answer_set: AnswerSet) -> None:
         """The round's first answer set: scoring can start."""
         self.answer_set = answer_set
@@ -198,12 +201,6 @@ class EvalClient:
         outcome = Outcome(config, None, cs.error or error, tag)
         if cs.ok:
             self.callsets[(cs.config_key, cs.fidelity)] = cs
-            if over_validator_limit(cs.runtime_s):
-                slow = self.__dict__.setdefault("slow", set())
-                if cs.config_key not in slow:
-                    slow.add(cs.config_key)
-                    log.warning("config %s ran %.0f s here: over the validator's %d s limit per run (it uses 2-8 "
-                                "threads, we use 1)", cs.config_key[:8], cs.runtime_s, VALIDATOR_RUN_S)
             if result is not None:
                 self.latest[(cs.config_key, cs.fidelity)] = result
                 self._note_best(result)

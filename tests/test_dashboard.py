@@ -176,3 +176,33 @@ class DashboardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClimberFoundTest(unittest.TestCase):
+    """The live panel reads only this run's rows of the round's results store (it keeps every replay)."""
+
+    def test_an_earlier_run_of_the_round_does_not_show_in_the_live_panel(self):
+        import sqlite3
+        import unittest.mock
+        from dashboard import server
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "results").mkdir()
+            con = sqlite3.connect(str(Path(tmp) / "results" / "r1.sqlite"))
+            con.execute("create table results (round_id text, config_key text, config text, fidelity text, "
+                        "answer_set_version integer, score real, score_sd real, gate_passed integer, result text, "
+                        "runtime_s real, tag text, created real)")
+            rows = [("old-b0", 82.70, "B0", 1000.0), ("new-b0", 82.30, "B0", 5000.0),
+                    ("old-ga", 82.90, "G", 1000.0), ("new-ga", 82.40, "G", 5000.0)]
+            for key, score, tag, created in rows:
+                con.execute("insert into results (config_key, config, score, tag, created) values (?, ?, ?, ?, ?)",
+                            (key, json.dumps({"params": {"min_pruning": int(score * 10) % 7}}), score, tag, created))
+            con.commit()
+            con.close()
+            live = {"round": {"tag": "r1"},
+                    "search": {"engine": {"started_ts": 4000.0, "basins": [{"id": 0, "best": 82.20, "best_key": "x"}]}}}
+            import dataclasses
+            with unittest.mock.patch.object(server, "SETTINGS", dataclasses.replace(server.SETTINGS, cache_dir=tmp)):
+                server.attach_climber_found(live, {})
+        eng = live["search"]["engine"]
+        self.assertEqual(eng["basins"][0]["found"], 82.30)
+        self.assertEqual([row["key"] for row in eng["ga"]["top"]], ["new-ga"])
