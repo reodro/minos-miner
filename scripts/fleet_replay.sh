@@ -13,8 +13,17 @@ cd "$(dirname "$0")/.."
 TAG=$1; MIN=${2:-72}
 mkdir -p test/runs; LOG=test/runs/replay_${TAG}_$(date +%H%M).log
 echo "[$(date +%H:%M:%S)] $(git branch --show-current) $(git log --oneline -1 | cut -c1-7) tag=$TAG minutes=$MIN log=$LOG"
-echo "[$(date +%H:%M:%S)] sync this code to every node"
-.venv/bin/python -m evaluator.fleet.control sync | cut -c1-160
+# the code is synced only when it changed since the last sync (a 72-minute test cadence has no 30 s to spare);
+# a node with other code is rejected when it connects, so a stale stamp shows up at once
+STAMP=cache/fleet_synced.stamp
+CODE="$(git rev-parse HEAD) $( (git diff HEAD; git ls-files --others --exclude-standard -- '*.py' | xargs -r cat) | sha1sum | cut -c1-16) $(sha1sum fleet.json | cut -c1-16)"
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$CODE" ]; then
+    echo "[$(date +%H:%M:%S)] code unchanged since the last sync; not synced"
+else
+    echo "[$(date +%H:%M:%S)] sync this code to every node"
+    .venv/bin/python -m evaluator.fleet.control sync | cut -c1-160
+    mkdir -p cache; echo "$CODE" > "$STAMP"
+fi
 echo "[$(date +%H:%M:%S)] wipe cache/{dcache,fleet,callsets}/$TAG on every node"
 .venv/bin/python - "$TAG" <<'PY'
 import sys
@@ -37,6 +46,6 @@ echo "[$(date +%H:%M:%S)] replay $TAG for $MIN min on the fleet (watch it on the
 .venv/bin/python -m main replay "$TAG" --fleet --minutes "$MIN" --no-review > "$LOG" 2>&1
 echo "[$(date +%H:%M:%S)] replay exit $?"
 echo "[$(date +%H:%M:%S)] review $TAG here (fleet is free)"
-nohup .venv/bin/python -m main review "$TAG" >> "$LOG" 2>&1 &
+nohup nice -n 19 .venv/bin/python -m main review "$TAG" >> "$LOG" 2>&1 &   # lowest CPU priority: the next round runs meanwhile
 echo "[$(date +%H:%M:%S)] review pid $!"
 grep -E "answer set vs|  (final|baseline|top) |final TRUE|^rank|searched|evaluated |local best" "$LOG" | cut -c1-220
