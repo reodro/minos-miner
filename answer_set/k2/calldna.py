@@ -13,6 +13,15 @@ import numpy as np
 from answer_set.k2.homrep import read_feats, repeat_at
 
 
+class Bag:
+    """call_dna.joblib as several models (each trained on a share of the rounds) whose probabilities are averaged"""
+    def __init__(self, models):
+        self.models = list(models)
+
+    def predict_proba(self, X):
+        return np.mean([m.predict_proba(X) for m in self.models], axis=0)
+
+
 def feats(bam, fa, chrom, k):
     """repeat shape (unit, span, copies, event in units, whole units) + homrep.read_feats for candidate k"""
     u, span, cp = repeat_at(fa, chrom, k)

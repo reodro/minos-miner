@@ -6,7 +6,9 @@ A 1000G round BAM consists of the person's public 1000 Genomes high-coverage rea
 distinctive qualities have an original with the same qualities and sequence). So readdiff.py works unchanged against
 these originals, as for GIAB rounds (giab_origin.py).
 
-The person's CRAM is found in EBI's sequence indexes of the 2,504 + 698 high-coverage sets (cached). A round region
+The person's CRAM is found in EBI's sequence indexes of the 2,504 + 698 high-coverage sets (cached). EBI is tried
+first and AWS's public mirror of the same CRAMs second (a person whose originals once failed or came back incomplete
+goes to the mirror first): on 2026-10-08 EBI refused connections and two live rounds scored 87.2 and 91.9. A round region
 (~10 Mb, ~2.5M reads) takes ~10-20 s in 8 parallel pieces. Same rules as giab_origin: each piece in its own process
 (killed past PIECE_TIMEOUT_S; htslib's remote reads have no timeout), the whole fetch stops at budget_s.
 Owner: answer_set.
@@ -23,6 +25,10 @@ from answer_set.k2.util import CACHE as K2_CACHE, ref_path
 BASE = "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage/"
 INDEXES = ("1000G_2504_high_coverage.sequence.index", "1000G_698_related_high_coverage.sequence.index")
 CACHE = K2_CACHE / "kg_origin"
+# AWS Open Data mirror of the same CRAMs, by EBI run accession: <MIRROR><set>/data/<ERR...>/<person>.final.cram
+MIRROR = "https://1000genomes.s3.amazonaws.com/1000G_2504_high_coverage/"
+MIRROR_SET = {INDEXES[0]: "", INDEXES[1]: "additional_698_related/"}
+PREFER_MIRROR = set()                                       # persons whose EBI fetch failed or was incomplete
 INDEX_TIMEOUT_S = 60
 PIECE_TIMEOUT_S = 300
 FETCH_BUDGET_S = 600
@@ -49,7 +55,15 @@ def _download(url, dest, deadline):
     tmp.rename(dest)
 
 
-def cram_url(person, deadline=None, attempts=4):
+def cram_urls(person, deadline=None):
+    """[EBI URL, AWS mirror URL] of the person's CRAM, in the order to try them."""
+    url, index = cram_url(person, deadline, with_index=True)
+    run, name = url.rstrip("/").split("/")[-2:]
+    urls = [url, f"{MIRROR}{MIRROR_SET[index]}data/{run}/{name}"]
+    return urls[::-1] if person in PREFER_MIRROR else urls
+
+
+def cram_url(person, deadline=None, attempts=4, with_index=False):
     """https URL of the person's CRAM, from EBI's sequence indexes (downloaded once)."""
     deadline = deadline or time.monotonic() + FETCH_BUDGET_S
     CACHE.mkdir(parents=True, exist_ok=True)
@@ -69,12 +83,14 @@ def cram_url(person, deadline=None, attempts=4):
                 continue
             u = line.split("\t", 1)[0]
             if u.endswith(f"/{person}.final.cram"):
-                return u.replace("ftp://", "https://")
+                u = u.replace("ftp://", "https://")
+                return (u, name) if with_index else u
     raise RuntimeError(f"no 1000G high-coverage CRAM listed for {person}")
 
 
 def remote_index(person, url, deadline, attempts=4):
-    local = CACHE / f"{person}.final.cram.crai"
+    local = CACHE / (f"{person}.final.cram.crai" if url.startswith(BASE.split("/vol1")[0]) or "ebi.ac.uk" in url
+                     else f"{person}.mirror.final.cram.crai")
     for t in range(attempts):
         if local.exists():
             return local
@@ -108,7 +124,20 @@ def fetch(person, chrom, a, b, pad=500, chunks=8, attempts=4, budget_s=None):
     if out.exists() and Path(str(out) + ".bai").exists():
         return out
     deadline = time.monotonic() + (FETCH_BUDGET_S if budget_s is None else budget_s)
-    url = cram_url(person, deadline)
+    errors = []
+    for url in cram_urls(person, deadline):                # EBI, then the AWS mirror (or the reverse, see above)
+        try:
+            return _fetch_from(url, person, chrom, a, b, pad, chunks, attempts, deadline, out)
+        except Exception as e:  # noqa: BLE001  (network trouble at one source: try the other within the budget)
+            errors.append(f"{url.split('/')[2]}: {str(e)[:300]}")
+            PREFER_MIRROR.add(person)
+            if time.monotonic() >= deadline:
+                break
+    raise RuntimeError("original reads from every source failed: " + " | ".join(errors))
+
+
+def _fetch_from(url, person, chrom, a, b, pad, chunks, attempts, deadline, out):
+    import pysam
     crai = remote_index(person, url, deadline)
     lo, hi = max(1, a - pad), b + pad
     step = (hi - lo + chunks) // chunks
