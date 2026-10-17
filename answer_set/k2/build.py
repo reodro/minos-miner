@@ -123,6 +123,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     features.KG_READDIFF = int(tracks.meta("kg", kname).get("kg_readdiff", 0)) if kname else 0
     features.KG_HAPGENO = int(tracks.meta("kg", kname).get("kg_hapgeno", 0)) if kname else 0
     features.KG_SITE_RULE = int(tracks.meta("kg", kname).get("kg_site_rule", 0)) if kname else 0
+    features.KG_HC = int(tracks.meta("kg", kname).get("kg_hc", 0)) if kname else 0
     keys, X, info, donors, beds = extract(bam, region, out / "work", threads)
     t_feat = time.time() - t0
     track = tracks.track_of_info(info)
@@ -137,6 +138,17 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         X = X[:, [tracks.col_index(n) for n in meta["features"]]] if len(keys) else X
     p_any = m_any.predict_proba(X)[:, 1] if len(keys) else np.array([])
     p_hom = m_hom.predict_proba(X)[:, 1] if len(keys) else np.array([])
+    n_call_dna = None
+    if not info["mode_giab"] and meta.get("call_dna") and len(keys):
+        # non-person indel candidates: call decision from the model that also sees reads judged by DNA (calldna.py)
+        import joblib
+        from answer_set.k2 import calldna
+        m_cd = joblib.load(tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
+                           / "call_dna.joblib")
+        fa_c, bam_c = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
+        p_any, n_call_dna = calldna.apply(p_any, keys, X, X_full[:, FEATURES.index("gatk_person_called")], bam_c, fa_c,
+                                          chrom, m_cd)
+        fa_c.close(); bam_c.close()
     p_raw = p_any
     if len(keys) and meta.get("thr_class"):
         p_any = tracks.apply_class_thr(meta, keys, p_any)
@@ -193,6 +205,18 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
                                             meta["cluster_decoder"].get("resolver_cut", 0.7))
     if isinstance(kg_own, int):                       # 1000G: the model's calls are the inserted mutations, flagged
         recs = [r[:4] + (k_ not in donor,) + r[5:] for r in recs for k_ in [(r[0], r[1], r[2])]]  # as Minos does
+    if not info["mode_giab"] and meta.get("cluster_decoder") and isinstance(kg_own, int) and len(keys):
+        # 1000G: the same edit-based cluster decoder, against the person's public original reads (kg_origin)
+        import joblib
+        from answer_set.k2 import clusterdec, kg_origin
+        vd_ = tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
+        person = kgi.get("person")
+        op_ = kg_origin.path(person, chrom, a, b) if person else None
+        recs, n_clusters = clusterdec.apply(recs, bam, ref_path(chrom), chrom, op_ if op_ is not None and op_.exists()
+                                            else None, donor, out / "work", keys, p_any, p_hom,
+                                            (joblib.load(vd_ / "cluster_chooser.joblib"),
+                                             joblib.load(vd_ / "cluster_arbiter.joblib")),
+                                            meta["cluster_decoder"]["cut"])
     if not info["mode_giab"] and meta.get("kg_one_spelling") and isinstance(kg_own, int):
         # one spelling per edited haplotype (clusterdec.apply_one_spelling); the person's records stay
         from answer_set.k2 import clusterdec, kg_origin
@@ -337,7 +361,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
         "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok",
-        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "hom_repeat": n_hom_repeat,
+        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "hom_repeat": n_hom_repeat, "call_dna": n_call_dna,
     }
     (out / "report.json").write_text(json.dumps(report, indent=1))
     return report

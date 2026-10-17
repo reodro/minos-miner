@@ -34,7 +34,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k030_20261016T1057) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k038_20261017T0834) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -220,6 +220,21 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   1 bp keeps k029's). Release check, 12 live 1000G rounds 2026-10-15 03:30 to 10-16 05:54 (k029 never trained on
   them), both built and scored like the validator: +0.0096 per round, t 2.22, better 5 / worse 2 / same 5
   (`test/answer_set/kg_release_check.py`). Without 10-16 05:54, examined before the design: +0.0067.
+- k038 (1000G, released 2026-10-17) = four changes on k029's recipe, each measured held out:
+  - base k033: the k025 recipe trained only on the 78 rounds of Minos's current insertion pattern (from 2026-10-05
+    05:53); as good as all 124 rounds (k031) with 37% less data;
+  - the repeat het/hom model trained on ALL true inserted indels (86k rows), applied as before (repeat >= 2 bp):
+    fold genotype errors 472 -> 452;
+  - DNA call model (`k2/calldna.py`, `call_dna.joblib`, meta `call_dna`): every non-person indel candidate is
+    re-scored by a model that also sees homrep's reads judged by their DNA and the repeat shape; folds, 78 rounds:
+    missed / false indels 916 / 183 -> 904 / 162;
+  - the cluster decoder (`clusterdec.py`) on 1000G, against the person's originals (`kg_origin`), with a chooser and
+    arbiter trained on 1000G clusters (`test/answer_set/kg_spell_data.py`, `kg_clusterdec_train.py`): arbiter cut
+    0.8 fixes 85 / breaks 8 clusters in 78 held-out rounds. GIAB's own chooser/arbiter does not transfer (k037).
+  Release check: 18 live 1000G rounds 2026-10-16 07:06 to 10-17 07:06, held out from every model and fixed before
+  training, built and scored like the validator (`test/answer_set/kg_compare.py`): vs k030 +0.0251 per round, t 2.15,
+  better 12 / worse 6 (k036 = without the decoder: +0.0198). Gains come from the weak rounds: on the 9 where k030
+  scored below 99.70, +0.049 each (9/9 better); on the other 9 about even.
 
 ## Open work
 

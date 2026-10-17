@@ -180,7 +180,8 @@ def train(track, rs, name):
     kg_rd = track == "kg" and all(r["info"].get("kg_readdiff") and "error" not in (r["info"].get("readdiff") or {})
                                   for r in rs)
     kg_hg = kg_rd and all(r["info"].get("kg_hapgeno") for r in rs)
-    feats = tracks.features_for(track, kg_rd, kg_hg)
+    kg_hc = track == "kg" and all(r["info"].get("hc_evidence") for r in rs)   # every round prepared with GATK
+    feats = tracks.features_for(track, kg_rd, kg_hg, kg_hc)
     if track == "giab" and NO_HC:
         feats = [f for f in feats if f not in tracks.HC_SET]
         for r in rs:
@@ -277,6 +278,8 @@ def train(track, rs, name):
             meta["kg_own_rule"] = 1
         if track == "kg" and ROUND_FEATS:
             meta["round_feats"] = 1
+        if kg_hc:
+            meta["kg_hc"] = min(int(r["info"]["hc_evidence"]) for r in rs)
         if kg_hg:
             meta["kg_hapgeno"] = min(int(r["info"]["kg_hapgeno"]) for r in rs)
         if track == "kg" and all(r["info"].get("kg_site_rule") for r in rs):
