@@ -23,6 +23,7 @@ RD_1BP_FACTOR = float(os.environ.get("MINOS_RD1BP", "0.5"))
 # Without it the model sees NaN for every rd_* measurement - still scorable, but weaker (2026-10-01 08:17 on the
 # k2/107 machine: inserted 1-bp indels 94.9% found instead of 96.9%).
 RD_ATTEMPTS, RD_WAIT_S = 3, 10
+KG_MAX_NO_ORIGINAL = 0.05          # 1000G: past this share of reads without an original, fetch again
 RD_BUDGET_S = 900               # the whole read comparison, every try: past it the build goes on without it
 # GIAB local haplotype genotyper (hapgeno.py): the two local DNA sequences the person most likely carries at each
 # spot, as events (new candidates) and per-candidate posteriors. On only for models trained with it (meta
@@ -436,6 +437,15 @@ def extract(bam, region, workdir, threads=8, cand_vcf=None, reuse=False):
             orig = (giab_origin.fetch(mode_donor, chrom, a, b, budget_s=left) if mode_giab else
                     kg_origin.fetch(kg_info["person"], chrom, a, b, budget_s=left))
             found, stats = readdiff.recover(bam, orig, chrom, a, b, workers=threads)
+            n_reads = sum(stats.get(k, 0) for k in ("no original found", "edited", "unedited"))
+            miss = stats.get("no original found", 0) / max(1, n_reads)
+            if not mode_giab and miss > KG_MAX_NO_ORIGINAL:
+                # incomplete originals (2026-10-08: 88% of reads without one, round scored 87.2): drop the cached
+                # file and fetch again, from the mirror first (kg_origin.PREFER_MIRROR)
+                for f_ in (Path(str(orig)), Path(str(orig) + ".bai")):
+                    f_.unlink(missing_ok=True)
+                kg_origin.PREFER_MIRROR.add(kg_info["person"])
+                raise RuntimeError(f"originals incomplete: {miss:.1%} of reads without an original")
             return readdiff.normalised(found, chrom, workdir), stats
         try:
             (rdiff, rd_info), failed = retry(compare, RD_ATTEMPTS, RD_WAIT_S, budget_s=RD_BUDGET_S)
