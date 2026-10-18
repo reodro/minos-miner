@@ -34,6 +34,7 @@ class Round:
     deadline: Optional[str] = None       # submission_end_time, ISO 8601
     released_dir: Optional[str] = None   # dir holding truth/mutations once revealed (backtest only)
     n_targets: Optional[int] = None      # platform's num_mutations if it ever reports it live (usually unknown: estimated)
+    n_source: Optional[str] = None       # where n_targets came from: "platform" | "recent rounds" (main.n_estimate)
 
     @property
     def region(self) -> str:

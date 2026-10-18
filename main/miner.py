@@ -157,8 +157,13 @@ def fetch_round(live: LiveRound, reference_for: Callable[[str], str], rounds_dir
             os.replace(str(dest) + ".part", dest)
     (d / "round.json").write_text(json.dumps({"round_id": live.round_id, "region": live.region}))
     deadline = datetime.utcfromtimestamp(live.deadline_ts).isoformat() + "Z" if live.deadline_ts else None
+    n, source = live.num_mutations, "platform" if live.num_mutations else None
+    if not n:                                     # not published live: recent rounds' median (main/n_estimate.py)
+        from main.n_estimate import recent_n
+        n = recent_n(tag, str(d.parent))
+        source = "recent rounds" if n else None
     return Round(live.round_id, chrom, start, end, bam=str(d / "input.bam"), reference=reference_for(chrom),
-                 deadline=deadline, n_targets=live.num_mutations)
+                 deadline=deadline, n_targets=n, n_source=source)
 
 
 def run_forever(source: RoundSource, make_parts: Callable[[Round], Parts], reference_for: Callable[[str], str],

@@ -81,6 +81,12 @@ def replay(tag: str, minutes: float, workers: int, fleet=None, scoring=None):
     from main.miner import mine_round
     from main.submitter import DryRunSubmitter
     rnd = load(tag, reference=reference_for(load(tag).chrom))
+    if rnd.n_targets is None:                     # as live: N from the rounds revealed before this one started
+        import dataclasses
+        from main.n_estimate import recent_n
+        n = recent_n(tag)
+        if n:
+            rnd = dataclasses.replace(rnd, n_targets=n, n_source="recent rounds")
     r = ranges()
     sub = DryRunSubmitter()
     parts = make_parts(rnd, r, sub, workers, fleet, scoring)
