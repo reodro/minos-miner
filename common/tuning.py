@@ -193,6 +193,12 @@ KNOBS_LIST: List[Knob] = [
     Knob("climb.ga_quiet_min", 4.0, 1.0, 20.0, LIVE, "min",
          "After a GA child or a candidate moves a climber, the climbers send nothing for this many "
          "minutes (scaled) and the fleet breeds. Then one rung past the compass walks to the peak."),
+    Knob("climb.big_steps", 1, 0, 1, ROUND, "count",
+         "1: each grid setting starts at a step that fits its ladder (<=40 rungs: 1; 41-150: 3; >150: 3), widens "
+         "after an iteration that did not move it (to 5 / 9 / climb.big_step_large_max) and then narrows back to 1. "
+         "0: every setting steps one rung, as before 2026-10-18."),
+    Knob("climb.big_step_large_max", 27, 9, 100, ROUND, "rungs",
+         "The widest grid step of a setting with more than 150 rungs (padding, assembly region sizes)."),
     Knob("climb.ga_open_min", 0.0, 0.0, 20.0, ROUND, "min",
          "At the start of Step B the whole fleet breeds before any grid. 0 (the default since 2026-10-18): no such "
          "step, the grids start at once. Over 33 openings of 2026-10-17/18 it gained +0.062 in 2.4 min on average "

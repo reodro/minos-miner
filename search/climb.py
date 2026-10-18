@@ -156,6 +156,19 @@ def is_one_rung_local_opt(ctx, centre: Config, score: float) -> bool:
     return True
 
 
+SMALL_LADDER, LARGE_LADDER = 40, 150   # rungs: the three step plans of climb.big_steps
+
+
+def step_plan(n_rungs: int) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """(widening steps, narrowing steps) of a setting with this many rungs (2026-10-18, the user's schedule)."""
+    if n_rungs <= SMALL_LADDER:
+        return (1, 2, 3, 5), (1,)
+    if n_rungs <= LARGE_LADDER:
+        return (3, 5, 7, 9), (3, 1)
+    top = max(19, int(tune("climb.big_step_large_max")))
+    return (3, 9, 18, top), (9, 3, 1)
+
+
 class Climber:
     def __init__(self, ctx, cid: int, start: Config, score: float, origin: str = "step A"):
         # An island's climbers are numbered from 100 x its index, so every B{id} tag in the store is one climber.
@@ -167,6 +180,7 @@ class Climber:
         self.iteration = 0
         self.turn = 0                                          # odd turns read-pass, unless that grid is already dead
         self.growth: Dict[str, Tuple[int, int]] = {}           # setting -> (direction, rungs) offered next time
+        self.reach: Dict[str, Tuple[str, int]] = {}            # setting -> (phase, index) of its grid step (step_plan)
         self.flat: set = set()                                 # settings gridded without a gain since their own last one
         self.recent: List[float] = []                          # gain of each finished grid, oldest first
         self.rotation = 0
@@ -326,7 +340,38 @@ class Climber:
 
     def offsets(self, name: str) -> List[int]:
         d, k = self.growth.get(name, (1, 1))
-        return [0, d * k, -d]
+        s = self.step_size(name)
+        return [0, d * max(k, s), -d * s]
+
+    def step_size(self, name: str) -> int:
+        """The rungs this setting's grid step spans now (climb.big_steps; 1 when off, for a bool or a list)."""
+        if not int(tune("climb.big_steps")):
+            return 1
+        spec = self.ctx.space.specs.get(name)
+        if spec is not None and (spec.type == "bool" or spec.allowed):
+            return 1
+        widen, narrow = step_plan(len(self.ctx.ladders.rungs.get(name) or ()))
+        phase, i = self.reach.get(name, ("w", 0))
+        if phase == "w":
+            return widen[min(i, len(widen) - 1)]
+        if phase == "n":
+            return narrow[min(i, len(narrow) - 1)]
+        return 1
+
+    def adapt_reach(self, group: Sequence[str], old: Optional[Config], new: Optional[Config]) -> None:
+        """After a grid iteration: a setting that moved keeps its step; one that did not widens it, past the widest it
+        narrows, and after one rung it stays at one rung."""
+        if not int(tune("climb.big_steps")):
+            return
+        for n in group:
+            if new is not None and old is not None and new.params.get(n) != old.params.get(n):
+                continue
+            widen, narrow = step_plan(len(self.ctx.ladders.rungs.get(n) or ()))
+            phase, i = self.reach.get(n, ("w", 0))
+            if phase == "w":
+                self.reach[n] = ("w", i + 1) if i + 1 < len(widen) else ("n", 0)
+            elif phase == "n":
+                self.reach[n] = ("n", i + 1) if i + 1 < len(narrow) else ("f", 0)
 
     def compass_offsets(self, name: str) -> List[int]:
         """The compass rungs. In the last 12 minutes each side also takes the next rung out.
@@ -535,7 +580,18 @@ class Climber:
                 continue
             arm, base = meta[0], meta[1]
             if "+" in arm[0]:                                  # a two-setting jump is not an arm
-                won += (s - base) >= accept
+                ok = (s - base) >= accept
+                won += ok
+                two = getattr(self.ctx, "_leap2", None)
+                if two is None:
+                    two = [0, 0, 0.0]
+                    try:
+                        self.ctx._leap2 = two
+                    except AttributeError:
+                        pass
+                two[0] += 1
+                two[1] += int(ok)
+                two[2] += max(0.0, s - base) if ok else 0.0
                 continue
             won += arms.learn(arm, max(0.0, s - base), accept)
         self._wave_leap_wins += won
@@ -1141,6 +1197,7 @@ class Climber:
                 if not one_rung:
                     self.note_momentum(self.centre, best[0])
                 self.growth.clear()
+                self.reach.clear()
                 self.move(best[0], best[1], "jump")
                 self.flat.clear()
             elif self.jumps_enabled and float(tune("climb.leap_share")) > 0:
@@ -1177,7 +1234,9 @@ class Climber:
         if refused is not None and refused[1] > self.score:
             self.move(refused[0], refused[1], "refused")               # says why, once per config
         best = max(allowed, key=lambda t: t[1], default=None)
+        moved_to = None
         if best is not None and best[1] > self.score and follow(ctx, self, best[0], best[1]):
+            moved_to = best[0]
             on_line = best[0].key in self.line_keys
             if on_line:
                 for name in self.group:
@@ -1205,6 +1264,7 @@ class Climber:
         else:
             for name in self.group:
                 self.growth.pop(name, None)
+        self.adapt_reach(self.group, old, moved_to)
         if self.first is None:
             self.first = (self.score, self.centre.key)
         gain = self.score - self.wave_before
@@ -1360,6 +1420,7 @@ class Climber:
             if (best is not None and best[1] - self.score >= accept and centre_allowed(self, best[0])):
                 ctx.say("climber %d: a 1-rung neighbor gains %+.4f; the grid resumes", self.id, best[1] - self.score)
                 self.growth.clear()
+                self.reach.clear()
                 self.move(best[0], best[1], "jump")
                 self.flat.clear()
                 return
@@ -1499,6 +1560,7 @@ class Climber:
         self.gate_futs, self.extra_futs, self.inflight = [], [], []
         self.batch_live = False
         self.growth.clear()
+        self.reach.clear()
         self.flat.clear()
         self.recent.clear()
         self.kind, self.group = "", []
@@ -1523,6 +1585,7 @@ class Climber:
         self.gate_futs, self.extra_futs, self.inflight = [], [], []
         self.batch_live = False
         self.growth.clear()
+        self.reach.clear()
         self.flat.clear()
         self.kind, self.group = "", []
         self.resume(c, s, "ga")
@@ -1533,6 +1596,7 @@ class Climber:
         """Climb again from `c` (Step C found it): fresh grids, no growth carried over."""
         self.ended_s = None
         self.growth.clear()
+        self.reach.clear()
         self.flat.clear()
         self.recent.clear()
         self.state = "climbing"

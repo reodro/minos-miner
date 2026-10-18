@@ -428,6 +428,7 @@ class Context:
                 "pick": self.picked,
                 "failures": dict(self.failures),
                 "head_reserve_ws": round(getattr(self, "reserve_ws", 0.0), 1),
+                "leaps": _leaps_summary(self),
                 "duplicates": {"parked": self.dups.n_parked, "audits": self.dups.n_audits, "near": self.dups.n_near,
                                "rules_broken": self.dups.n_broken, "released": self.dups.n_released,
                                "still_parked": self.dups.still_parked()},
@@ -439,6 +440,11 @@ class Context:
             }
         except Exception:  # noqa: BLE001 - the notes must never end the round
             log.exception("engine: publishing the notes failed")
+
+
+def _leaps_summary(ctx) -> dict:
+    from search import leaps
+    return leaps.summary(ctx)
 
 
 def _fingerprint_history(ctx) -> list:
@@ -629,6 +635,12 @@ async def search_one(client, space: Space, profile: Optional[str], rng: random.R
     if ctx.failures:
         ctx.say("failed runs by source: %s | reasons: %s", ", ".join(f"{k} {v}" for k, v in sorted(ctx.failures.items())),
                 "; ".join(f"{v} x {k}" for k, v in sorted(ctx.fail_reasons.items(), key=lambda kv: -kv[1])[:3]))
+    js = _leaps_summary(ctx)
+    t2 = js["two_setting"]
+    if js["tries"] or t2["tries"]:
+        ctx.say("centre jumps: %d sent, %d won (%.0f%%), gain %+.4f in all, %+.4f per jump sent; two-setting: %d sent, "
+                "%d won, gain %+.4f", js["tries"], js["wins"], 100.0 * js["wins"] / max(1, js["tries"]), js["gain"],
+                js["gain"] / max(1, js["tries"]), t2["tries"], t2["wins"], t2["gain"])
     if ctx.guard.summary():
         ctx.say("%s", ctx.guard.summary())
     if ctx.dups.summary():

@@ -711,6 +711,7 @@ class ClimbTest(unittest.TestCase):
         self.assertFalse(low.pending)
         self.assertFalse(low.batch_live)
 
+    @unittest.mock.patch.dict(TUNING.values, {"climb.big_steps": 0})       # the one-rung compass walk
     def test_a_flat_compass_step_lands_on_the_next_untried_rung(self):
         ctx, cl = self.climber()
         centre = cl.centre

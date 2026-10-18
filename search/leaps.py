@@ -232,6 +232,23 @@ class Arms:
         return won
 
 
+def summary(ctx) -> dict:
+    """Centre jumps sent and won this round: totals, per setting, and the two-setting jumps (not arms)."""
+    arms = getattr(ctx, "_jump_arms", None)
+    stats = arms.stats if arms is not None else {}
+    by: Dict[str, dict] = {}
+    tries = wins = gain = 0.0
+    for arm, (w, t, g) in stats.items():
+        row = by.setdefault(str(arm[0]), {"tries": 0, "wins": 0, "gain": 0.0})
+        row["tries"] += int(t)
+        row["wins"] += int(w)
+        row["gain"] = round(row["gain"] + g, 4)
+        tries, wins, gain = tries + t, wins + w, gain + g
+    two = getattr(ctx, "_leap2", None) or [0, 0, 0.0]
+    return {"tries": int(tries), "wins": int(wins), "gain": round(gain, 4),
+            "two_setting": {"tries": int(two[0]), "wins": int(two[1]), "gain": round(two[2], 4)}, "by_setting": by}
+
+
 def arms_of(ctx) -> Arms:
     arms = getattr(ctx, "_jump_arms", None)
     if arms is None:
