@@ -156,6 +156,16 @@ def panel_sites(chrom, a, b, workdir):
 GATK_RAW = ("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage/working/"
             "20201028_3202_raw_GT_with_annot/20201028_CCDG_14151_B01_GRM_WGS_2020-08-05_{chrom}.recalibrated_variants.vcf.gz")
 GATK_PERSON_CACHE = CACHE / "kg_gatk_person"
+# the same callset on AWS's public mirror of the 1000 Genomes FTP tree (2026-10-18: an EBI read of the person's
+# genotypes took 19 minutes); attempts alternate EBI / mirror, each attempt is time-limited, the whole fetch too
+GATK_RAW_MIRROR = GATK_RAW.replace("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/",
+                                   "https://1000genomes.s3.amazonaws.com/")
+GATK_TRY_S, GATK_BUDGET_S = 180, 480
+
+
+def _gatk_raw(chrom, attempt):
+    """the callset URL for this attempt: EBI first, then the mirror, alternating"""
+    return (GATK_RAW if attempt % 2 == 0 else GATK_RAW_MIRROR).format(chrom=chrom)
 
 
 def gatk_person_at(chrom, a, b, sample, loci, chunks=6, attempts=10):
@@ -181,6 +191,7 @@ def gatk_person_at(chrom, a, b, sample, loci, chunks=6, attempts=10):
         tmp = GATK_PERSON_CACHE / f".tmp_{sample}_{chrom}_{a}_{b}"
         tmp.mkdir(exist_ok=True)
         parts = [wins[i::chunks] for i in range(chunks)]
+        deadline = time.monotonic() + GATK_BUDGET_S
 
         def fetch(i):
             if not parts[i]:
@@ -189,19 +200,22 @@ def gatk_person_at(chrom, a, b, sample, loci, chunks=6, attempts=10):
             reg.write_text("".join(f"{chrom}\t{x}\t{y}\n" for x, y in sorted(parts[i])))
             out = tmp / f"p{i}.vcf.gz"
             for t in range(attempts):
+                if time.monotonic() > deadline:
+                    break
                 try:
                     bcftools(f"set -o pipefail; cd /o && bcftools view -s {sample} -R /o/{reg.name} "
-                             f"{GATK_RAW.format(chrom=chrom)} -Ou "
+                             f"{_gatk_raw(chrom, t)} -Ou "
                              f"| bcftools view -e 'GT=\"0/0\" || GT=\"./.\" || ALT~\"<\" || ALT=\"*\"' -Ou "
                              f"| bcftools norm -m -both -f /r/{chrom}.fa -Oz -o /o/{out.name} "
                              f"&& bcftools index -f -t /o/{out.name}",
-                             [(str(tmp), "/o"), (str(ref_path(chrom).parent), "/r")])
+                             [(str(tmp), "/o"), (str(ref_path(chrom).parent), "/r")],
+                             timeout_s=max(10, min(GATK_TRY_S, deadline - time.monotonic())))
                     return out
                 except RuntimeError as e:
                     err = e
                     out.unlink(missing_ok=True)
                     time.sleep(5 * (t + 1))
-            raise RuntimeError(f"GATK lookup for {sample} chunk {i} failed after {attempts} attempts: {err}")
+            raise RuntimeError(f"GATK lookup for {sample} chunk {i} failed (EBI and mirror, {GATK_BUDGET_S} s budget): {err}")
 
         with cf.ThreadPoolExecutor(chunks) as ex:
             outs = [o for o in ex.map(fetch, range(chunks)) if o]
@@ -344,25 +358,31 @@ def gatk_person_region(chrom, a, b, sample, chunks=8, attempts=10):
         tmp.mkdir(exist_ok=True)
         step = (b - a + chunks) // chunks
         pieces = [(a + i * step, min(b, a + (i + 1) * step - 1)) for i in range(chunks) if a + i * step <= b]
+        deadline = time.monotonic() + GATK_BUDGET_S
 
         def fetch(i):
             x, y = pieces[i]
             out = tmp / f"p{i}.vcf.gz"
+            err = None
             for t in range(attempts):
+                if time.monotonic() > deadline:
+                    break
                 try:
                     bcftools(f"set -o pipefail; cd /o && bcftools view -s {sample} -r {chrom}:{x}-{y} "
-                             f"{GATK_RAW.format(chrom=chrom)} -Ou "
+                             f"{_gatk_raw(chrom, t)} -Ou "
                              f"| bcftools view -e 'GT=\"0/0\" || GT=\"./.\" || ALT~\"<\" || ALT=\"*\"' -Ou "
                              f"| bcftools norm -m -both --old-rec-tag OLD -f /r/{chrom}.fa -Oz -o /o/{out.name} "
                              f"&& bcftools index -f -t /o/{out.name}",
-                             [(str(tmp), "/o"), (str(ref_path(chrom).parent), "/r")])
+                             [(str(tmp), "/o"), (str(ref_path(chrom).parent), "/r")],
+                             timeout_s=max(10, min(GATK_TRY_S, deadline - time.monotonic())))
                     if _count_records(out) > 0:
                         return out
                 except RuntimeError as e:
                     err = e
                 out.unlink(missing_ok=True)
                 time.sleep(5 * (t + 1))
-            raise RuntimeError(f"GATK region fetch for {sample} {chrom}:{x}-{y} failed after {attempts} attempts")
+            raise RuntimeError(f"GATK region fetch for {sample} {chrom}:{x}-{y} failed (EBI and mirror, {GATK_BUDGET_S} s "
+                               f"budget): {err}")
 
         with cf.ThreadPoolExecutor(len(pieces)) as ex:
             outs = list(ex.map(fetch, range(len(pieces))))
