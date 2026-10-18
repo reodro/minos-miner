@@ -6,9 +6,9 @@
                 workers: the round's read-length profile first, deduplicated, never the round being replayed)
                 and a Latin hypercube for the rest; each point carries candidates.riders calling-threshold
                 riders (one GATK run).
-                The default wait is candidates.launch_back. MINOS_FAST_HANDOFF=1 ends the opening once half
-                of it is back and the best score has stood still for 90 seconds. That flag is an experiment,
-                not the default.
+                Wave 0 ends once half of it is back and the best score has stood still for 90 seconds, at the
+                latest at candidates.launch_back (candidates.wave0_settle 1, the default since 2026-10-18: on round
+                05:54 of that day the best was set at minute 8 and the 80% wait ran to minute 14.6). 0: the 80% wait.
     1 GA gen    60 parents, the best scores that are pairwise at least candidates.min_distance apart.
                 Three groups are built inside those 60:
                   both  the Pareto front on (core up, false positives down)
@@ -1300,7 +1300,7 @@ class StepA:
             wave0 += [c for c in latin_hypercube(ctx.space, ctx.rng, max(0, ctx.cap - len(wave0)))
                       if all(c.key != x.key for x in wave0)]
             await self.wave(wave0, int(tune("candidates.riders")), "seeds + portfolio + hypercube", until,
-                            settle=bool(os.environ.get("MINOS_FAST_HANDOFF")))
+                            settle=bool(int(tune("candidates.wave0_settle"))) or bool(os.environ.get("MINOS_FAST_HANDOFF")))
             path = self._save_fixed_wave0()
             ctx.say("wave 0 fixed for later tests: %s", path)
         if os.environ.get("MINOS_FAST_HANDOFF"):

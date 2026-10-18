@@ -112,6 +112,9 @@ KNOBS_LIST: List[Knob] = [
     Knob("candidates.generation_min", 12.0, 2.0, 30.0, LIVE, "min",
          "Minutes generation 1 is given after it is launched (scaled). The wave is waited until "
          "candidates.launch_back of it is back. candidates.max_min does not abandon it."),
+    Knob("candidates.wave0_settle", 1, 0, 1, ROUND, "count",
+         "1: wave 0 ends once half of it is back and the best has stood still for 90 s (at the latest at "
+         "candidates.launch_back). 0: wave 0 waits for candidates.launch_back of it."),
     Knob("candidates.launch_back", 0.8, 0.1, 1.0, LIVE, "share",
          "A generation launches once this share of the previous wave is back."),
     Knob("candidates.mutate_frac", 0.3, 0.0, 1.0, LIVE, "share",
