@@ -61,6 +61,13 @@ from search.space import ACTIVITY_PARAMS, ASSEMBLY_PARAMS, FULL_RUN_PARAMS, GENO
 # a 5-rung jump would leave them.
 FILL_CUTOFF_S = 150.0        # Step C sends no fill this close to the pick (a GATK run takes about 100 s)
 LEAP_SHARE_MAX = 0.25        # centre jumps never take more of a climber's workers: at 0.5 the waves were the slowest
+
+
+def leap_share_max() -> float:
+    """The most of a climber's workers centre jumps may take: LEAP_SHARE_MAX, or climb.leap_share when it is set higher.
+    2026-10-18 rounds 10:42 and 11:54: single-setting jumps gained +3.75 on at most a quarter of the climbers' workers,
+    the grids at most +1.33 on the rest; the setting was raised to 0.5 to test more jumps."""
+    return max(LEAP_SHARE_MAX, float(tune("climb.leap_share")))
 LARGE_RUNGS = 30
 LARGE_STEPS = (1, 2, 3, 5)
 LINE_COARSE = 1               # one rung past the compass, once GA candidate updates have gone quiet
@@ -607,7 +614,7 @@ class Climber:
         else:
             self.leap_succ, self.leap_fail = 0, self.leap_fail + 1
         if self.leap_succ >= 3:
-            self.leap_share, self.leap_succ = min(LEAP_SHARE_MAX, 2.0 * self.leap_share), 0
+            self.leap_share, self.leap_succ = min(leap_share_max(), 2.0 * self.leap_share), 0
         elif self.leap_fail >= 2:
             self.leap_share, self.leap_fail = max(0.1, self.leap_share / 2.0), 0
         self._wave_leaps = self._wave_leap_wins = 0
