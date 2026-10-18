@@ -278,6 +278,8 @@ def train(track, rs, name):
             meta["kg_own_rule"] = 1
         if track == "kg" and ROUND_FEATS:
             meta["round_feats"] = 1
+        if track == "kg" and all(r["info"].get("kg_rd_entry") for r in rs):
+            meta["kg_rd_entry"] = min(int(r["info"]["kg_rd_entry"]) for r in rs)
         if kg_hc:
             meta["kg_hc"] = min(int(r["info"]["hc_evidence"]) for r in rs)
         if kg_hg:

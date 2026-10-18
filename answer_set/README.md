@@ -34,7 +34,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k040_20261017T1012) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k047_20261018T1106) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -245,6 +245,16 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   Release check: 19 live 1000G rounds 2026-10-16 07:06 to 10-17 08:18, held out from every model: vs k038 +0.0350
   per round, t 3.95, better 16 / worse 3; vs k030 +0.0646 (t 4.61); false records 228 -> 202. Builds run GATK
   (~45 s more feature time, median build ~4 min).
+- k047 (1000G, released 2026-10-18) = k040's recipe on 102 current-pattern rounds (78 + 24 through 10-17 14:18)
+  with a looser read-comparison entry for 1000G indels (features.KG_RD_ENTRY 2, meta kg_rd_entry, prepare
+  --kg-rd-entry; tables in cache/answer_set/k2/prepared_kghc_rd2). Found on k040's 18 live rounds: 28 of 36
+  "not a candidate" misses had Minos's edit in the read comparison (e.g. 5 of 30 reads) but the entry rule (>= 25%
+  of the cover, >= the strongest change within 10 bp) dropped them - Minos now puts inserted indels in fewer reads.
+  Rule 2: indels with >= 3 edited reads enter at >= 15% of the cover if >= that neighbour, or at >= 25% regardless.
+  On the 102 training rounds it adds 3.7 candidates per round, 1.74 of them real inserted mutations.
+  Release check: 15 live 1000G rounds after the training cut-off (2026-10-17 15:30 .. 10-18 09:30), built and
+  scored like the validator: vs k040 +0.0311 per round, t 2.42, better 10 / worse 3; vs k045 (same recipe, old
+  rule) +0.0255, t 3.28 - the gain is the entry rule; k045 vs k040 +0.0056 (more data alone). GATK fallback k038.
 
 ## Open work
 

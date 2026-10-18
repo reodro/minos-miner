@@ -208,6 +208,8 @@ def main():
                                                       "MINOS_PREPARED to keep these tables apart")
     ap.add_argument("--kg-hc", action="store_true", help="1000G rounds with the GATK evidence (hcrun.py); set "
                                                          "MINOS_PREPARED to keep these tables apart")
+    ap.add_argument("--kg-rd-entry", type=int, default=0, help="1000G read-comparison entry rule version "
+                                                                "(features.KG_RD_ENTRY); set MINOS_PREPARED")
     ap.add_argument("--hapgeno-version", type=int, default=0, help="genotyper version (hapgeno.VERSION if 0; 2 = "
                                                                    "repeat-aware windows); set MINOS_PREPARED")
     ap.add_argument("--window-labels", action="store_true", help="GIAB: also teach events of genotyper windows that "
@@ -223,6 +225,7 @@ def main():
     from answer_set.k2 import hcrun
     features.HC_EVIDENCE = hcrun.VERSION if args.hc else 0
     features.KG_HC = hcrun.VERSION if args.kg_hc else 0
+    features.KG_RD_ENTRY = args.kg_rd_entry
     for tag in sorted(args.tag or os.listdir(SETTINGS.rounds_dir)):
         if not args.redo and (PREPARED / f"{tag}.npz").exists():
             continue

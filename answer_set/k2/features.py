@@ -49,6 +49,11 @@ KG_HC = int(os.environ.get("MINOS_KG_HC", "0"))
 # the GATK run gets this long from the start of extraction (normally 35-90 s); past it the run is stopped and skipped,
 # and build.py uses the model's hc_fallback version (one trained without the GATK evidence)
 HC_BUDGET_S = 300
+# 1000G rounds: read-comparison-only entry rule version (meta kg_rd_entry; build.py sets it, prepare.py --kg-rd-entry).
+# 0: >= 2 edited reads, >= 25% of the cover, >= the strongest change within 10 bp (half of it for 1-bp indels).
+# 2 (2026-10-18): indels with >= 3 edited reads also enter at >= 15% of the cover if still >= that neighbour, or at
+#    >= 25% whatever the neighbour (k040's 18 live rounds: +1.7 real inserted indels per round, +2.2 noise)
+KG_RD_ENTRY = int(os.environ.get("MINOS_KG_RD_ENTRY", "0"))
 # 1000G rounds: read-comparison candidates judged per SITE for indels >= 2 bp (meta kg_site_rule; build.py sets it).
 # In tandem repeats Minos's inserted indel shows up in the edited reads at several lengths, so no single length reaches
 # 25% of the reads or is the strongest at its spot (2026-10-09, 26 new-pattern rounds: 0.9 / 0.7 / 0.5 inserted
@@ -501,6 +506,7 @@ def _extract(bam, region, workdir, threads, cand_vcf, reuse, chrom, a, b, hc_job
             j0, j1 = bisect.bisect_left(rd_pos, k[0] - 10), bisect.bisect_right(rd_pos, k[0] + len(k[1]) + 10)
             return max([rdiff[o][0] for o in rd_keys[j0:j1] if o != k] or [0])
         n_rd_only = 0
+        L_rd = lambda k_: abs(len(k_[1]) - len(k_[2]))      # noqa: E731
         site_keep = set()
         if KG_SITE_RULE and not mode_giab:
             by_pos = {}
@@ -521,6 +527,9 @@ def _extract(bam, region, workdir, threads, cand_vcf, reuse, chrom, a, b, hc_job
             need = RD_1BP_FACTOR * sib_max(k) if abs(len(k[1]) - len(k[2])) == 1 else sib_max(k)
             if k in site_keep and k not in cands and k not in own and a <= k[0] <= b:
                 pass                                    # a strong repeat site's best lengths (KG_SITE_RULE)
+            elif (KG_RD_ENTRY >= 2 and not mode_giab and L_rd(k) >= 1 and k not in cands and k not in own
+                    and a <= k[0] <= b and sup >= 3 and ((sup >= 0.15 * cov and sup >= need) or sup >= 0.25 * cov)):
+                pass                                    # the looser 1000G entry (KG_RD_ENTRY 2)
             elif (k in cands or k in own or not (a <= k[0] <= b) or sup < 2 or sup < 0.25 * cov or sup < need
                     or (mode_giab and not (dbed.contains(k[0]) and dbed.contains(k[0] + len(k[1]) - 1)))):
                 continue
@@ -752,4 +761,5 @@ def _extract(bam, region, workdir, threads, cand_vcf, reuse, chrom, a, b, hc_job
     info["kg_hapgeno"] = int(KG_HAPGENO) if (not mode_giab and rd_on and hg_window is not None) else 0
     info["hc_evidence"] = int(HC_EVIDENCE if mode_giab else KG_HC) if hc is not None else 0
     info["kg_site_rule"] = int(KG_SITE_RULE) if (not mode_giab and rd_on and "error" not in rd_info) else 0
+    info["kg_rd_entry"] = int(KG_RD_ENTRY) if (not mode_giab and rd_on and "error" not in rd_info) else 0
     return keys, X, info, donors, beds
