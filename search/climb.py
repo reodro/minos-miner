@@ -163,6 +163,8 @@ def is_one_rung_local_opt(ctx, centre: Config, score: float) -> bool:
     return True
 
 
+KICK_AFTER = 3              # dry after-peak jump waves before a kick (climb.after_peak)
+KICK_MIN_LEFT_MIN = 10.0    # no kick with less of the climb left
 SMALL_LADDER, LARGE_LADDER = 40, 150   # rungs: the three step plans of climb.big_steps
 
 
@@ -188,6 +190,10 @@ class Climber:
         self.turn = 0                                          # odd turns read-pass, unless that grid is already dead
         self.growth: Dict[str, Tuple[int, int]] = {}           # setting -> (direction, rungs) offered next time
         self.reach: Dict[str, Tuple[str, int]] = {}            # setting -> (phase, index) of its grid step (step_plan)
+        self.dry_jumps = 0                                     # after-peak jump waves in a row without a win
+        self.after_peak_wave = False                           # the running jumps wave is after the peak
+        self.kicking = False                                   # the running jumps wave is a kick (climb.after_peak)
+        self.kick_rng = random.Random(1000 + int(cid) if isinstance(cid, int) else 1000)
         self.flat: set = set()                                 # settings gridded without a gain since their own last one
         self.recent: List[float] = []                          # gain of each finished grid, oldest first
         self.rotation = 0
@@ -1108,6 +1114,28 @@ class Climber:
         self.batch_live = True
         self.ctx.say("climber %d it %d (%s): cube on %d axes", self.id, self.iteration, self.kind, len(live))
         return True
+    def kick_configs(self, n: int) -> List[Config]:
+        """Up to n configs 4-6 settings from the centre, each moved 3-9 rungs either way (published ranges only)."""
+        ctx = self.ctx
+        names = [x for x in self.all_names if ctx.ladders.movable(x)]
+        if len(names) < 4:
+            return []
+        out, seen = [], set()
+        for _ in range(10 * n):
+            if len(out) >= n:
+                break
+            p = dict(self.centre.params)
+            for name in self.kick_rng.sample(names, min(len(names), self.kick_rng.randint(4, 6))):
+                v = ctx.ladders.shift(name, p.get(name), self.kick_rng.randint(3, 9) * self.kick_rng.choice((1, -1)))
+                if v is not None:
+                    p[name] = v
+            c = ctx.space._assemble(p)
+            if c is None or c.key in seen or not ctx.fresh(c) or held_by_climber(ctx, c, me=self) is not None:
+                continue
+            seen.add(c.key)
+            out.append(c)
+        return out
+
     def begin_jumps(self, until: float) -> bool:
         """Score every untried one-rung neighbor and every untried centre jump. That wave is the peak certificate.
 
@@ -1126,6 +1154,18 @@ class Climber:
         self.drop_failed()
         heads += self.plan_leaps(self.centre, None, {c.key for c in heads})
         running = [f for f in self.leap_futs if not f.done()]
+        mode = "certify"
+        self.after_peak_wave = False
+        if not heads and not running and int(tune("climb.after_peak")) and until - ctx.clock() > 90.0:
+            if self.dry_jumps >= KICK_AFTER and until - ctx.clock() >= 60.0 * KICK_MIN_LEFT_MIN:
+                heads = self.kick_configs(int(tune("climb.kick_configs")))
+                self.kicking = bool(heads)
+                mode = "kick" if heads else mode
+            if not heads:
+                heads = self.plan_leaps(self.centre, int(tune("climb.after_peak_jumps")), set())
+                self.kicking = False
+                mode = "after-peak" if heads else mode
+            self.after_peak_wave = mode == "after-peak"
         if not heads and not running:
             n = len(one_rung_neighbors(ctx, self.centre))
             self._peaked()
@@ -1143,7 +1183,13 @@ class Climber:
         self._wave_t0 = ctx.clock()
         self._wave_n = 0
         self._wave_id += 1
-        if heads:
+        if heads and mode == "kick":
+            ctx.say("climber %d: kick after %d dry jump waves: %d configs 4-6 settings from the peak %.4f",
+                    self.id, self.dry_jumps, len(heads), self.score)
+        elif heads and mode == "after-peak":
+            ctx.say("climber %d: after the peak %.4f, %d centre jumps (dry waves %d)", self.id, self.score, len(heads),
+                    self.dry_jumps)
+        elif heads:
             ctx.say("climber %d: certifying 1-rung neighborhood, %d untried, %d centre jumps",
                     self.id, n_rung, len(heads) - n_rung)
         else:
@@ -1205,9 +1251,23 @@ class Climber:
                     self.note_momentum(self.centre, best[0])
                 self.growth.clear()
                 self.reach.clear()
+                self.dry_jumps, self.kicking, self.after_peak_wave = 0, False, False
                 self.move(best[0], best[1], "jump")
                 self.flat.clear()
+            elif self.kicking:
+                self.kicking, self.dry_jumps = False, 0
+                if best is not None:
+                    ctx.say("climber %d: the kick lands at %.4f (its peak was %.4f); it climbs again from there",
+                            self.id, best[1], self.score)
+                    self.growth.clear()
+                    self.reach.clear()
+                    self.flat.clear()
+                    self.move(best[0], best[1], "kick")
+                else:
+                    self.begin_jumps(self.climb_until)
             elif self.jumps_enabled and float(tune("climb.leap_share")) > 0:
+                if self.after_peak_wave:
+                    self.dry_jumps += 1
                 self.begin_jumps(self.climb_until)            # the rest of the certificate, or the peak
             elif is_one_rung_local_opt(ctx, self.centre, self.score):
                 n = len(one_rung_neighbors(ctx, self.centre))

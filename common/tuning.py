@@ -193,6 +193,11 @@ KNOBS_LIST: List[Knob] = [
     Knob("climb.ga_quiet_min", 4.0, 1.0, 20.0, LIVE, "min",
          "After a GA child or a candidate moves a climber, the climbers send nothing for this many "
          "minutes (scaled) and the fleet breeds. Then one rung past the compass walks to the peak."),
+    Knob("climb.after_peak", 1, 0, 1, ROUND, "count",
+         "1: a climber that named a 1-rung peak keeps sending centre jumps (no grid) instead of stopping; after three "
+         "jump waves without a win (and 10+ minutes left) it kicks 4-6 settings by 3-9 rungs and climbs again. 0: it stops."),
+    Knob("climb.after_peak_jumps", 24, 4, 200, ROUND, "count", "Centre jumps per wave of a peaked climber."),
+    Knob("climb.kick_configs", 12, 2, 100, ROUND, "count", "Configs scored for one kick; the climber moves to the best."),
     Knob("climb.big_steps", 1, 0, 1, ROUND, "count",
          "1: each grid setting starts at a step that fits its ladder (<=40 rungs: 1; 41-150: 3; >150: 3), widens "
          "after an iteration that did not move it (to 5 / 9 / climb.big_step_large_max) and then narrows back to 1. "
