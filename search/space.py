@@ -39,40 +39,17 @@ PINNED = {"gatk": {"emit_ref_confidence": "NONE",
 # padding 0-4 reached the top 200 of 7,067 true-scored (best 85.67 against 85.84 at padding 13).
 FLOORS = {"gatk": {"assembly_region_padding": 5}}
 
-# Live /scoring/parameter-ranges is tighter than the validator GATK template (templates.tool_params).
-# Local GATK scores the template bounds. Family A (PCR NONE/CONSERVATIVE × large assembly) peaked ~81.1
-# on 20261010T044200Z against king 82.78. These are the remaining unclimbed values: template-legal,
-# outside that published box. Adaptive-pruning floats stay PINNED: HaplotypeCaller does not read them
-# without a switch, and that switch is not a published parameter.
-VALIDATOR_EDGES = {
-    "gatk": {
-        "min_pruning": {"min": 1},
-        "min_dangling_branch_length": {"min": 1},
-        "active_probability_threshold": {"min": 0.0001},
-        "max_num_haplotypes_in_population": {"max": 512},
-        "contamination_fraction_to_filter": {"max": 0.5},
-        "standard_min_confidence_threshold_for_calling": {"min": 0.0},
-        "max_assembly_region_size": {"max": 1000},
-        "max_reads_per_alignment_start": {"min": 0},
-        "sample_ploidy": {"min": 1, "max": 10, "allowed": ()},
-        "dont_use_soft_clipped_bases": {"allowed": ()},
-    }
-}
+# Live /scoring/parameter-ranges is tighter than the validator GATK template (templates.tool_params). Until
+# 2026-10-18 the space opened the template bounds here ("validator edges": min_pruning 1, max_reads 0-24, haplotypes
+# 129-512, ...). The platform clamps a submission to the published ranges and the validators score the clamped
+# config: our rounds 23:54 and 01:06 scored 90.6632 and 90.0564 officially, exactly what the clamped configs score
+# with stock GATK (ours unclamped: 90.9726 and 90.9502). 10 of the 11 final picks of 2026-10-17 used such values.
+# So nothing is opened: every config scored is the config the validators run.
+VALIDATOR_EDGES = {"gatk": {}}
 
 # Sparse rungs outside the published box. Dense ladders stay on the API range so certify does not
 # grow by hundreds of neighbors (haplotypes 129–512, contamination 0.05–0.5).
-EDGE_RUNGS = {
-    "min_pruning": (1,),
-    "min_dangling_branch_length": (1,),
-    "active_probability_threshold": (0.0001, 0.0002, 0.0005),
-    "max_num_haplotypes_in_population": (160, 192, 256, 384, 512),
-    "contamination_fraction_to_filter": (0.08, 0.10, 0.15, 0.25, 0.5),
-    "standard_min_confidence_threshold_for_calling": (0.0, 10.0, 20.0),
-    "max_assembly_region_size": (800, 900, 1000),
-    "max_reads_per_alignment_start": (0,),
-    "sample_ploidy": (1, 3),
-    "dont_use_soft_clipped_bases": (True,),
-}
+EDGE_RUNGS: dict = {}     # no rungs outside the published box (VALIDATOR_EDGES above)
 
 # Assemble and seed these; leave them out of names so setting-distance stays on the published axes.
 SEED_ONLY = frozenset({"sample_ploidy", "dont_use_soft_clipped_bases"})

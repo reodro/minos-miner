@@ -213,6 +213,8 @@ class CandidatesTest(unittest.TestCase):
         front = pareto_layers(pts, 3)
         self.assertEqual(sorted(p.score for p in front), [85, 90, 91])      # 80 is dominated by 91
 
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
+
     def test_left_the_rim_is_the_edge_family_not_a_pcr_flip_on_this_shelf(self):
         space = Space(ranges())
         ladders = Ladders(space)
@@ -235,6 +237,8 @@ class CandidatesTest(unittest.TestCase):
         self.assertFalse(left_the_rim(unused, shelf))
         self.assertFalse(left_the_rim(shelf, shelf))
 
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
+
     def test_edge_family_seeds_sit_outside_the_published_api_box(self):
         space = Space(ranges())
         self.assertFalse(in_indel_family(space._assemble(dict(OFFICIAL_SEED))))
@@ -243,6 +247,8 @@ class CandidatesTest(unittest.TestCase):
             c = space._assemble(dict(p))
             self.assertIsNotNone(c)
             self.assertTrue(in_indel_family(c))
+
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
 
     def test_edge_family_seeds_are_skipped_on_the_round_they_come_from(self):
         from search.candidates import REFERENCE_ROUND
@@ -551,6 +557,8 @@ class ClimbTest(unittest.TestCase):
         self.assertEqual(won(short, 2, 2), (1, 3))
         self.assertEqual(won(short, 2, 3), (1, 4))
 
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
+
     def test_a_far_seat_leaves_its_box_only_for_a_score_above_the_other_seats(self):
         """044200Z islands, 2026-10-16: island 1's far seat found 82.5627 with min_pruning 2 (inside the API box)
         while the other seat was at 82.4066; the lock kept it on 82.3514."""
@@ -842,6 +850,8 @@ class ClimbTest(unittest.TestCase):
         self.assertEqual(far.centre.key, ga.key)
         self.assertEqual(high.centre.key, high.start.key)
 
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
+
     def test_a_far_family_seat_does_not_take_this_shelf_ga(self):
         ctx, high = self.climber()
         high.id = 0
@@ -904,6 +914,8 @@ class ClimbTest(unittest.TestCase):
         self.assertTrue(in_indel_family(far.centre))
         self.assertFalse(in_indel_family(high.centre))
 
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
+
     def test_step_c_climbs_the_edge_family_only_when_it_is_within_reach(self):
         from search.climb import FAMILY_REACH, family_in_reach
         ctx, cl = self.climber()
@@ -961,6 +973,8 @@ class ClimbTest(unittest.TestCase):
         pool[0] = Point(centre, 50.1, 0.9, 10.0)
         moved_best = asyncio.run(step.far_parents(2))
         self.assertIsNot(moved_best, first)
+
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
 
     def test_the_last_opening_seat_is_the_best_far_config(self):
         ctx, cl = self.climber()
@@ -1230,6 +1244,8 @@ class ClimbTest(unittest.TestCase):
         self.assertEqual(len(futs), 1)
         self.assertEqual(ctx.sent[-1][0].key, a.key)
         self.assertTrue(held_by_ga(ctx, b))
+
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
 
     def test_an_empty_seat_takes_the_best_scored_config_that_is_far(self):
         ctx, cl = self.climber()

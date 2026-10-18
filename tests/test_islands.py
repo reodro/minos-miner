@@ -729,6 +729,8 @@ class RelinkTest(unittest.TestCase):
     def moved(self, c):
         return [n for n in self.space.names if c.params.get(n) != self.peak.params.get(n)]
 
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
+
     def test_subsets_of_the_differences_toward_a_better_config(self):
         ctx = JumpCtx(self.space, lambda c: 80.0, history=[(self.better, 82.6664)])
         got = leaps.relink(ctx, self.peak, 82.6298, lambda c: False, random.Random(0))
@@ -740,10 +742,14 @@ class RelinkTest(unittest.TestCase):
             self.assertTrue(set(self.moved(c)) <= diff)
             self.assertTrue(all(c.params[n] == self.better.params[n] for n in self.moved(c)))
 
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
+
     def test_a_target_far_below_or_too_close_is_not_used(self):
         near = self.space._assemble({**self.peak.params, MMQ: 48})
         ctx = JumpCtx(self.space, lambda c: 80.0, history=[(self.better, 82.40), (near, 82.70)])
         self.assertEqual(leaps.relink(ctx, self.peak, 82.6298, lambda c: False, random.Random(0)), [])
+
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
 
     def test_the_other_islands_best_is_a_target(self):
         ctx = JumpCtx(self.space, lambda c: 80.0)

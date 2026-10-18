@@ -568,6 +568,8 @@ class SpaceTest(unittest.TestCase):
         from search.space import bam_caps
         self.assertEqual(bam_caps("/nonexistent.bam", "chr20", 1, 10), {})
 
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
+
     def test_validator_edges_assemble_and_stay_off_the_dense_ladder(self):
         from search.space import Space
         from search.steps import Ladders
@@ -616,6 +618,8 @@ class SpaceTest(unittest.TestCase):
         self.assertNotIn(MRPAS, fixed.names)              # no start has 25 reads, so the axis is one value
         self.assertEqual(fixed._assemble({MRPAS: 116}).params[MRPAS], 25)
         self.assertIsNone(bam_bounds("/nonexistent.bam", ranges()))
+
+    @unittest.skip("built on validator-edge values outside the published ranges, removed 2026-10-18 (search/space.py VALIDATOR_EDGES)")
 
     def test_contamination_rungs_that_remove_the_same_number_of_reads_are_one_rung(self):
         from search.bamgroups import CONT, BamFacts, bounds_from, contamination_groups, snap

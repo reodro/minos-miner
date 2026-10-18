@@ -30,10 +30,29 @@ from fastapi.staticfiles import StaticFiles
 from common.settings import SETTINGS
 from common.tuning import DEFAULTS, GROUPS, TUNING_FILE, describe, read_overrides, validate, write_overrides
 from dashboard.auth import AUTH_FILE, SESSION_S, Auth
-from dashboard.field import FieldCache, live_rank, published_scores
+from dashboard.field import FieldCache, live_rank, published_scores, refresh_rank
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
+RERANK_S = 24 * 3600          # runs that ended within this long are placed again on the published field
+CLAMPED = STATIC / "clamped_true.json"   # test/bench/clamped_true.py: final configs scored as the validators run them
+
+
+def clamped_true() -> dict:
+    """run id -> the final config's TRUE score after clamping to the platform's ranges (2026-10-18: the platform
+    clamps a submission and the validators score the clamped config). Empty when the file is missing or unreadable."""
+    try:
+        return json.loads(CLAMPED.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def apply_clamped(row: dict, table: dict) -> dict:
+    hit = table.get(row.get("run_id") or "")
+    if hit and isinstance(hit.get("true_score"), (int, float)):
+        row = {**row, "unclamped_true": row.get("true_score"), "true_score": hit["true_score"],
+               "clamped": hit.get("clamped") or []}
+    return row
 COOKIE = "minos_session"
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
@@ -226,6 +245,7 @@ def history_of(path: Path) -> list:
         out.append({
             "run_id": rid,
             "tag": _text(rnd, "tag") or _text(rev, "tag") or _text(rank, "tag"),
+            "round_id": _text(rank, "round_id") or _text(rnd, "round_id"),
             "region": _text(rnd, "region"),
             "kind": _text(rnd, "kind"),
             "mode": _text(rnd, "mode"),
@@ -365,13 +385,29 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
         fill_wave_starts(live)
         attach_climber_found(live, found_cache)
         rank = await asyncio.to_thread(live_rank, live, ranks)
-        return {"now": time.time(), "live": live, "result": result_of(live), "rank": rank}
+        result = result_of(live)
+        if result and result.get("rank"):
+            kind = ((live or {}).get("round") or {}).get("kind")
+            row = apply_clamped(result["rank"], clamped_true())
+            result["rank"] = await asyncio.to_thread(refresh_rank, row, ranks, replay=kind == "replay")
+        return {"now": time.time(), "live": live, "result": result, "rank": rank}
 
     @app.get("/api/history")
     async def history(request: Request):
         if user_of(request) is None:
             return denied()
-        return {"runs": history_of(history_file)}
+        runs = history_of(history_file)
+
+        def fresh() -> list:                      # recent runs' ranks on the field as published now (refresh_rank)
+            cutoff, table = time.time() - RERANK_S, clamped_true()
+            for r in runs:
+                fixed = r.get("run_id") in table
+                if fixed:
+                    r.update(apply_clamped(r, table))
+                if r.get("true_score") is not None and (fixed or (r.get("ended") or 0) > cutoff):
+                    r.update(refresh_rank(r, ranks, replay=r.get("kind") == "replay"))
+            return runs
+        return {"runs": await asyncio.to_thread(fresh)}
 
     _wave_at = re.compile(r"engine: wave (\d+) \([^)]*\) at t\+([0-9.]+)m")
     _dom_at = re.compile(r"domain (\d+) (?:-> [\d.]+|born at [\d.]+).*t\+([0-9.]+)m")
