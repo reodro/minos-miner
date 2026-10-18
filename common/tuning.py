@@ -233,7 +233,10 @@ KNOBS_LIST: List[Knob] = [
     Knob("main.stop_before_deadline_s", 60.0, 10.0, 900.0, ROUND, "s", "The search stops this long before the deadline."),
     Knob("answer_set.n", 548, 50, 2000, ROUND, "count",
          "How many targets the next round's answer set writes. The local score divides false calls by this. "
-         "A change made during a round waits for the next round."),
+         "A change made during a round waits for the next round. Used when main.n_recent_rounds gives no N."),
+    Knob("main.n_recent_rounds", 10, 0, 100, ROUND, "count",
+         "N for a round the platform gives no N for: the median target count of this many recent rounds whose truth "
+         "was out when the round started (main/n_estimate.py). 0: the fixed answer_set.n (before 2026-10-18)."),
 ]
 KNOBS: Dict[str, Knob] = {k.name: k for k in KNOBS_LIST}
 assert len(KNOBS) == len(KNOBS_LIST) and all(k.group in GROUPS for k in KNOBS_LIST)

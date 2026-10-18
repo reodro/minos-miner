@@ -124,6 +124,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     features.KG_HAPGENO = int(tracks.meta("kg", kname).get("kg_hapgeno", 0)) if kname else 0
     features.KG_SITE_RULE = int(tracks.meta("kg", kname).get("kg_site_rule", 0)) if kname else 0
     features.KG_HC = int(tracks.meta("kg", kname).get("kg_hc", 0)) if kname else 0
+    features.KG_RD_ENTRY = int(tracks.meta("kg", kname).get("kg_rd_entry", 0)) if kname else 0
     keys, X, info, donors, beds = extract(bam, region, out / "work", threads)
     t_feat = time.time() - t0
     track = tracks.track_of_info(info)
