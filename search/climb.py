@@ -2425,6 +2425,8 @@ async def open_with_ga(ctx, live: List[Climber], until: float) -> None:
         return
     if free_workers(ctx) is None:
         return
+    if float(tune("climb.ga_open_min")) <= 0:          # off (the default): Step B starts with the grids
+        return
     cap_s = 60 * float(tune("climb.ga_open_min"))
     T = getattr(ctx, "T", None)
     if callable(T):

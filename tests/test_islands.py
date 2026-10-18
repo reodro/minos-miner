@@ -1120,3 +1120,17 @@ class MoveAtOnceTest(unittest.TestCase):
         self.assertTrue(cl.early_gain())
         ctx.best = lambda: (other, 80.002)
         self.assertFalse(cl.early_gain())
+
+
+class GaOpeningOffTest(unittest.TestCase):
+    """climb.ga_open_min 0 (the default since 2026-10-18): Step B starts with the grids, no whole-fleet GA first."""
+
+    def test_no_ga_opening_when_it_is_off(self):
+        import asyncio
+        from search.climb import open_with_ga
+        space = Space(ranges())
+        ctx = JumpCtx(space, lambda c: 80.0)
+        cl = Climber(ctx, 0, space._assemble({MMQ: 40}), 82.0)
+        with unittest.mock.patch("search.climb.free_workers", return_value=10):
+            asyncio.run(open_with_ga(ctx, [cl], until=1e9))
+        self.assertFalse(getattr(ctx, "ga_opening", False))

@@ -190,9 +190,10 @@ KNOBS_LIST: List[Knob] = [
     Knob("climb.ga_quiet_min", 4.0, 1.0, 20.0, LIVE, "min",
          "After a GA child or a candidate moves a climber, the climbers send nothing for this many "
          "minutes (scaled) and the fleet breeds. Then one rung past the compass walks to the peak."),
-    Knob("climb.ga_open_min", 8.0, 1.0, 20.0, ROUND, "min",
-         "At the start of Step B the whole fleet breeds. Grids start once a free GA score beats the lowest "
-         "climber, or when this many minutes (scaled) have passed. One wave: usually 2-4 minutes, 6-8 on a long region."),
+    Knob("climb.ga_open_min", 0.0, 0.0, 20.0, ROUND, "min",
+         "At the start of Step B the whole fleet breeds before any grid. 0 (the default since 2026-10-18): no such "
+         "step, the grids start at once. Over 33 openings of 2026-10-17/18 it gained +0.062 in 2.4 min on average "
+         "against +0.073 for the grids in the same time after it, and nothing at all in 16 of them."),
     Knob("far.coarse", 25, 3, 500, LIVE, "count",
          "Step C: rungs tried beyond the nearest tried value on each side of a peak, at least (more when the fleet has room)."),
     Knob("far.second_margin", 0.1, 0.0, 2.0, LIVE, "score",
