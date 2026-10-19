@@ -7,6 +7,7 @@ so it can never slow down or break mining; main applies settings itself (common/
   POST /api/logout
   GET  /api/status       main's live.json as it is, the server's clock, and the run's review/rank rows when they exist
   GET  /api/history      one row per finished run from rounds.jsonl (round, review, rank), newest first
+  GET  /api/points       every config scored this round, projected to 3D (dashboard/points.py)
   GET  /api/settings     every setting's metadata and default, the file's overrides and what main would reject
   PUT  /api/settings     {"set": {name: value}, "reset": [name]} -> checked, then the file is replaced atomically
 
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -294,6 +296,7 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
     ranks = field_cache if field_cache is not None else FieldCache(published_scores)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    app.add_middleware(GZipMiddleware, minimum_size=50_000)      # /api/points carries every scored config
     write_lock = asyncio.Lock()
 
     def addr(request: Request) -> str:
@@ -391,6 +394,20 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
             row = apply_clamped(result["rank"], clamped_true())
             result["rank"] = await asyncio.to_thread(refresh_rank, row, ranks, replay=kind == "replay")
         return {"now": time.time(), "live": live, "result": result, "rank": rank}
+
+    @app.get("/api/points")
+    async def all_points(request: Request):
+        if user_of(request) is None:
+            return denied()
+        try:
+            live = json.loads(status_file.read_text())
+        except (OSError, ValueError):
+            live = None
+        tag = ((live or {}).get("round") or {}).get("tag")
+        if not tag:
+            return {"round": None, "n": 0}
+        from dashboard.points import points
+        return await asyncio.to_thread(points, tag)
 
     @app.get("/api/history")
     async def history(request: Request):

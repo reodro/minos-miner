@@ -6,9 +6,9 @@
 <title>Minos dashboard</title>
 <script src="/static/theme.js?v=17"></script>
 <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
-<link rel="stylesheet" href="/static/app.css?v=51">
+<link rel="stylesheet" href="/static/app.css?v=57">
 <script src="/static/vendor/uPlot.iife.min.js" defer></script>
-<script src="/static/app.js?v=117" defer></script>
+<script src="/static/app.js?v=127" defer></script>
 </head>
 <body>
 <header class="top">
@@ -38,8 +38,16 @@
       <span><i class="stepb"></i>Step B</span>
       <span><i class="live"></i>climbing</span><span><i class="final"></i>at its peak</span>
       <span><i class="stopped"></i>stopped</span><span><i class="landed"></i>Step C short climb</span>
-      <span><i class="retired"></i>joined another</span><span><i class="grid"></i>climber update</span><span><i class="ga"></i>GA child</span>
-      <span><i class="find"></i>a Step C find</span><span><i class="jump"></i>a random jump</span>
+      <span><i class="retired"></i>joined another</span><span><i class="grid"></i>grid update</span><span><i class="jump"></i>centre jump</span>
+      <span><i class="ga"></i>GA child</span><span><i class="rf"></i>RF-UCB</span><span><i class="returned"></i>own run back late (older rounds)</span><span><i class="find"></i>a Step C find</span>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-islands">
+    <h2 id="h-islands">Islands <span class="sub" id="islands-sub"></span></h2>
+    <div class="islands-wrap">
+      <div class="space3d" id="space3d"></div>
+      <div class="rows" id="island-dist"></div>
     </div>
   </section>
 
@@ -80,6 +88,13 @@
     <div class="feed" id="feed"></div>
   </section>
 </main>
+
+<div class="drawer" id="drawer" hidden>
+  <div class="drawer-box" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+    <div class="drawer-head"><div class="drawer-title" id="drawer-title"></div><button class="btn" id="drawer-close" type="button">Close</button></div>
+    <div class="parts" id="drawer-parts"></div>
+  </div>
+</div>
 
 <main id="view-history" hidden>
   <div class="settings-bar" role="toolbar" aria-label="History actions">

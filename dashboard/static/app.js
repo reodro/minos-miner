@@ -26,7 +26,7 @@ function h(tag, props, ...kids) {
   for (const [k, v] of Object.entries(props || {})) {
     if (v == null || v === false) continue;
     if (k === "class") el.className = v;
-    else if (k === "style") Object.assign(el.style, v);
+    else if (k === "style") for (const [sk, sv] of Object.entries(v)) { if (sk.startsWith("--")) el.style.setProperty(sk, sv); else el.style[sk] = sv; }
     else if (k === "text") el.textContent = v;
     else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else el.setAttribute(k, v === true ? "" : v);
@@ -129,6 +129,9 @@ $("theme").addEventListener("click", () => {
 });
 darkQuery.addEventListener("change", themeChanged);
 showThemeButton();
+$("drawer-close").addEventListener("click", closeDetail);
+$("drawer").addEventListener("click", (e) => { if (e.target === $("drawer")) closeDetail(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && detail) closeDetail(); });
 $("logout").addEventListener("click", async () => {
   await fetch("/api/logout", {method: "POST", headers: {"X-Minos": "1"}}).catch(() => {});
   location.replace("/login");
@@ -190,7 +193,9 @@ function render() {
   renderResult(lastResult, finished);
   renderSchedule(E);
   renderLineage(E);
+  renderIslands(E);
   renderClimbers(E, finished, X);
+  renderDetail(E, finished);
   renderStepB(E, X);
   renderStepC(E);
   renderStepA(E, R);
@@ -437,11 +442,12 @@ function renderLineage(E) {
     r.append(s("title", {}, `Climber ${c.id}: ${fix(c.opened)} → ${fix(c.best)}, ${STATUS_TEXT[c.status] || c.status}; ` +
       `from ${c.origin} at ${mins(c.born_s)}; ${c.iterations} grids`));
     svg.append(r);
-    for (const [t, sc, why] of c.history || []) {           // GA children and the climber's own updates are different colors
-      const kind = why === "ga" ? "ga" : why === "jump" ? "jump" : why.startsWith("C") ? "c"
+    for (const [t, sc, why, part] of c.history || []) {     // each update in the colour of the part that found it
+      const kind = why.startsWith("C") ? "c" : part && part !== "other" ? part
+        : why === "ga" ? "ga" : why === "jump" ? "jump" : why === "returned" ? "returned"
         : why === "view" || why === "met" || why.endsWith("grid") || why.endsWith("line") ? "grid" : "";
-      const m = s("circle", {class: kind ? `move ${kind}` : "move", cx: x(t), cy: y(i), r: kind === "grid" ? 2.5 : 3.5});
-      m.append(s("title", {}, `${mins(t)}: ${fix(sc)} (${why})`));
+      const m = s("circle", {class: kind ? `move ${kind}` : "move", cx: x(t), cy: y(i), r: 3.5});
+      m.append(s("title", {}, `${mins(t)}: ${fix(sc)} · ${kind === "c" ? "Step C" : kind === "returned" ? "own run back after its wave (grid or jump, not recorded)" : PART_NAME[kind] || why} (${why})`));
       svg.append(m);
     }
     svg.append(s("text", {x: 4, y: y(i) + 4}, `C${c.id}`));
@@ -554,12 +560,32 @@ function renderClimbers(E, finished, X) {
       ? "main points first, genotyping rides along; PairHMM and the cheap list run on the centre only after those points are out; the GA is last"
       : "a free worker takes the next unsent value; the GA runs only on workers those updates leave free";
   if (!main.length) { box.replaceChildren(h("div", {class: "empty", text: (E.phase || "").startsWith("A") ? "Step A is still running." : "No climber."})); return; }
-  box.replaceChildren(...main.map((c) => {
+  const groups = new Map();
+  for (const c of main) {
+    const i = c.island == null ? 0 : c.island;
+    if (!groups.has(i)) groups.set(i, []);
+    groups.get(i).push(c);
+  }
+  const isl = islandRows(E);
+  box.replaceChildren(...[...groups.keys()].sort((a, b) => a - b).map((i) => {
+    const row = isl.find((r) => r.island === i) || {};
+    return h("div", {class: "island-group", style: {"--isl": islandColor(i)}},
+      h("div", {class: "island-head"}, h("i", {class: "dot"}), h("b", {text: `Island ${i}`}),
+        h("span", {class: "muted num", text: `${int(row.capacity)} workers · best ${fix(row.best)} · ${groups.get(i).length} climber${groups.get(i).length === 1 ? "" : "s"}`})),
+      h("div", {class: "cards"}, groups.get(i).map((c) => climberCard(c, finished, X, E))));
+  }));
+}
+
+function climberCard(c, finished, X, E) {
+  {
     const w = c.wave;
     const growth = Object.entries(c.growth || {});
     const best = c.found != null ? c.found : c.best;
-    return h("div", {class: `card ${climberClass(c)}`},
-      h("div", {class: "head"}, h("b", {text: `Climber ${c.id}`}),
+    const i = c.island == null ? 0 : c.island;
+    return h("div", {class: `card clickable ${climberClass(c)}`, role: "button", tabindex: "0",
+        style: {borderTopColor: islandColor(i)}, title: "Open this climber's parts",
+        onclick: () => openDetail(i, c.id), onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openDetail(i, c.id); } }},
+      h("div", {class: "head"}, h("span", {class: "isl-tag", style: {background: islandColor(i)}, text: `I${i}`}), h("b", {text: `Climber ${c.id}`}),
         chip(finished && c.status === "climbing" ? "stopped" : STATUS_TEXT[c.status] || c.status, c.status === "climbing" && !finished ? "climbing" : c.status === "peak" ? "final" : "")),
       h("div", {class: "score-pair"},
         h("div", {},
@@ -581,8 +607,456 @@ function renderClimbers(E, finished, X) {
       ]),
       growth.length ? h("div", {class: "names"}, h("span", {class: "label", text: "growing steps "}),
         growth.map(([n, k]) => `${n} ${k > 0 ? "+" : ""}${k}`).join(" · ")) : null,
-      h("div", {class: "origin", text: `From ${c.origin}.`}));
-  }));
+      partsLine(c),
+      coreShare(c, E),
+      h("div", {class: "origin", text: `From ${c.origin}. Click for grid, centre jumps, GA and RF-UCB.`}));
+  }
+}
+
+// The share of the island's workers each part holds now: this climber's grid and jumps, the island's GA and RF-UCB.
+function coreShare(c, E) {
+  const i = c.island == null ? 0 : c.island;
+  const row = islandRows(E).find((r) => r.island === i) || {};
+  const cap = row.capacity || E.capacity || 0, P = c.parts || {}, sp = (row.sources || {}).split || {};
+  if (!cap || !c.parts) return null;
+  const vals = [["grid", (P.grid || {}).inflight || 0], ["jump", (P.jump || {}).inflight || 0], ["ga", sp.ga || 0], ["rf", sp.rf || 0]];
+  return h("div", {class: "split"},
+    h("div", {class: "best-label", text: "cores now (share of the island)"}),
+    h("div", {class: "stack"}, vals.map(([k, v]) => h("span", {class: `seg ${k}`, style: {width: `${pct(v, cap)}%`}, title: `${PART_NAME[k]} ${int(v)}`}))),
+    h("div", {class: "core-share"}, vals.map(([k, v]) => h("span", {class: `part-chip ${k}`},
+      h("b", {text: PART_SHORT[k]}), ` ${pct(v, cap).toFixed(0)}%`, k === "ga" || k === "rf" ? h("span", {class: "muted", text: " isl"}) : null))));
+}
+
+function partsLine(c) {
+  const P = c.parts;
+  if (!P) return null;
+  return h("div", {class: "parts-line"},
+    ["grid", "jump", "ga", "rf"].map((k) => h("span", {class: `part-chip ${k}`, title: PART_NAME[k]},
+      h("b", {text: PART_SHORT[k]}), ` ${P[k] && P[k].inflight != null ? int(P[k].inflight) + " live · " : ""}${int(P[k] ? P[k].moves : 0)} moves`)));
+}
+
+// ---- islands: 3D view, distances, and the climber detail ------------------------------------------------------------
+const PART_NAME = {grid: "Grid", jump: "Centre jump", ga: "GA", rf: "RF-UCB"};
+const PART_SHORT = {grid: "GRID", jump: "JUMP", ga: "GA", rf: "RF"};
+const ISLAND_TOKENS = ["--accent", "--merge", "--final", "--bad", "--open", "--top-muted"];   // apart from the part colours
+function islandColor(i) { return css(ISLAND_TOKENS[i % ISLAND_TOKENS.length]) || "#888"; }
+
+// GA and RF-UCB runs are tagged G and R on every island, and their configs share batches: the executor's cores per
+// tag, split between the islands by their configs in flight, is what each island's GA and RF-UCB really hold.
+function realCores(rows, tag, key) {
+  const X = (last && last.executor) || {}, cores = (X.cores || {})[tag];
+  if (cores == null) return null;
+  const n = rows.map((r) => (((r.sources || {}).split || {})[key]) || 0), tot = n.reduce((a, b) => a + b, 0);
+  return rows.map((r, i) => (tot ? Math.round((cores * n[i]) / tot) : 0));
+}
+function withRealCores(rows) {
+  const ga = realCores(rows, "G", "ga"), rf = realCores(rows, "R", "rf");
+  return rows.map((r, i) => {
+    const sp = (r.sources || {}).split;
+    if (!sp || (ga == null && rf == null)) return r;
+    return {...r, sources: {...r.sources, split: {...sp, ga: ga == null ? sp.ga : ga[i], rf: rf == null ? sp.rf : rf[i]}}};
+  });
+}
+
+function islandRows(E) {
+  if (!E) return [];
+  if (Array.isArray(E.islands) && E.islands.length) return withRealCores(E.islands);
+  return [{island: 0, capacity: E.capacity, best: E.best, phase: E.phase, best_vec: E.best_vec,
+           sources: E.sources, cloud: E.cloud || [], climbers: climbers(E).length}];
+}
+
+// Principal axes of the encoded configs, recomputed at most every 15 s so the view does not spin with each poll.
+let pcaBasis = null, pcaAt = 0, pcaDim = 0;
+function pcaProject(vectors) {
+  const V = vectors.filter((v) => Array.isArray(v) && v.length);
+  if (!V.length) return null;
+  const d = V[0].length;
+  const mean = new Array(d).fill(0);
+  for (const v of V) for (let j = 0; j < d; j++) mean[j] += v[j] / V.length;
+  if (!pcaBasis || pcaDim !== d || Date.now() - pcaAt > 15000) {
+    const C = Array.from({length: d}, () => new Array(d).fill(0));
+    for (const v of V) for (let a = 0; a < d; a++) { const x = v[a] - mean[a]; for (let b = 0; b < d; b++) C[a][b] += x * (v[b] - mean[b]); }
+    const basis = [];
+    for (let k = 0; k < 3; k++) {
+      let u = Array.from({length: d}, (_, j) => Math.sin(j * 1.7 + k * 3.1) + 1.1);
+      for (let it = 0; it < 80; it++) {
+        const w = C.map((row) => row.reduce((acc, x, j) => acc + x * u[j], 0));
+        for (const b of basis) { const dot = w.reduce((acc, x, j) => acc + x * b[j], 0); for (let j = 0; j < d; j++) w[j] -= dot * b[j]; }
+        const n = Math.hypot(...w) || 1;
+        u = w.map((x) => x / n);
+      }
+      const big = u.reduce((m, x, j) => Math.abs(x) > Math.abs(u[m]) ? j : m, 0);
+      if (u[big] < 0) u = u.map((x) => -x);              // a fixed sign, so the axes do not flip between refreshes
+      basis.push(u);
+    }
+    pcaBasis = basis; pcaAt = Date.now(); pcaDim = d;
+  }
+  return (v) => (Array.isArray(v) && v.length === d ? pcaBasis.map((b) => b.reduce((acc, x, j) => acc + x * (v[j] - mean[j]), 0)) : null);
+}
+
+// ---- the 3D island view: canvas, no library (the page's CSP allows no eval) ----------------------------------------
+// World points come from the configs' 25-setting encodings projected on 3 main axes (/api/points gives the axes and
+// every scored config; until it answers, the axes come from the live clouds). Drag turns, the wheel zooms.
+const v3 = {yaw: 0.7, pitch: 0.35, zoom: 1, auto: false, mode: "top", colour: "source", fit: "all",
+            all: null, fetchedAt: 0, fetching: false, scene: null, screen: [], hover: null, raf: 0, wired: false, t0: performance.now()};
+const SRC_TOKEN = {ga: "--warn", rf: "--rf", step_a: "--muted", released: "--faint", other: "--faint"};
+const HEAT = [[44, 62, 145], [42, 157, 143], [233, 196, 106], [244, 162, 97], [230, 57, 70]];
+function heat(t) {
+  t = Math.max(0, Math.min(1, t)) * (HEAT.length - 1);
+  const i = Math.min(HEAT.length - 2, Math.floor(t)), f = t - i, a = HEAT[i], b = HEAT[i + 1];
+  return `rgb(${a.map((x, k) => Math.round(x + (b[k] - x) * f)).join(",")})`;
+}
+function rgba(col, a) {
+  const c = col.trim();
+  if (c.startsWith("#")) {
+    const n = c.length === 4 ? c.slice(1).split("").map((x) => parseInt(x + x, 16)) : [1, 3, 5].map((k) => parseInt(c.slice(k, k + 2), 16));
+    return `rgba(${n.join(",")},${a})`;
+  }
+  return c.startsWith("rgb(") ? c.replace("rgb(", "rgba(").replace(")", `,${a})`) : c;
+}
+
+async function fetchAllPoints() {
+  if (v3.fetching || Date.now() - v3.fetchedAt < 30000) return;
+  v3.fetching = true;
+  try {
+    const r = await api("/api/points");
+    const d = await r.json();
+    if (d && d.n) { v3.all = d; v3.scene = null; }
+  } catch (e) { /* the next poll tries again */ } finally { v3.fetching = false; v3.fetchedAt = Date.now(); }
+}
+
+function projector(liveVectors) {
+  const A = v3.all;
+  if (A && A.basis && A.mean) {
+    const d = A.mean.length;
+    return (v) => (Array.isArray(v) && v.length === d ? A.basis.map((b) => b.reduce((acc, x, j) => acc + x * (v[j] - A.mean[j]), 0)) : null);
+  }
+  return pcaProject(liveVectors);
+}
+
+function settingDiff(a, b) {
+  const names = (v3.all && v3.all.names) || [];
+  if (!a || !b) return "";
+  return a.map((x, j) => [j, b[j] - x]).filter(([, dx]) => Math.abs(dx) > 1e-9)
+    .map(([j, dx]) => `${names[j] || `#${j}`} ${dx > 0 ? "+" : "−"}${Math.abs(dx * 100).toFixed(0)}%`).join(", ");
+}
+
+function buildScene(E) {
+  const rows = islandRows(E), cl = climbers(E).filter((c) => c.parent == null);
+  const live = [];
+  for (const r of rows) { for (const [v] of r.cloud || []) live.push(v); if (r.best_vec) live.push(r.best_vec); }
+  for (const c of cl) { if (c.vec) live.push(c.vec); for (const t of c.trail || []) live.push(t[0]); }
+  const proj = projector(live);
+  if (!proj) return null;
+  const bg = [];
+  if (v3.mode === "all" && v3.all && v3.all.n) {
+    const A = v3.all;
+    for (let i = 0; i < A.n; i++) bg.push({p: [A.xyz[3 * i], A.xyz[3 * i + 1], A.xyz[3 * i + 2]], s: A.score[i], src: A.sources[A.src[i]],
+      island: A.island[i], climber: A.climber[i]});
+  } else {
+    for (const r of rows) for (const [v, sc] of r.cloud || []) { const p = proj(v); if (p) bg.push({p, s: sc, src: "climber", island: r.island}); }
+  }
+  const bests = rows.map((r) => ({p: proj(r.best_vec), island: r.island, best: r.best})).filter((b) => b.p);
+  const paths = cl.map((c) => {
+    const i = c.island == null ? 0 : c.island;
+    const steps = (c.trail || []).map((t) => ({p: proj(t[0]), v: t[0], s: t[1], part: t[2]})).filter((x) => x.p);
+    const here = proj(c.vec);
+    return {c, island: i, steps, here};
+  });
+  const links = (E.island_distances || []).map((dd) => {
+    const a = bests.find((b) => b.island === dd.a), b = bests.find((x) => x.island === dd.b);
+    return a && b ? {a: a.p, b: b.p, dd} : null;
+  }).filter(Boolean);
+  const scores = bg.map((q) => q.s).sort((a, b) => a - b);
+  const lo = scores.length ? scores[Math.floor(scores.length * 0.05)] : 0, hi = scores.length ? scores[scores.length - 1] : 1;
+  return {bg, bests, paths, links, lo, hi};
+}
+
+function draw3d(now) {
+  const box = $("space3d"), sc = v3.scene;
+  if (!sc) return;
+  let cv = box.querySelector("canvas");
+  if (!cv) {
+    box.replaceChildren();
+    cv = h("canvas", {class: "space-canvas"});
+    box.append(cv, h("div", {class: "space-tip", id: "space-tip", hidden: true}), spaceControls());
+  }
+  const dpr = window.devicePixelRatio || 1, W = Math.max(320, box.clientWidth || 600), H = 480;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.width = `${W}px`; cv.style.height = `${H}px`; }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // the frame: what "fit" shows
+  let fitPts = sc.bg.map((q) => q.p).concat(sc.bests.map((b) => b.p));
+  for (const pa of sc.paths) for (const st of pa.steps) fitPts.push(st.p);
+  if (v3.fit !== "all") {
+    const pa = sc.paths.find((x) => `${x.island}:${x.c.id}` === v3.fit);
+    if (pa && pa.steps.length) fitPts = pa.steps.map((st) => st.p).concat(pa.here ? [pa.here] : []);
+  }
+  if (!fitPts.length) return;
+  const c = [0, 1, 2].map((k) => fitPts.reduce((a, p) => a + p[k], 0) / fitPts.length);
+  const rad = fitPts.reduce((m, p) => Math.max(m, Math.hypot(p[0] - c[0], p[1] - c[1], p[2] - c[2])), 1e-6);   // no spread: 45k points
+  const cy = Math.cos(v3.yaw), sy = Math.sin(v3.yaw), cp = Math.cos(v3.pitch), sp = Math.sin(v3.pitch);
+  const scale = 0.40 * Math.min(W, H) * v3.zoom;
+  const P = (p) => {
+    const x0 = (p[0] - c[0]) / rad, y0 = (p[1] - c[1]) / rad, z0 = (p[2] - c[2]) / rad;
+    const x1 = cy * x0 + sy * z0, z1 = -sy * x0 + cy * z0, y2 = cp * y0 - sp * z1, z2 = sp * y0 + cp * z1;
+    const f = 3.2 / (3.2 + z2);
+    return [W / 2 + scale * x1 * f, H / 2 - scale * y2 * f, z2, f];
+  };
+  const W0 = (q) => [c[0] + q[0] * rad, c[1] + q[1] * rad, c[2] + q[2] * rad];      // unit frame -> world
+  const key = [v3.yaw, v3.pitch, v3.zoom, v3.fit, v3.mode, v3.colour, W, H, v3.sceneId, effectiveTheme()].join("|");
+  if (v3.bgKey !== key) {                       // the background layer is redrawn only when the view or data moves
+    const off = v3.bgCanvas || (v3.bgCanvas = document.createElement("canvas"));
+    off.width = cv.width; off.height = cv.height;
+    const bgc = off.getContext("2d");
+    bgc.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const bgScreen = [];
+    // background and floor
+    const panel = css("--panel"), panel2 = css("--panel-2"), ink = css("--ink"), mut = css("--muted"), line = css("--line");
+    const bgGrad = bgc.createRadialGradient(W / 2, H * 0.42, 10, W / 2, H / 2, Math.max(W, H) * 0.75);
+    bgGrad.addColorStop(0, panel); bgGrad.addColorStop(1, panel2);
+    bgc.fillStyle = bgGrad; bgc.fillRect(0, 0, W, H);
+    bgc.lineWidth = 1;
+    for (let k = -5; k <= 5; k++) {
+      const t = k / 5, al = 0.35 - Math.abs(t) * 0.2;
+      bgc.strokeStyle = rgba(line, al);
+      let a = P(W0([t * 1.2, -1.05, -1.2])), b = P(W0([t * 1.2, -1.05, 1.2]));
+      bgc.beginPath(); bgc.moveTo(a[0], a[1]); bgc.lineTo(b[0], b[1]); bgc.stroke();
+      a = P(W0([-1.2, -1.05, t * 1.2])); b = P(W0([1.2, -1.05, t * 1.2]));
+      bgc.beginPath(); bgc.moveTo(a[0], a[1]); bgc.lineTo(b[0], b[1]); bgc.stroke();
+    }
+    // axis gizmo
+    const gz = [[1, 0, 0, "1"], [0, 1, 0, "2"], [0, 0, 1, "3"]], o = [44, H - 40];
+    for (const [ax, ay, az, label] of gz) {
+      const x1 = cy * ax + sy * az, z1 = -sy * ax + cy * az, y2 = cp * ay - sp * z1;
+      bgc.strokeStyle = mut; bgc.beginPath(); bgc.moveTo(o[0], o[1]); bgc.lineTo(o[0] + 22 * x1, o[1] - 22 * y2); bgc.stroke();
+      bgc.fillStyle = mut; bgc.font = "10px system-ui"; bgc.fillText(`axis ${label}`, o[0] + 26 * x1 - 8, o[1] - 26 * y2 + 3);
+    }
+    // background points, far first
+    const pts = sc.bg.map((q) => ({q, s: P(q.p)})).sort((a, b) => b.s[2] - a.s[2]);
+    const all = v3.mode === "all";
+    for (const {q, s: sp2} of pts) {
+      const depth = Math.max(0.15, Math.min(1, (1.6 - sp2[2]) / 2.2));
+      let col;
+      if (v3.colour === "score") col = heat(Math.pow((q.s - sc.lo) / Math.max(1e-9, sc.hi - sc.lo), 1.6));
+      else col = q.src === "climber" && q.island >= 0 ? islandColor(q.island) : css(SRC_TOKEN[q.src] || "--faint");
+      bgc.fillStyle = rgba(col, (all ? 0.55 : 0.6) * depth);
+      const r = (all ? 1.6 : 2.6) * sp2[3];
+      bgc.beginPath(); bgc.arc(sp2[0], sp2[1], r, 0, 6.2832); bgc.fill();
+      bgScreen.push({x: sp2[0], y: sp2[1], r: Math.max(3, r + 1), tip: () => `${q.src === "climber" ? `climber ${q.climber >= 0 ? q.climber : ""} · island ${q.island}` : q.src.replace("_", " ")} · ${fix(q.s)}`, w: 0});
+    }
+    v3.bgKey = key; v3.bgScreen = bgScreen;
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(v3.bgCanvas, 0, 0);
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const screen = v3.bgScreen.slice();
+  const panel = css("--panel"), ink = css("--ink"), mut = css("--muted");
+  // island links
+  for (const L of sc.links) {
+    const a = P(L.a), b = P(L.b);
+    g.setLineDash([6, 5]); g.strokeStyle = rgba(mut, 0.9); g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke(); g.setLineDash([]);
+    g.fillStyle = mut; g.font = "11px system-ui";
+    g.fillText(`${fix(L.dd.distance, 2)} apart · ${L.dd.settings} settings`, (a[0] + b[0]) / 2 + 6, (a[1] + b[1]) / 2 - 6);
+  }
+  // climber paths with numbered steps
+  const pulse = 0.5 + 0.5 * Math.sin(((now || performance.now()) - v3.t0) / 380);
+  for (const pa of sc.paths) {
+    const col = islandColor(pa.island), seq = pa.steps.concat(pa.here ? [{p: pa.here, v: pa.c.vec, s: pa.c.best, part: "now"}] : []);
+    const sps = seq.map((st) => P(st.p));
+    for (let k = 1; k < sps.length; k++) {
+      g.strokeStyle = rgba(col, 0.25 + 0.65 * (k / sps.length)); g.lineWidth = 1.5 + 1.5 * (k / sps.length);
+      g.beginPath(); g.moveTo(sps[k - 1][0], sps[k - 1][1]); g.lineTo(sps[k][0], sps[k][1]); g.stroke();
+    }
+    seq.forEach((st, k) => {
+      const q = sps[k];
+      if (st.part === "now") return;
+      const pc = st.part === "grid" ? css("--good") : st.part === "jump" ? css("--scout") : st.part === "ga" ? css("--warn") : st.part === "rf" ? css("--rf") : col;
+      g.fillStyle = pc; g.beginPath(); g.arc(q[0], q[1], 3 * q[3], 0, 6.2832); g.fill();
+      if (v3.fit !== "all" || sps.length <= 12) { g.fillStyle = mut; g.font = "9px system-ui"; g.fillText(String(k + 1), q[0] + 4, q[1] - 4); }
+      const prev = k ? seq[k - 1].v : null;
+      screen.push({x: q[0], y: q[1], r: 6, w: 2, tip: () => `climber ${pa.c.id} · step ${k + 1} · ${PART_NAME[st.part] || st.part} · ${fix(st.s)}${prev ? `\n${settingDiff(prev, st.v)}` : ""}`});
+    });
+    if (pa.here) {
+      const q = P(pa.here), climbing = pa.c.status === "climbing", r = (climbing ? 7 : 5.5) * q[3];
+      if (climbing) { g.strokeStyle = rgba(col, 0.55 * (1 - pulse)); g.lineWidth = 2; g.beginPath(); g.arc(q[0], q[1], r + 4 + 8 * pulse, 0, 6.2832); g.stroke(); }
+      g.shadowColor = col; g.shadowBlur = climbing ? 14 : 6;
+      const grad = g.createRadialGradient(q[0] - r / 3, q[1] - r / 3, 1, q[0], q[1], r);
+      grad.addColorStop(0, "#ffffff"); grad.addColorStop(0.35, col); grad.addColorStop(1, rgba(col, 0.85));
+      g.fillStyle = grad; g.beginPath(); g.arc(q[0], q[1], r, 0, 6.2832); g.fill(); g.shadowBlur = 0;
+      g.fillStyle = col; g.font = "bold 11px system-ui"; g.fillText(`c${pa.c.id}`, q[0] + r + 4, q[1] + 4);
+      screen.push({x: q[0], y: q[1], r: r + 4, w: 3, tip: () => `climber ${pa.c.id} · island ${pa.island} · ${pa.c.status} · centre ${fix(pa.c.best)} · ${seq.length - 1} moves`});
+    }
+  }
+  // island bests
+  for (const b of sc.bests) {
+    const q = P(b.p), col = islandColor(b.island), r = 8 * q[3];
+    g.shadowColor = col; g.shadowBlur = 18;
+    g.fillStyle = col; g.beginPath(); g.moveTo(q[0], q[1] - r); g.lineTo(q[0] + r, q[1]); g.lineTo(q[0], q[1] + r); g.lineTo(q[0] - r, q[1]); g.closePath(); g.fill();
+    g.shadowBlur = 0; g.strokeStyle = ink; g.lineWidth = 1; g.stroke();
+    g.fillStyle = col; g.font = "bold 12px system-ui"; g.fillText(`I${b.island} ${fix(b.best, 3)}`, q[0] + r + 5, q[1] - r);
+    screen.push({x: q[0], y: q[1], r: r + 4, w: 4, tip: () => `island ${b.island} best ${fix(b.best)}`});
+  }
+  // legend
+  g.font = "11px system-ui"; g.fillStyle = mut;
+  const legend = v3.colour === "score" ? `colour: score, ${fix(sc.lo, 2)} (blue) → ${fix(sc.hi, 2)} (red)`
+    : "colour: island (climbers) · amber GA · magenta RF-UCB · grey Step A";
+  g.fillText(`${legend} · ${v3.mode === "all" ? `${int(sc.bg.length)} scored configs` : "top 40 per island"}`, 12, 18);
+  v3.screen = screen;
+}
+
+function spaceControls() {
+  const btn = (id, text, on) => h("button", {class: "btn small", id, type: "button", onclick: on, text});
+  const sel = h("select", {class: "small-select", id: "space-fit", onchange: (e) => { v3.fit = e.target.value; draw3d(); }});
+  return h("div", {class: "space-ctl"},
+    btn("space-mode", "All scored", () => { v3.mode = v3.mode === "all" ? "top" : "all"; v3.scene = null; if (v3.mode === "all") { v3.fetchedAt = 0; fetchAllPoints().then(() => renderIslands(last && last.search && last.search.engine)); } renderIslands(last && last.search && last.search.engine); }),
+    btn("space-colour", "Colour: score", () => { v3.colour = v3.colour === "score" ? "source" : "score"; draw3d(); syncControls(); }),
+    btn("space-auto", "Auto-rotate", () => { v3.auto = !v3.auto; syncControls(); }),
+    btn("space-reset", "Reset", () => { Object.assign(v3, {yaw: 0.7, pitch: 0.35, zoom: 1, fit: "all"}); draw3d(); syncControls(); }),
+    sel);
+}
+
+function syncControls() {
+  const n = v3.all && v3.all.n;
+  const m = $("space-mode"); if (m) m.textContent = v3.mode === "all" ? "Top 40 per island" : `All scored${n ? ` (${int(n)})` : ""}`;
+  const c = $("space-colour"); if (c) c.textContent = v3.colour === "score" ? "Colour: source" : "Colour: score";
+  const a = $("space-auto"); if (a) a.classList.toggle("primary", v3.auto);
+  const sel = $("space-fit");
+  if (sel && v3.scene) {
+    const opts = [["all", "Fit: everything"]].concat(v3.scene.paths.map((pa) => [`${pa.island}:${pa.c.id}`, `Fit: climber ${pa.c.id}`]));
+    const key = opts.map((o) => o[0]).join("|");
+    if (sel.dataset.key !== key) { sel.replaceChildren(...opts.map(([v, t]) => h("option", {value: v, text: t}))); sel.dataset.key = key; }
+    sel.value = opts.some((o) => o[0] === v3.fit) ? v3.fit : "all";
+  }
+}
+
+function wire3d() {
+  if (v3.wired) return;
+  v3.wired = true;
+  const box = $("space3d");
+  let drag = null;
+  box.addEventListener("pointerdown", (e) => { if (e.target.closest(".space-ctl")) return; drag = [e.clientX, e.clientY]; box.setPointerCapture(e.pointerId); });
+  box.addEventListener("pointermove", (e) => {
+    if (drag) {
+      v3.yaw += (e.clientX - drag[0]) * 0.01;
+      v3.pitch = Math.max(-1.5, Math.min(1.5, v3.pitch + (e.clientY - drag[1]) * 0.01));
+      drag = [e.clientX, e.clientY];
+      draw3d();
+      return;
+    }
+    const rect = box.getBoundingClientRect(), x = e.clientX - rect.left, y = e.clientY - rect.top;
+    let best = null;
+    for (const s2 of v3.screen) {
+      const d = Math.hypot(s2.x - x, s2.y - y);
+      if (d <= s2.r && (!best || s2.w > best.w || (s2.w === best.w && d < best.d))) best = {...s2, d};
+    }
+    const tip = $("space-tip");
+    if (!tip) return;
+    if (!best) { tip.hidden = true; return; }
+    tip.textContent = best.tip();
+    tip.hidden = false;
+    tip.style.left = `${Math.min(rect.width - 260, x + 14)}px`;
+    tip.style.top = `${y + 14}px`;
+  });
+  box.addEventListener("pointerup", () => { drag = null; });
+  box.addEventListener("pointerleave", () => { const tip = $("space-tip"); if (tip) tip.hidden = true; });
+  box.addEventListener("wheel", (e) => { e.preventDefault(); v3.zoom = Math.max(0.3, Math.min(8, v3.zoom * (e.deltaY < 0 ? 1.12 : 0.89))); draw3d(); }, {passive: false});
+  const tick = (now) => {
+    if (v3.scene && !document.hidden && $("view-live") && !$("view-live").hidden) {
+      if (v3.auto) v3.yaw += 0.004;
+      if (v3.auto || v3.scene.paths.some((pa) => pa.c.status === "climbing")) draw3d(now);
+    }
+    v3.raf = requestAnimationFrame(tick);
+  };
+  v3.raf = requestAnimationFrame(tick);
+}
+
+function renderIslands(E) {
+  const box = $("space3d"), dist = $("island-dist");
+  const rows = islandRows(E);
+  if (!E || !rows.length) { dist.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); return; }
+  $("islands-sub").textContent = `${rows.length} island${rows.length === 1 ? "" : "s"} · the configs' 25 settings on their 3 main axes · drag to turn, scroll to zoom, hover for details`;
+  fetchAllPoints();
+  v3.scene = buildScene(E);
+  v3.sceneId = (v3.sceneId || 0) + 1;
+  if (!v3.scene) {
+    box.replaceChildren(h("div", {class: "empty", text: "No positions yet: they appear once the engine publishes scored configs."}));
+  } else {
+    wire3d();
+    draw3d();
+    syncControls();
+  }
+  const pairs = (E.island_distances || []).map((dd) => h("div", {class: "rowline"},
+    h("div", {class: "top-line"}, h("span", {}, h("i", {class: "dot", style: {background: islandColor(dd.a)}}), ` Island ${dd.a} ↔ `,
+      h("i", {class: "dot", style: {background: islandColor(dd.b)}}), ` Island ${dd.b}`),
+      h("span", {class: "num", text: `${fix(dd.distance, 3)} apart · ${dd.settings} of 25 settings differ`})),
+    bar(Math.min(1, dd.distance / 2), "", null)));
+  const summary = rows.map((r) => {
+    const S = r.sources || {}, ga = S.ga || {}, rf = S.rf || {};
+    return h("div", {class: "rowline"},
+      h("div", {class: "top-line"}, h("span", {}, h("i", {class: "dot", style: {background: islandColor(r.island)}}), h("b", {text: ` Island ${r.island}`}),
+        h("span", {class: "muted", text: ` · ${int(r.capacity)} workers · ${r.climbers != null ? r.climbers : "–"} climbers`})),
+        h("span", {class: "num", text: `best ${fix(r.best)}`})),
+      h("div", {class: "muted num small", text: `GA ${int(ga.inflight)} live / ${int(ga.sent)} sent, best ${fix(ga.best)} · RF-UCB ${int(rf.inflight)} live / ${int(rf.sent)} sent, best ${fix(rf.best)}`}),
+      splitBar(S.split));
+  });
+  dist.replaceChildren(...summary, ...(pairs.length ? pairs : [h("div", {class: "empty", text: rows.length > 1 ? "Distances appear once every island has a best config." : "One island: no distance to show."})]));
+}
+
+// Runs in flight on one island by part, against the grid and centre-jump quotas (climb.grid_cores, climb.jump_cores).
+function splitBar(sp) {
+  if (!sp || !sp.cap) return null;
+  const parts = [["grid", sp.grid], ["jump", sp.jump], ["rf", sp.rf], ["ga", sp.ga]];
+  const used = parts.reduce((a, [, v]) => a + (v || 0), 0);
+  return h("div", {class: "split"},
+    h("div", {class: "stack"}, parts.map(([k, v]) => h("span", {class: `seg ${k}`, style: {width: `${pct(v || 0, Math.max(sp.cap, used))}%`},
+      title: `${PART_NAME[k]} ${int(v)}`}))),
+    h("div", {class: "muted num small", text: `in flight: grid ${int(sp.grid)}${sp.grid_quota ? ` / ${int(sp.grid_quota)}` : ""} · jumps ${int(sp.jump)}${sp.jump_quota ? ` / ${int(sp.jump_quota)}` : ""} · RF ${int(sp.rf)} · GA ${int(sp.ga)} · of ${int(sp.cap)} workers`}));
+}
+
+let detail = null;                // {island, id} of the open climber card
+function openDetail(island, id) { detail = {island, id}; $("drawer").hidden = false; render(); $("drawer-close").focus(); }
+function closeDetail() { detail = null; $("drawer").hidden = true; }
+
+function partPanel(key, title, sub, pairs, extra) {
+  return h("section", {class: `part ${key}`}, h("h3", {}, h("span", {class: `part-chip ${key}`}, h("b", {text: PART_SHORT[key]})), ` ${title}`),
+    sub ? h("div", {class: "muted small", text: sub}) : null, kv(pairs), extra || null);
+}
+
+function renderDetail(E, finished) {
+  if (!detail) return;
+  const c = climbers(E).find((x) => x.id === detail.id && (x.island == null ? 0 : x.island) === detail.island);
+  if (!c) { $("drawer-title").textContent = `Climber ${detail.id} has left the round`; $("drawer-parts").replaceChildren(); return; }
+  const i = c.island == null ? 0 : c.island;
+  const row = islandRows(E).find((r) => r.island === i) || {};
+  const S = row.sources || {}, ga = S.ga || {}, rf = S.rf || {}, P = c.parts || {};
+  const p = (k) => P[k] || {moves: 0, gain: 0};
+  const lastMove = (k) => (p(k).last_s == null ? "–" : `${mins(p(k).last_s)} into the round`);
+  $("drawer-title").replaceChildren(h("span", {class: "isl-tag", style: {background: islandColor(i)}, text: `I${i}`}),
+    ` Climber ${c.id} · ${finished && c.status === "climbing" ? "stopped" : STATUS_TEXT[c.status] || c.status} · centre ${fix(c.best)} · ${int(c.evaluated)} configs sent`);
+  const w = c.wave;
+  const steps = Object.entries(c.steps || {});
+  const waves = (c.waves || []).slice(-6).reverse();
+  const arms = Object.entries((E.leaps || {}).by_setting || {}).sort((a, b) => (b[1].wins || 0) - (a[1].wins || 0)).slice(0, 6);
+  $("drawer-parts").replaceChildren(
+    partPanel("grid", "Grid", w && w.kind !== "jumps" ? `${w.kind} wave: ${int(w.back)} / ${int(w.sent)} back` : "no grid wave out now", [
+      ["in flight now", int(p("grid").inflight)], ["runs sent", int(p("grid").sent)], ["centre moves", int(p("grid").moves)],
+      ["gain", `+${fix(p("grid").gain)}`], ["last move", lastMove("grid")], ["grid waves", int(c.iterations)], ["flat settings", `${int(c.flat)} of ${int(c.expensive)}`]],
+      h("div", {}, steps.length ? h("div", {class: "names"}, h("span", {class: "label", text: "steps now "}),
+          steps.map(([n, k]) => `${n} ±${k.join("/")}`).join(" · ")) : null,
+        waves.length ? h("div", {class: "names"}, h("span", {class: "label", text: "last waves "}),
+          waves.map((x) => `${x[0]} ${x[1]}/${x[2]} in ${x[3]}m`).join(" · ")) : null)),
+    partPanel("jump", "Centre jump", w && w.kind === "jumps" ? `jump wave: ${int(w.back)} / ${int(w.sent)} back` : "jumps ride with every grid wave", [
+      ["in flight now", int(p("jump").inflight)], ["runs sent", int(p("jump").sent)], ["centre moves", int(p("jump").moves)],
+      ["gain", `+${fix(p("jump").gain)}`], ["last move", lastMove("jump")]],
+      arms.length ? h("div", {class: "names"}, h("span", {class: "label", text: "island's best arms "}),
+        arms.map(([n, a]) => `${n} ${int(a.wins)}/${int(a.tries)}`).join(" · ")) : null),
+    partPanel("ga", "GA", `island ${i}: ${int(ga.inflight)} in flight, ${int(ga.back)} / ${int(ga.sent)} back, best ${fix(ga.best)}`, [
+      ["moves into this climber", int(p("ga").moves)], ["gain", `+${fix(p("ga").gain)}`], ["last move", lastMove("ga")]]),
+    partPanel("rf", "RF-UCB", `island ${i}: ${int(rf.inflight)} in flight, ${int(rf.back)} / ${int(rf.sent)} back, best ${fix(rf.best)}`, [
+      ["moves into this climber", int(p("rf").moves)], ["gain", `+${fix(p("rf").gain)}`], ["last move", lastMove("rf")],
+      ["forests fitted", int(rf.fits)], ["trained on", int(rf.trained_on)], ["share · kappa", `${fix(rf.share, 2)} · ${fix(rf.kappa, 2)}`]]));
 }
 
 function climberCores(c, X) {
