@@ -5,8 +5,11 @@ sample of the ones Minos inserts (the pool), never more than 1/8 of them. 488 ro
   - a region starts with a base pool of ~600-615 inserted per Mb;
   - when 8 x N does not fit in it, the pool is raised until it does: above 680 per Mb, N = q x pool / 8 with
     q ~ 0.97 (the median over past cleanly raised rounds, pool <= 1.06 x 8N);
-  - otherwise N is a draw that fitted the base pool: the median of past draws of the same round type (binned
-    quality <= 9 distinct base qualities, or full) that fit this pool.
+  - otherwise N is a draw that fitted the base pool, and no feature of the round predicts which: past draws of the
+    same round type (binned quality <= 9 distinct base qualities, or full) that fit this pool are the plausible N,
+    and the one N the pick should use is 1/E[1/N] over them (weighted toward the low ones: N too high makes false
+    calls look cheap, which costs more than too low; field submissions as candidates, 465 rounds: score lost by
+    the pick 0.0091 -> 0.0069 per round).
 What looked like batches of the task window with their own N range (binned 26-28 Sep median 578 against 432 and
 460 later) were raised pools. Live, the pool is the inserted mutations our answer set flags SYNTHETIC (median 0.2%
 under the truth's, at most 5% on healthy builds).
@@ -128,8 +131,10 @@ def estimate(tag: str, bam: str, region: str, pool: int, rounds_dir: Optional[st
     cap = CAP_SHARE * pool_t / POOL_UNDER if ok else None
     fit = [n for n in same if cap is None or n <= cap]
     if len(fit) >= MIN_ROUNDS:
-        how.update(rule="draws that fit the pool", cap=round(cap) if cap else None, rounds=len(fit))
-        return int(round(statistics.median(fit))), how
+        # the pick sees N through FP / N, and N too high (false calls look cheap) costs more than too low: 1/E[1/N]
+        how.update(rule="draws that fit the pool", cap=round(cap) if cap else None, rounds=len(fit),
+                   median=statistics.median(fit))
+        return int(round(1 / statistics.mean(1 / n for n in fit))), how
     if len(same) >= MIN_ROUNDS:
         how.update(rule="type median, capped", cap=round(cap) if cap else None, rounds=len(same))
         return int(round(min(statistics.median(same), cap) if cap else statistics.median(same))), how

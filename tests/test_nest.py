@@ -86,16 +86,16 @@ class NestTest(unittest.TestCase):
         # 4800 on 8 Mb (600/Mb, base): cap = 4800 / 0.9976 / 8 / 0.95 = 633
         n, how = nest.estimate(self.later, self.full, "chr1:1-8000000", 4800, self.root)
         self.assertEqual((how["rule"], how["cap"]), ("draws that fit the pool", 633))
-        self.assertEqual(n, 555)                                       # full draws that fit: 500..610, not 700..750
+        self.assertEqual(n, 553)                                       # 1/E[1/N] of the full draws that fit: 500..610
 
     def test_type_is_kept_apart(self):
         n, _ = nest.estimate(self.later, self.binned, "chr1:1-8000000", 4800, self.root)
-        self.assertEqual(n, 355)                                       # binned draws 300..410
+        self.assertEqual(n, 352)                                       # binned draws 300..410
 
     def test_a_short_pool_count_sets_no_cap(self):
         n, how = nest.estimate(self.later, self.full, MB, 300, self.root)   # 300/Mb: the build lost flags
         self.assertEqual((how["per_mb"], how["rule"], how["cap"]), (None, "draws that fit the pool", None))
-        self.assertEqual(n, 585)                                       # all 18 full draws: 500..610 and 700..750
+        self.assertEqual(n, 600)                                       # all 18 full draws: 500..610 and 700..750
 
     def test_unrevealed_rounds_are_not_used(self):
         n, _ = nest.estimate("20261017T120000Z", self.binned, MB, 300, self.root)   # 4 binned rounds out by then
