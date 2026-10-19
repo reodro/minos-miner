@@ -26,6 +26,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from answer_set.k2 import nest
 from answer_set.k2.build import build
 from answer_set.k2.util import CACHE, trim
 from common.types import AnswerSet, CallSet, Regime, Round, SyntheticCandidate, Variant
@@ -71,13 +72,24 @@ def read_output(round: Round, out: Path) -> AnswerSet:
     mutations = str(out / "mutations.vcf.gz")
     with gzip.open(mutations, "rt") as f:
         n_file = sum(1 for line in f if not line.startswith("#"))
+    n, n_source = round.n_targets, (getattr(round, "n_source", None) or ("platform" if round.n_targets else "setting answer_set.n"))
+    n_how = None
+    if n_source != "platform" and nest.ENABLED:
+        # no N from the platform: past rounds of this type, capped at our pool / 8 (answer_set/k2/nest.py)
+        pool = len(synthetic) if regime != Regime.UNKNOWN else 0      # a short count sets no cap (nest.pool_cap)
+        try:
+            est, n_how = nest.estimate(round.tag, round.bam, round.region, pool)
+        except Exception as e:  # noqa: BLE001  (never fails the answer set: the caller's N stays)
+            est, n_how = None, {"error": repr(e)}
+        if est:
+            n, n_source = est, "type + pool cap"
     notes = {"source": "k2", "truth_vcf": str(out / "truth.vcf.gz"), "mutations_vcf": mutations,
              "scores_tsv": str(out / "scores.tsv.gz"), "region": round.region, "reference": round.reference,
              "model": report.get("model"), "threshold": report.get("threshold"), "mode": report["mode"],
-             "n_targets_source": (getattr(round, "n_source", None) or ("platform" if round.n_targets else "setting answer_set.n")),
+             "n_targets_source": n_source, "n_estimate": n_how,
              "report": report,
              "warnings": warnings_of(report)}
-    return AnswerSet(round.round_id, 1, regime, donor, germline, synthetic, round.n_targets or n_file, notes)
+    return AnswerSet(round.round_id, 1, regime, donor, germline, synthetic, n or n_file, notes)
 
 
 def warnings_of(report: dict) -> List[str]:

@@ -23,6 +23,7 @@ the released truth.
 | Module | Role |
 |---|---|
 | `k2/provider.py` | `K2Provider`: build into `<cache_dir>/answer_set/k2/<tag>/v1/`, read it into an `AnswerSet` |
+| `k2/nest.py` | N when the platform gives none: from a raised pool of inserted mutations (>= 660/Mb: 0.97 x pool / 8), else the median of past same-type draws that fit this pool. Walk-forward, 472 rounds: error in N 17.4% (median of the last 10 rounds) -> 12.6% |
 | `k2/build.py` | candidates -> features -> track model -> `truth.vcf.gz`, `mutations.vcf.gz` (N is the setting `answer_set.n`, default 548), `scores.tsv.gz`, `report.json` |
 | `k2/features.py` | read scan, format detection (GIAB / 1000G), every measurement |
 | `k2/kg.py`, `k2/masks.py` | 1000G person, DRAGEN / GATK lookups, panel index; region masks |
