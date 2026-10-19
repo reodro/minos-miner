@@ -62,6 +62,33 @@ class ReachTest(unittest.TestCase):
         self.assertEqual(self.cl.step_size(self.mid), 3)
 
 
+class AllStepsTest(unittest.TestCase):
+    """climb.all_steps: every step size of a setting's plan in one compass (user, 2026-10-19)."""
+    setUp = ReachTest.setUp
+
+    def offs(self, name, on=1):
+        with unittest.mock.patch.dict(TUNING.values, {"climb.all_steps": on}):
+            return sorted(self.cl.compass_offsets(name))
+
+    def test_a_medium_ladder_sends_one_to_nine_rungs_at_once(self):
+        self.assertEqual(self.offs(self.mid), [-9, -7, -5, -3, -1, 1, 3, 5, 7, 9])
+
+    def test_a_long_ladder_sends_one_to_its_maximum_at_once(self):
+        self.assertEqual(self.offs(self.big), [-27, -18, -9, -3, -1, 1, 3, 9, 18, 27])
+
+    def test_off_sends_the_scheduled_step_only(self):
+        self.assertEqual(self.offs(self.mid, on=0), [-3, 3])
+
+    def test_a_bool_keeps_one_rung(self):
+        name = next(n for n in self.space.names if self.space.specs[n].type == "bool")
+        self.assertEqual(self.offs(name), [-1, 1])
+
+    def test_the_compass_holds_every_step(self):
+        with unittest.mock.patch.dict(TUNING.values, {"climb.all_steps": 1}):
+            heads = self.cl.compass_heads(self.centre, [self.mid])
+        self.assertGreaterEqual(len(heads), 8)                  # 10 offsets; an edge or a repair can merge a few
+
+
 class LeapSummaryTest(unittest.TestCase):
     def test_counts_tries_wins_and_two_setting_jumps(self):
         ctx = engine.Context(FakeBase(), Space(ranges()), random.Random(0), None)

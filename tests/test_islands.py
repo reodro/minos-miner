@@ -165,7 +165,8 @@ class ClimberJumpTest(unittest.TestCase):
 
     def test_the_peak_is_named_once_every_centre_jump_has_lost(self):
         centre = self.space._assemble({MMQ: 59})
-        cl = self.certify(lambda c: 82.6168 if c.key == centre.key else 82.60, centre)
+        with unittest.mock.patch.dict(TUNING.values, {"climb.after_peak": 0}):       # on, it keeps jumping
+            cl = self.certify(lambda c: 82.6168 if c.key == centre.key else 82.60, centre)
         self.assertEqual(cl.state, "peak")
         self.assertEqual(cl.centre.key, centre.key)
         down = sorted(59 - c.params.get(MMQ) for c, _ in cl.ctx.done.values()
