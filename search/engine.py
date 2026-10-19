@@ -90,6 +90,7 @@ client.notes["engine"] (version, phase, basins: one row per climber).
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import math
@@ -108,7 +109,7 @@ from search.candidates import StepA
 from search.client import EvalClient, Outcome
 from search.crashguard import CrashGuard
 from search.duplicates import PARKED, DuplicateGuard
-from search.climb import Climber, occupy
+from search.climb import Climber, core_quotas, encoded, occupy, runs_by_part
 from search.distance import Distance
 from search.engine_tag import VERSION
 from search.repeats import TiedCallsets
@@ -395,6 +396,10 @@ class Context:
 
     def publish(self, force: bool = False) -> None:
         """client.notes["engine"]: what main and the review read (the basins ledger)."""
+        if getattr(self, "island", None) is not None:
+            q = self.client.capacity()                   # islands.rebalance moves the island's quota
+            if q:
+                self.cap = int(q)
         self.send_released()
         self.send_sweep()
         now = self.clock()
@@ -437,9 +442,65 @@ class Context:
                                 "audits": self.guard.n_audits, "audits_crashed": self.guard.n_audit_crashed,
                                 "rules_off": self.guard.n_off},
                 "events": list(self.events[-200:]),
+                "sources": _source_rows(self),
+                "best_vec": None if top is None else encoded(self, top[0]),
+                "cloud": _cloud(self),
             }
         except Exception:  # noqa: BLE001 - the notes must never end the round
             log.exception("engine: publishing the notes failed")
+
+
+def _source_rows(ctx) -> dict:
+    """The island's GA and RF-UCB runs: sent, back, in flight, the best score each found (the dashboard)."""
+    rf_keys = getattr(ctx, "rf_keys", None) or set()
+    rf_futs = list(getattr(ctx, "rf_futs", None) or [])
+    rf_ids = {id(f) for f in rf_futs}
+    ga_futs = [f for f in ctx.ga_futs if id(f) not in rf_ids]
+
+    def best_of(keys):
+        top = None
+        for k in keys:
+            r = ctx.client.latest.get((k, FULL))
+            if r is not None and r.score is not None and (top is None or r.score > top):
+                top = r.score
+        return None if top is None else round(top, 4)
+
+    def runs(futs):
+        back = sum(1 for f in futs if f.done())
+        return {"sent": len(futs), "back": back, "inflight": len(futs) - back}
+
+    rf_state = getattr(ctx, "_rf", None) or {}
+    split = runs_by_part(ctx.climbers)
+    quota = core_quotas(ctx) or {}
+    ga_runs, rf_runs = runs(ga_futs), runs(rf_futs)
+    now = ctx.clock()
+    if now - getattr(ctx, "_split_said", -1e9) >= SPLIT_SAY_S and (split["grid"] or split["jump"]):
+        ctx._split_said = now
+        ctx.say("cores: grid %d (quota %s), centre jumps %d (quota %s), RF-UCB %d configs, GA %d configs out, of %d workers",
+                split["grid"], quota.get("grid", "-"), split["jump"], quota.get("jump", "-"), rf_runs["inflight"],
+                ga_runs["inflight"], ctx.cap)
+    return {"split": {"cap": ctx.cap, "grid": split["grid"], "jump": split["jump"], "grid_quota": quota.get("grid"),
+                      "jump_quota": quota.get("jump"), "rf": rf_runs["inflight"], "ga": ga_runs["inflight"]},
+            "ga": {**ga_runs, "best": best_of(set(getattr(ctx, "ga_keys", None) or ()) - rf_keys)},
+            "rf": {**rf_runs, "best": best_of(rf_keys), "fits": rf_state.get("fits", 0),
+                   "trained_on": rf_state.get("rows", 0), "share": float(tune("climb.rf_ucb_share")),
+                   "kappa": float(tune("climb.rf_ucb_kappa"))}}
+
+
+CLOUD_N, CLOUD_S = 40, 30.0
+SPLIT_SAY_S = 300.0         # the "cores:" line: grid, centre jumps, RF-UCB and GA runs in flight
+
+
+def _cloud(ctx) -> list:
+    """The island's CLOUD_N best scored configs as [encoding, score], refreshed every CLOUD_S (the 3D view)."""
+    now = ctx.clock()
+    cache = getattr(ctx, "_cloud_cache", None)
+    if cache is not None and now - cache[0] < CLOUD_S:
+        return cache[1]
+    top = heapq.nlargest(CLOUD_N, ctx.scored(), key=lambda cs: cs[1])
+    rows = [[encoded(ctx, c), round(sc, 4)] for c, sc in top]
+    ctx._cloud_cache = (now, rows)
+    return rows
 
 
 def _leaps_summary(ctx) -> dict:
@@ -641,6 +702,9 @@ async def search_one(client, space: Space, profile: Optional[str], rng: random.R
         ctx.say("centre jumps: %d sent, %d won (%.0f%%), gain %+.4f in all, %+.4f per jump sent; two-setting: %d sent, "
                 "%d won, gain %+.4f", js["tries"], js["wins"], 100.0 * js["wins"] / max(1, js["tries"]), js["gain"],
                 js["gain"] / max(1, js["tries"]), t2["tries"], t2["wins"], t2["gain"])
+    rf = getattr(ctx, "_rf", None)
+    if rf is not None and rf["sent"]:
+        ctx.say("rf-ucb: %d sent (tag R), %d forests fitted", rf["sent"], rf["fits"])
     if ctx.guard.summary():
         ctx.say("%s", ctx.guard.summary())
     if ctx.dups.summary():

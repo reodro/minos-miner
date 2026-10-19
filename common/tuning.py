@@ -170,6 +170,33 @@ KNOBS_LIST: List[Knob] = [
          "Finished grids in a row, each below climb.accept_min, after which a climber certifies its peak (every "
          "untried one-rung neighbour and its centre jumps in one wave). 0: only when every group is flat (before "
          "2026-10-16)."),
+    Knob("climb.all_steps", 0, 0, 1, LIVE, "count",
+         "1: every grid wave sends each setting at every step of its plan at once (+-1 and the big steps of "
+         "step_plan, e.g. 1,3,5,7,9 rungs), not one step size per wave; the cube keeps the scheduled step. 0: one step."),
+    Knob("islands.by_climber", 0, 0, 1, LIVE, "count",
+         "1: the fleet is shared equally by the climbing climbers, whichever island they are on: an island's quota is "
+         "its climbers' share (one climber's worth with none). 0: equal islands."),
+    Knob("climb.heads_first", 0, 0, 1, LIVE, "count",
+         "1: a grid wave's heads go out even past climb.grid_cores (they decide when the wave ends); extra grid points "
+         "stay within the quota."),
+    Knob("climb.flat_shift", 0.0, 0.0, 1.0, LIVE, "share",
+         "With the core quotas: a climber whose last grid wave gained nothing moves this share of its grid runs to "
+         "centre jumps until it moves again."),
+    Knob("climb.grid_cores", 0.0, 0.0, 1.0, LIVE, "share",
+         "Share of an island's workers the grid may keep busy in Step B (heads, line points, packs, more rungs). With "
+         "climb.jump_cores both > 0, they replace climb.grid_fill; workers the two leave free go to RF-UCB and the GA."),
+    Knob("climb.jump_cores", 0.0, 0.0, 1.0, LIVE, "share",
+         "Share of an island's workers centre jumps may keep busy in Step B (see climb.grid_cores)."),
+    Knob("climb.grid_fill", 0.0, 0.0, 1.0, LIVE, "share",
+         "Share of the free workers left after the climbers' heads, packs and centre jumps that go to more grid points "
+         "(more rungs of the wave's settings, Climber.extend) before RF-UCB and the GA. 0: the GA takes them all."),
+    Knob("climb.rf_ucb_share", 0.0, 0.0, 1.0, LIVE, "share",
+         "Share of the free workers left after the grids that go to RF-UCB proposals (search/rf_ucb.py step_b); the GA "
+         "breeds on the rest. 0: no RF-UCB in Step B."),
+    Knob("climb.rf_ucb_kappa", 0.0, 0.0, 5.0, LIVE, "share",
+         "RF-UCB ranks by predicted score + kappa x the spread across trees. 2026-10-19 offline check on four "
+         "full-fleet rounds (test/bench/rf_ucb_offline.py): improvers among the top 100 summed 146 at 0, 90 at 0.25, "
+         "49 at 0.5, 10 at 1."),
     Knob("climb.head_reserve", 24, 0, 200, LIVE, "count",
          "Workers the GA leaves free for a climber's next heads once its wave is half back (at most this many per "
          "climber). 0: the GA fills every free worker."),

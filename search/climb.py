@@ -224,6 +224,9 @@ class Climber:
         self.leap_share = float(tune("climb.leap_share"))      # this climber's share; TuRBO-style counters move it
         self.momentum: Optional[Tuple[str, int, int]] = None    # (setting, direction, rungs) of the last winning jump
         self._sent: Dict[object, Tuple[str, str]] = {}          # future -> (config key, head | rider | line | pack | jump)
+        self.part_sent = {"grid": 0, "jump": 0}               # runs sent per part (the dashboard's climber card)
+        self.part_moves = {p: [0, 0.0, None] for p in PARTS}  # part -> [centre moves, gain, elapsed s of the last]
+        self.trail: List[list] = []                            # [encoded centre, score, part] of each move
         self.sent_wave: Dict[str, int] = {}                     # config key -> the wave that sent it
         self._wave_id = 0
         self._wave_t0, self._wave_n = 0.0, 0
@@ -386,12 +389,29 @@ class Climber:
             elif phase == "n":
                 self.reach[n] = ("n", i + 1) if i + 1 < len(narrow) else ("f", 0)
 
+    def all_step_offsets(self, name: str, offs: List[int]) -> List[int]:
+        """climb.all_steps (user, 2026-10-19: free cores, so big and small steps at once): +-1 and every step of the
+        setting's plan, plus the offsets in force (a growing setting's reach)."""
+        spec = self.ctx.space.specs.get(name)
+        if spec is not None and (spec.type == "bool" or spec.allowed):
+            return offs
+        widen, narrow = step_plan(len(self.ctx.ladders.rungs.get(name) or ()))
+        sizes = sorted({1, *widen, *narrow})
+        out = list(offs)
+        for s in sizes:
+            for off in (s, -s):
+                if off not in out:
+                    out.append(off)
+        return out
+
     def compass_offsets(self, name: str) -> List[int]:
         """The compass rungs. In the last 12 minutes each side also takes the next rung out.
 
         The joint cube stays on the inner offsets, so the extra rung does not grow the cube.
         """
         offs = [off for off in self.offsets(name) if off != 0]
+        if int(tune("climb.all_steps")) and int(tune("climb.big_steps")):
+            offs = self.all_step_offsets(name, offs)
         if not (getattr(self, "compass_only", False) and late_axis(self.ctx)):
             return offs
         further = []
@@ -980,7 +1000,8 @@ class Climber:
         if not pack:
             return
         fs = ctx.propose(pack, f"B{self.id}", ["big"] * len(pack), priority=CLIMB_PRIORITY)
-        self._note_sent(fs, pack, "pack")
+        self._note_sent(fs[:1], pack[:1], "pack")
+        self._note_sent(fs[1:], pack[1:], "pack rider")             # one GATK run: the pack's first config
         self.extra_futs.extend(fs)
         for c in pack:
             self._watch(c)
@@ -1254,6 +1275,13 @@ class Climber:
                 self.dry_jumps, self.kicking, self.after_peak_wave = 0, False, False
                 self.move(best[0], best[1], "jump")
                 self.flat.clear()
+            elif not self._wave_n:
+                # Not one config of this wave could be sent: its untried neighbours and jumps are held by another
+                # climber or already out. Planning the same wave again would never end (a virtual clock does not
+                # move: VirtualRoundTest hung), so the climber names its peak.
+                self.after_peak_wave = self.kicking = False
+                self._peaked()
+                ctx.say("climber %d: nothing of its jump wave could be sent; peak %.4f", self.id, self.score)
             elif self.kicking:
                 self.kicking, self.dry_jumps = False, 0
                 if best is not None:
@@ -1335,6 +1363,7 @@ class Climber:
         if self.first is None:
             self.first = (self.score, self.centre.key)
         gain = self.score - self.wave_before
+        self.last_wave_flat = gain < float(tune("climb.accept_min"))       # climb.flat_shift reads it
         self.note_gain(self.group, gain)
         self.adapt_leap_share()
         ctx.say("climber %d it %d (%s: %s): %+.4f -> %.4f; waves %s", self.id, self.iteration, kind,
@@ -1535,13 +1564,15 @@ class Climber:
             self.released = True
             self.ctx.say("climber %d leaves its edge-family box for %s %.4f, above every other seat; the lock is "
                          "released", self.id, c.key[:8], s)
+        part = self.note_part(c, s, why)
+        self.last_wave_flat = False                                         # it moved: its grid share comes back
         self.centre, self.score = c, s
         if getattr(self, "compass_only", False):
             self.tried_axes = set()
             self.flat.clear()
         if s > self.found:
             self.found = s
-        self.history.append((round(self.ctx.elapsed(), 1), round(s, 4), why))
+        self.history.append((round(self.ctx.elapsed(), 1), round(s, 4), why, part))     # part: the dashboard's colour
         top = self.ctx.best() if callable(getattr(self.ctx, "best", None)) else None
         if top is not None and c.key == top[0].key:
             self.led_round = True
@@ -1559,6 +1590,51 @@ class Climber:
         for f, c in zip(futs, configs):
             if f is not None and hasattr(f, "done"):
                 self._sent[f] = (c.key, kind)
+                self.part_sent["jump" if kind == "jump" else "grid"] += 1
+
+    def runs_in_flight(self) -> Dict[str, int]:
+        """GATK runs this climber has out, by part: heads, line points and packs are the grid, jumps the centre
+        jumps; riders share their head's run (climb.grid_cores, climb.jump_cores)."""
+        out = {"grid": 0, "jump": 0}
+        for f, (_key, kind) in list(self._sent.items()):
+            if f.done() or kind.endswith("rider"):
+                continue
+            out["jump" if kind == "jump" else "grid"] += 1
+        return out
+
+    def head_part(self) -> str:
+        """The part the next queued head belongs to: a centre jump of a jump wave, or the grid."""
+        return "jump" if self.pending and self.pending[0].key in self.leap_meta else "grid"
+
+    def part_of(self, c: Config, why: str) -> str:
+        """Which part found the config a move goes to: the grid, a centre jump (or kick), the GA or RF-UCB."""
+        if c.key in (getattr(self.ctx, "rf_keys", None) or ()):
+            return "rf"
+        if why in ("jump", "kick") or c.key in self.leap_sent or c.key in self.leap_meta:
+            return "jump"
+        if why == "ga" or c.key in (getattr(self.ctx, "ga_keys", None) or ()):
+            return "ga"
+        if why.endswith(("grid", "line")) or why in ("returned", "best"):
+            return "grid"
+        return "other"
+
+    def note_part(self, c: Config, s: float, why: str) -> str:
+        part = self.part_of(c, why)
+        rec = self.part_moves[part]
+        rec[0] += 1
+        rec[1] += max(0.0, s - self.score)
+        rec[2] = round(self.ctx.elapsed(), 1)
+        self.trail = (self.trail + [[encoded(self.ctx, c), round(s, 4), part]])[-30:]
+        return part
+
+    def part_rows(self) -> dict:
+        """Per part: centre moves, gain, last move; grid and jumps also configs sent and GATK runs in flight now
+        (riders share their head's run, so the card's core share matches the island's quota count)."""
+        live = self.runs_in_flight()
+        out = {p: {"moves": m, "gain": round(g, 4), "last_s": t} for p, (m, g, t) in self.part_moves.items()}
+        for p in ("grid", "jump"):
+            out[p].update(sent=self.part_sent[p], inflight=live[p])
+        return out
 
     def claim_higher(self) -> bool:
         """A run this climber sent that has come back above the centre takes the centre.
@@ -1685,7 +1761,29 @@ class Climber:
                 "flat": len(self.flat), "expensive": len(self.read_names) + len(self.assembly_names),
                 "waves": self.waves[-10:], "history": self.history[-20:],
                 "entry_gap": self.entry_gap, "entry_peers": list(self.entry_peers),
-                "led_round": self.led_round}
+                "led_round": self.led_round,
+                "parts": self.part_rows(), "vec": encoded(self.ctx, self.centre), "trail": self.trail,
+                "steps": self.step_rows()}
+
+    def step_rows(self) -> Dict[str, List[int]]:
+        """The rung steps the live grid wave sends per setting (climb.big_steps, climb.all_steps)."""
+        if not self.group or self.kind == "jumps":
+            return {}
+        try:
+            return {n: sorted({abs(o) for o in self.compass_offsets(n) if o}) for n in self.group}
+        except Exception:  # noqa: BLE001 - the dashboard row must not end a climb
+            return {}
+
+
+PARTS = ("grid", "jump", "ga", "rf", "other")
+
+
+def encoded(ctx, c: Optional[Config]) -> Optional[List[float]]:
+    """A config's unit-cube encoding, rounded: the dashboard's 3D view projects these."""
+    try:
+        return None if c is None else [round(float(x), 3) for x in ctx.space.encode(c)]
+    except Exception:  # noqa: BLE001
+        return None
 
 
 SIMILAR_SETTINGS = 4          # fewer than this many searched-setting differences is the same hill
@@ -1908,6 +2006,171 @@ def ga_keep(ctx, config: Config) -> bool:
         return False
     tied = getattr(ctx, "tied", None)
     return tied is None or not tied.holds(config.params)
+
+
+def core_quotas(ctx) -> Optional[Dict[str, int]]:
+    """GATK runs the grid and the centre jumps may have out on this island: climb.grid_cores and climb.jump_cores of
+    its workers (user, 2026-10-19: grid 40%, centre jumps 30%, the GA and RF-UCB the rest). None when off."""
+    g, j = float(tune("climb.grid_cores")), float(tune("climb.jump_cores"))
+    cap = int(getattr(ctx, "cap", 0) or 0)
+    if g <= 0 or j <= 0 or cap <= 0:
+        return None
+    return {"grid": max(1, int(round(g * cap))), "jump": max(1, int(round(j * cap)))}
+
+
+def runs_by_part(live: Sequence[Climber]) -> Dict[str, int]:
+    out = {"grid": 0, "jump": 0}
+    for cl in live:
+        for k, v in cl.runs_in_flight().items():
+            out[k] += v
+    return out
+
+
+def submit_by_quota(ctx, live: Sequence[Climber], quota: Dict[str, int]) -> Dict[str, int]:
+    """Fill the grid's and the centre jumps' quotas from the climbers' queues, round robin: heads first, then jumps,
+    then line points and packs, then more rungs of the live grids (Climber.extend). Workers the two parts leave free
+    go to RF-UCB and the GA. Returns the runs sent per part."""
+    out = {"grid": 0, "jump": 0}
+    have = runs_by_part(live)
+    climbing = [cl for cl in live if cl.state == "climbing"]
+    if not climbing:
+        return out
+    # Each climber gets an equal share of each quota (islands.by_climber; user, 2026-10-19). climb.flat_shift: a
+    # climber whose last grid wave gained nothing moves that share of its grid runs to centre jumps until it moves.
+    each = {p: max(1, quota[p] // len(climbing)) for p in quota}
+    shift = float(tune("climb.flat_shift"))
+    caps = {}
+    for cl in climbing:
+        g, j = each["grid"], each["jump"]
+        if shift > 0 and getattr(cl, "last_wave_flat", False):
+            moved = int(g * shift)
+            g, j = g - moved, j + moved
+        caps[id(cl)] = {"grid": g, "jump": j}
+    total = {p: sum(c[p] for c in caps.values()) for p in quota}       # the island's quotas, after the shifts
+    heads_first = bool(int(tune("climb.heads_first")))
+    own = {id(cl): cl.runs_in_flight() for cl in climbing}
+    rr = 0
+    for _ in range(int(getattr(ctx, "cap", 0) or 0) + 5):
+        idle = free_workers(ctx)
+        if idle is not None and idle <= 0:
+            break
+        room = {p: total[p] - have[p] for p in quota}
+
+        def free(cl, p):
+            return room[p] > 0 and own[id(cl)][p] < caps[id(cl)][p]
+
+        def head_ok(cl):
+            # climb.heads_first: a grid wave's heads decide when the wave ends, so they go even past the grid quota
+            # (round 05:54: late waves took 2.9 min against 2.0 while extra points filled the quota).
+            part = cl.head_part()
+            return (heads_first and part == "grid") or free(cl, part)
+
+        for cl in climbing:
+            # A climber with jump room and no jump queued plans more now, so the centre jumps keep their quota (round
+            # 05:54, island 1: the wave's planned jumps ran out at 51 of 84 and the GA took the rest).
+            if (not cl.leaps and cl.batch_live and cl.kind != "jumps" and free(cl, "jump")
+                    and getattr(cl, "_leaps_dry", None) != getattr(cl, "_wave_id", 0)):
+                taken = {c.key for c in cl.pending} | {c.key for c in cl.later}
+                cl.leaps = cl.plan_leaps(cl.wave_centre or cl.centre, caps[id(cl)]["jump"] - own[id(cl)]["jump"], taken)
+                if not cl.leaps:
+                    cl._leaps_dry = getattr(cl, "_wave_id", 0)          # nothing new for this wave: ask again next wave
+        heads = [cl for cl in climbing if cl.pending and head_ok(cl)]
+        jumps = [cl for cl in climbing if cl.leaps and free(cl, "jump")]
+        lines = [cl for cl in climbing if (cl.extra or cl.later) and free(cl, "grid")]
+        if heads:
+            cl, how = heads[rr % len(heads)], "head"
+        elif jumps:
+            cl, how = jumps[rr % len(jumps)], "jump"
+        elif lines:
+            cl, how = lines[rr % len(lines)], "line"
+        elif room["grid"] > 0:
+            grids = [c for c in climbing if c.batch_live and c.kind != "jumps" and not c.pending and free(c, "grid")]
+            if not grids or not sum(c.extend(caps[id(c)]["grid"] - own[id(c)]["grid"]) for c in grids):
+                break
+            continue
+        else:
+            break
+        rr += 1
+        part = cl.head_part() if how == "head" else "jump" if how == "jump" else "grid"
+        before = cl.evaluated
+        if how == "head":
+            cl._submit_head()
+        elif how == "jump":
+            cl._submit_leap()
+        elif cl.extra:
+            cl._submit_extra()
+        else:
+            cl._submit_pack()
+        if cl.evaluated > before:
+            have[part] += 1
+            own[id(cl)][part] += 1
+            out[part] += 1
+    return out
+
+
+def fill_grids(live: Sequence[Climber], idle: Optional[int]) -> int:
+    """climb.grid_fill of the workers still free after heads, packs and centre jumps: more rungs of each grid wave's
+    settings (Climber.extend), shared by the climbers in a grid wave, before RF-UCB and the GA (user, 2026-10-19:
+    fewer GA cores, more grid cores; round 19:06 sent every one of 11,164 runs after minute 20 to the GA)."""
+    share = float(tune("climb.grid_fill"))
+    if share <= 0 or not idle or idle <= 0:
+        return 0
+    if any(cl.state == "climbing" and cl.leaps for cl in live):
+        return 0                                    # centre jumps still queued: they go first
+    grids = [cl for cl in live if cl.state == "climbing" and cl.batch_live and cl.kind != "jumps" and not cl.pending]
+    if not grids:
+        return 0
+    n = int(idle * share)
+    each = max(1, n // len(grids))
+    for cl in grids:
+        cl.extend(each)
+    sent = 0
+    for _ in range(n):
+        ready = [cl for cl in grids if cl.extra]
+        if not ready:
+            break
+        ready[sent % len(ready)].submit_one()
+        sent += 1
+    return sent
+
+
+async def submit_rf(ctx, n: int) -> list:
+    """RF-UCB configs (search/rf_ucb.py step_b) for climb.rf_ucb_share of the workers the grids leave to the GA.
+    They are not kept away from the climbers like GA children: they aim at the top. Tagged "R"; they count as GA
+    children, so a higher one moves a climber (adopt_ga_best) and joins the GA's parents."""
+    if n <= 0 or ctx.over():
+        return []
+    from search.rf_ucb import step_b
+
+    async def accept(c: Config) -> bool:
+        if not ctx.fresh(c):
+            return False
+        tied = getattr(ctx, "tied", None)
+        return tied is None or not tied.holds(c.params)
+
+    configs = await step_b(ctx, n, accept, float(tune("climb.rf_ucb_kappa")))
+    keys = getattr(ctx, "ga_keys", None)
+    if keys is None:
+        keys = set()
+        ctx.ga_keys = keys
+    futs = []
+    live = list(getattr(ctx, "ga_live", None) or [])
+    rf_keys = getattr(ctx, "rf_keys", None)
+    if rf_keys is None:
+        rf_keys = ctx.rf_keys = set()
+    for c in configs:
+        keys.add(c.key)
+        rf_keys.add(c.key)
+        fs = ctx.propose([c], "R", ["big"], priority=0)
+        futs += fs
+        live.append((c, fs[0] if fs else None))
+    ctx.rf_futs = list(getattr(ctx, "rf_futs", None) or []) + futs
+    ctx.ga_live = live
+    ctx.ga_hills = [c for c, _ in live]
+    held = getattr(ctx, "ga_futs", None)
+    if held is not None:
+        held.extend(futs)
+    return futs
 
 
 async def submit_ga(ctx, n: int, gen: int = 1) -> list:
@@ -2739,11 +3002,27 @@ async def occupy(ctx, ready: Sequence[Tuple[Config, float, str]], until: float) 
                     cl.begin_grid(until)
         idle = free_workers(ctx)
         guard = 0
+        quota = core_quotas(ctx)
+        if quota is not None and not hold:
+            submit_by_quota(ctx, live, quota)
+            idle = 0                                    # the quota pass sent what the grid and the jumps may take
         while idle is not None and idle > 0 and not hold:
             # Heads, then the planned line, then a centre pack. v9.18 stops there and breeds on the
             # cores that remain. Later tags walk further up the line until the fleet is full.
             heads = [cl for cl in live if cl.state == "climbing" and cl.pending]
             extras = [cl for cl in live if cl.state == "climbing" and cl.extra]
+            if not heads and float(tune("climb.grid_fill")) > 0:
+                # The centre jumps keep their share ahead of the grid fill's extra points (round 04:42, 2026-10-19:
+                # with the fill first, jumps were 7.2% of the climbers' runs).
+                jumpers = [cl for cl in live if cl.state == "climbing" and cl.leaps]
+                if jumpers:
+                    rr += 1
+                    jumpers[rr % len(jumpers)]._submit_leap()
+                    idle = free_workers(ctx)
+                    guard += 1
+                    if guard > int(ctx.cap) + 5:
+                        break
+                    continue
             choices = heads or extras
             if not choices:
                 if leftover_breeds():
@@ -2766,6 +3045,8 @@ async def occupy(ctx, ready: Sequence[Tuple[Config, float, str]], until: float) 
             guard += 1
             if guard > int(ctx.cap) + 5:
                 break
+        if not hold and leftover_breeds() and quota is None:
+            fill_grids(live, idle)
         acted = False
         for cl in list(live):
             if cl.state != "climbing" or not (cl.gate_done() or cl.early_gain()):
@@ -2837,12 +3118,13 @@ async def occupy(ctx, ready: Sequence[Tuple[Config, float, str]], until: float) 
         if (hold or leftover_breeds()) and idle is not None and idle > 0:
             heads_left = any(cl.state == "climbing" and cl.pending for cl in live)
             packs_left = any(cl.state == "climbing" and (cl.later or cl.leaps) for cl in live)
-            if not heads_left and not packs_left:
+            if quota is not None or (not heads_left and not packs_left):
                 keep = head_reserve(live)
                 spare = idle - keep
                 held = min(idle, keep)
                 if spare > 0:
-                    ga = [f for f in ga if not f.done()] + await submit_ga(ctx, spare)
+                    rf = await submit_rf(ctx, int(spare * float(tune("climb.rf_ucb_share"))))
+                    ga = [f for f in ga if not f.done()] + rf + await submit_ga(ctx, spare - len(rf))
         note_reserve(ctx, held)
         if not live and not any(not f.done() for f in ga) and \
                 not any(not f.done() for f in getattr(ctx, "_scout_futs", [])):

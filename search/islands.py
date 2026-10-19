@@ -44,6 +44,33 @@ def quotas(cap: int, k: int) -> List[int]:
     return [cap // k + (1 if i < cap % k else 0) for i in range(k)]
 
 
+def weighted_quotas(cap: int, weights: Sequence[int]) -> List[int]:
+    """cap split in proportion to weights, the remainder to the largest fractions."""
+    total = sum(weights) or len(weights)
+    raw = [cap * w / total for w in weights]
+    out = [int(math.floor(x)) for x in raw]
+    for i in sorted(range(len(raw)), key=lambda i: out[i] - raw[i])[:cap - sum(out)]:
+        out[i] += 1
+    return out
+
+
+def climbing_in(view) -> int:
+    """Climbers still climbing on one island, from its published notes."""
+    eng = view.notes.get("engine") or {}
+    return sum(1 for b in eng.get("basins") or [] if isinstance(b, dict) and b.get("status") == "climbing")
+
+
+def rebalance(views: Sequence["IslandClient"], cap: int) -> None:
+    """islands.by_climber (user, 2026-10-19): every climbing climber gets the same share of the fleet, whichever island
+    it is on. An island's quota is its climbing climbers' share (one climber's worth when it has none, for its GA,
+    RF-UCB and the next seat); the island's engine reads it back as its capacity (Context.publish)."""
+    if not int(tune("islands.by_climber")) or len(views) < 2:
+        return
+    weights = [max(1, climbing_in(v)) for v in views]
+    for v, q in zip(views, weighted_quotas(cap, weights)):
+        v.quota = q
+
+
 class Island:
     """What an island's engine run knows about the islands: its index, how many there are, and their seats."""
 
@@ -299,6 +326,20 @@ def name_pick(base, views: Sequence[IslandClient]) -> None:
         base.pick_key = best[1]
 
 
+def island_distances(rows: Sequence[dict]) -> List[dict]:
+    """Between every two islands' best configs: the unit-cube distance and how many searched settings differ."""
+    out = []
+    for i, a in enumerate(rows):
+        for b in rows[i + 1:]:
+            va, vb = a.get("best_vec"), b.get("best_vec")
+            if not va or not vb or len(va) != len(vb):
+                continue
+            out.append({"a": a["island"], "b": b["island"],
+                        "distance": round(sum((x - y) ** 2 for x, y in zip(va, vb)) ** 0.5, 4),
+                        "settings": sum(1 for x, y in zip(va, vb) if abs(x - y) > 1e-9)})
+    return out
+
+
 def merge_notes(base, views: Sequence[IslandClient], cap: int) -> None:
     """client.notes["engine"]: the best island's notes, every island's summary and every island's climbers."""
     rows, lead, lead_best = [], None, None
@@ -318,7 +359,11 @@ def merge_notes(base, views: Sequence[IslandClient], cap: int) -> None:
                           "best": (v.notes.get("engine") or {}).get("best"),
                           "phase": (v.notes.get("engine") or {}).get("phase"),
                           "pick": (v.notes.get("engine") or {}).get("pick"),
-                          "climbers": len((v.notes.get("engine") or {}).get("basins") or [])} for v in views]
+                          "climbers": len((v.notes.get("engine") or {}).get("basins") or []),
+                          "best_vec": (v.notes.get("engine") or {}).get("best_vec"),
+                          "sources": (v.notes.get("engine") or {}).get("sources"),
+                          "cloud": (v.notes.get("engine") or {}).get("cloud") or []} for v in views]
+    merged["island_distances"] = island_distances(merged["islands"])
     basins, events = [], []
     for v in views:
         eng = v.notes.get("engine") or {}
@@ -350,6 +395,7 @@ async def run(base, cap: int, k: int, start: Callable[[IslandClient, Island], ob
     virtual = hasattr(base.executor, "now")
     try:
         while True:
+            rebalance(views, cap)
             merge_notes(base, views, cap)
             name_pick(base, views)
             if all(t.done() for t in tasks):
