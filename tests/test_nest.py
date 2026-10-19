@@ -40,7 +40,7 @@ def _round(root, tag, n, quals, pool):
     _bam(os.path.join(d, "input.bam"), quals)
     _vcf(os.path.join(d, "mutations.vcf.gz"), n)
     _vcf(os.path.join(d, "truth.vcf.gz"), pool, "SYNTHETIC")
-    Path(d, "round.json").write_text(json.dumps({"region": MB}))
+    Path(d, "round.json").write_text(json.dumps({"region": "chr1:1-8000000"}))
 
 
 def _tag(i):
@@ -53,11 +53,11 @@ class NestTest(unittest.TestCase):
         self.root = tempfile.mkdtemp()
         self.cache = mock.patch.object(nest, "ROUND_CACHE", Path(self.root) / "rounds.json")
         self.cache.start()
-        # on 2026-10-17/18, every 72 min: 12 binned rounds N 300..410 and 12 full ones N 500..610, base pool 610/Mb;
-        # then 6 full rounds with raised pools: N 700..750, pool = 8 N / 0.97
+        # on 2026-10-17/18, every 72 min, 8 Mb each: 12 binned rounds N 300..410 and 12 full ones N 500..610, base
+        # pool 650/Mb (5200 >= 1.06 x 8N: not raised); then 6 full rounds with raised pools: N 700..750, pool 8N / 0.97
         for i in range(24):
             binned = i % 2 == 0
-            _round(self.root, _tag(i), (300 if binned else 500) + 10 * (i // 2), BINNED if binned else FULL, 610)
+            _round(self.root, _tag(i), (300 if binned else 500) + 10 * (i // 2), BINNED if binned else FULL, 5200)
         for i in range(24, 30):
             n = 700 + 10 * (i - 24)
             _round(self.root, _tag(i), n, FULL, round(8 * n / 0.97))
