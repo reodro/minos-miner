@@ -252,6 +252,9 @@ class FleetExecutor:
         bundle = selftest.make_bundle(SETTINGS.cache_dir, SETTINGS.rounds_dir)
         push(h, selftest.bundle_files(bundle), f"{h.repo}/cache/selftest/")   # slice BAM + truth: the score check
         args = h.extra.get("node_args", "") + (f" --workers {int(h.workers)}" if h.workers else "")
+        k = int(tune("evaluator.split_k"))
+        if k > 1:                                                            # evaluator/split.py
+            args += f" --split {k} --split-pad {int(tune('evaluator.split_pad'))}"
         shared = {"MINOS_NODE_SHARED_DATA": "1"} if h.local else {}          # main's rounds are not the node's to delete
         env = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in {"DATA_DIR": h.data_dir, **shared, **h.extra.get("env", {})}.items())
         repo = shlex.quote(h.repo)

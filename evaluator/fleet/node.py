@@ -422,6 +422,9 @@ def main() -> None:
     ap.add_argument("--workers", type=int)
     ap.add_argument("--score-threads", type=int, help="scorer processes; default: one per GATK worker")
     ap.add_argument("--fake", action="store_true", help="tests only: FakeRunner/FakeScorer, no GATK, no self-test")
+    ap.add_argument("--split", type=int, default=1,
+                    help="region pieces per full-region run (evaluator/split.py); the node offers workers // split slots")
+    ap.add_argument("--split-pad", type=int, default=2000, help="bp of padding around each piece")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s node: %(message)s")
     from common.limits import raise_open_files
@@ -452,6 +455,11 @@ def main() -> None:
             selftest.record(SETTINGS.cache_dir, result)
     if a.selftest_only:
         print(json.dumps(result)); return
+    if a.split > 1:                           # after the self-test, which checks the unsplit runner
+        from evaluator.split import SplitRunner
+        runner = SplitRunner(runner, a.split, a.split_pad)
+        workers = max(1, workers // a.split)
+        log.info("split runs: %d pieces of each full-region run, %d slots", a.split, workers)
     node = Node(workers, runner, scorer_factory, a.score_threads,
                 score_dir=None if a.fake else os.path.join(SETTINGS.cache_dir, "dcache"))
     if not a.fake:

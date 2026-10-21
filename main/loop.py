@@ -11,7 +11,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 from answer_set.base import AnswerSetProvider
 from common.params import ParamRanges
 from common.store import ResultStore
-from common.types import FULL, AnswerSet, CallSet, Config, Round, ScoreResult
+from common.types import FULL, WHOLE, AnswerSet, CallSet, Config, Round, ScoreResult
 from evaluator.base import Executor, Scorer
 from search.client import EvalClient, Outcome
 from main.submitter import Submitter
@@ -82,6 +82,33 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
     def changed(config: Config) -> dict:
         return {k: v for k, v in config.params.items() if v != defaults.get(k)}
 
+    confirming: set = set()                       # configs whose WHOLE run has been asked for
+
+    def needs_whole(config: Config) -> bool:
+        """Split runs (evaluator/split.py) are exact without contamination; with it, the random read filter can shift
+        the score a little, so such a config is submitted on its WHOLE run (one unsplit run, the validator's result)."""
+        from common.tuning import tune
+        return (int(tune("evaluator.split_k")) > 1
+                and float(config.params.get("contamination_fraction_to_filter") or 0) > 0)
+
+    def trusted(key: str) -> Optional[float]:
+        """The score a submission can rely on: the FULL score when it is exact, else the WHOLE run's - asked for here
+        the first time (high priority, off the search's path) and None until it is back."""
+        config = client.configs[key]
+        if not needs_whole(config):
+            r = client.latest.get((key, FULL))
+            return r.score if r is not None else None
+        r = client.latest.get((key, WHOLE))
+        if r is not None:
+            return r.score
+        if key not in confirming:
+            confirming.add(key)
+            try:
+                client.propose(config, fidelity=WHOLE, priority=20, tag="whole check", batch="small")
+            except Exception:  # noqa: BLE001 - no check, no submission of this config; the round goes on
+                log.exception("whole-run check of %s could not be sent", key)
+        return None
+
     def maybe_submit(force: bool = False):
         best = client.best(FULL)
         if best is None:
@@ -90,10 +117,13 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         pick = client.picked()                    # the search's own pick (a plateau centre) goes out as it is
         key = submitted[0]
         if pick is not None and pick.config_key != key:
+            score = trusted(pick.config_key)
+            if score is None:
+                return                            # its whole-run check is still out
             if submitter.submit(round, client.configs[pick.config_key]):
                 submitted[0] = pick.config_key
                 last_submit[0] = clock()
-                out.submissions.append((clock(), pick.config_key, pick.score))
+                out.submissions.append((clock(), pick.config_key, score))
             return
         if pick is not None or best.config_key == key:
             return
@@ -101,12 +131,15 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
             return                            # the first submission is never delayed; later ones wait
         if not force and clock() - last_refused[0] < 30.0:
             return
-        current = client.latest[(key, FULL)].score if key else None
-        if current is None or best.score > current + settings.resubmit_margin:
+        score = trusted(best.config_key)
+        if score is None:
+            return                                # its whole-run check is still out
+        current = trusted(key) if key else None
+        if current is None or score > current + settings.resubmit_margin:
             if submitter.submit(round, client.configs[best.config_key]):
                 submitted[0] = best.config_key
                 last_submit[0] = clock()
-                out.submissions.append((clock(), best.config_key, best.score))
+                out.submissions.append((clock(), best.config_key, score))
             else:
                 last_refused[0] = clock()
 

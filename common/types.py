@@ -116,6 +116,8 @@ class AnswerSet:
 
 
 FULL = "full"   # fidelity of a full-region evaluation; anything else is a sub-region like "chr20:1-1000000"
+WHOLE = "full:whole"   # the full region in ONE GATK run, never split into region pieces (evaluator/split.py): the
+                       # validator's exact result, asked for before a split-scored config is submitted
 
 
 @dataclass(frozen=True)

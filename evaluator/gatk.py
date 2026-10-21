@@ -44,7 +44,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from common.scoring import finalize
 from common.settings import SETTINGS
-from common.types import CLASSES, FULL, AnswerSet, CallSet, ClassCounts, Config, Round, ScoreResult
+from common.types import CLASSES, FULL, WHOLE, AnswerSet, CallSet, ClassCounts, Config, Round, ScoreResult
 
 log = logging.getLogger(__name__)
 
@@ -362,6 +362,7 @@ class GatkRunner:
         self._servers_busy: List[_GatkServer] = []
         self._server_jobs = 0
         self.server_stats = {"jobs": 0, "fallbacks": 0, "verified": 0, "started": 0}
+        self.extra = threading.local()               # .props: JVM properties this thread's next runs also get (split.py)
 
     def command(self, round: Round, config: Config, fidelity: str, out_vcf: Path, jvm_props: Optional[dict] = None) -> list:
         from templates.tool_params import validate_and_build_flags   # upstream
@@ -379,14 +380,14 @@ class GatkRunner:
             cmd += [GATK_IMAGE, "gatk", "--java-options", heap, "HaplotypeCaller"]
         else:
             jvm_props = {**self._activity_cache(config, fidelity, jvm_props), **self._assembly_cache(config, fidelity, jvm_props),
-                         **(jvm_props or {})}
+                         **(jvm_props or {}), **(getattr(self.extra, "props", None) or {})}
             props = [f"-D{k}={v}" for k, v in jvm_props.items()]
             cmd += ["-v", f"{self.patch_jar.parent}:/patch:ro", GATK_IMAGE, "java", *WRAPPER_JVM, heap, *props,
                     "-cp", f"/patch/{self.patch_jar.name}:{GATK_JAR_IN_IMAGE}", "org.broadinstitute.hellbender.Main",
                     "HaplotypeCaller"]
         cmd += ["-R", f"/data/reference/{ref.name}", "-I", f"/data/bams/{bam.name}",
                "-O", f"/data/output/{out_vcf.name}", "--native-pair-hmm-threads", str(self.threads),
-               "-L", round.region if fidelity == FULL else fidelity]
+               "-L", round.region if fidelity in (FULL, WHOLE) else fidelity]
         for f in flags["flags"]:
             cmd.extend(str(f).split())
         for a in SAFE_ANNOTATION_EXCLUSIONS:
@@ -593,7 +594,8 @@ class GatkRunner:
 
     def _reserve_warm(self, parent: Path, config: Config, fidelity: str) -> Optional[Path]:
         """A directory for a warm session, or None when this run should exit as usual."""
-        if self.patch_jar is None or self.branch_key(config, fidelity) is None or self.server:
+        if self.patch_jar is None or self.branch_key(config, fidelity) is None or self.server \
+                or getattr(self.extra, "props", None):     # a split piece: its chain cannot share the JVM with a session
             return None
         with self._warm_lock:
             alive = sum(1 for s in self._warm.values() if s.proc.poll() is None)

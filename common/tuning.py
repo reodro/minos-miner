@@ -257,6 +257,12 @@ KNOBS_LIST: List[Knob] = [
          "running. Each kept round holds its BAM and callsets on every node: raise it for multi-round tuning."),
     Knob("evaluator.max_copy_share", 0.02, 0.0, 1.0, LIVE, "share",
          "Most of the ready workers that slow-batch copies may hold at once (0 turns copies off)."),
+    Knob("evaluator.split_k", 1, 1, 16, ROUND, "count",
+         "Region pieces per full-region GATK run (evaluator/split.py): each config runs as this many padded pieces at "
+         "once on one node and is merged, so it comes back several times sooner and each node offers workers / k "
+         "slots. 1: off. Read when the node sessions start (a miner restart)."),
+    Knob("evaluator.split_pad", 2000, 0, 20000, ROUND, "bp",
+         "Padding of each region piece beyond its own part, on both sides (evaluator.split_k > 1)."),
     Knob("evaluator.lost_factor", 6.0, 2.0, 100.0, LIVE, "x",
          "A GATK run outstanding this many times its expected time (and at least 40 minutes) is lost: its jobs are "
          "queued again and the node is told to drop it."),
