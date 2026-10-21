@@ -35,7 +35,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k047_20261018T1106) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k050_20261021T0135) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -256,6 +256,19 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   Release check: 15 live 1000G rounds after the training cut-off (2026-10-17 15:30 .. 10-18 09:30), built and
   scored like the validator: vs k040 +0.0311 per round, t 2.42, better 10 / worse 3; vs k045 (same recipe, old
   rule) +0.0255, t 3.28 - the gain is the entry rule; k045 vs k040 +0.0056 (more data alone). GATK fallback k038.
+- k050 (1000G, released 2026-10-21) = k047 + a haplotype-aware het/hom model (`k2/hapgt.py`, `hom_hap.joblib`, meta
+  `hom_hap`). On k047's 27 live rounds 62% of the wrong het/hom calls on inserted indels (13% of the right ones) had
+  another variant in the read window: reads carrying the indel and its neighbour did not match "the indel alone", so
+  a hom indel next to a het neighbour looked het, and the reverse. Each spanning read is now judged against every
+  local haplotype (the indel with or without each of up to 5 nearest neighbours: the person's records and the other
+  called candidates); a model on k047's columns + homrep's measurements + these counts replaces p_hom for every called
+  indel candidate that is not the person's. Held-out on k047's folds (102 rounds, 112,114 true inserted indels):
+  genotype errors 544 -> 476, with neighbours 306 -> 242, >= 4 bp 193 -> 147.
+  Release check: 41 held-out 1000G rounds (k047's out/kg_release set): +0.0218/round, t 3.87, better 22 / worse 5,
+  false records 325 -> 291 (test/answer_set/gt_study). Rollback: `--rollback` (k047).
+- Off by default, not in any released version: `gt_unsure_drop` (leave out inserted indels whose het/hom p is within
+  m of 0.5; k048 m 0.1 +0.0055/round, t 2.32 - a scoring tactic, held back) and the GIAB DNA call model hook
+  (`call_dna` with `in_mode_donor` as the person; g078 +0.0036/round, t 0.67 on 30 frozen rounds - not released).
 
 ## Open work
 

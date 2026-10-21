@@ -148,15 +148,16 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     p_any = m_any.predict_proba(X)[:, 1] if len(keys) else np.array([])
     p_hom = m_hom.predict_proba(X)[:, 1] if len(keys) else np.array([])
     n_call_dna = None
-    if not info["mode_giab"] and meta.get("call_dna") and len(keys):
-        # non-person indel candidates: call decision from the model that also sees reads judged by DNA (calldna.py)
+    if meta.get("call_dna") and len(keys):
+        # non-person indel candidates (GIAB: not in the donor's NIST list): call decision from the model that also
+        # sees reads judged by DNA (calldna.py)
         import joblib
         from answer_set.k2 import calldna
         m_cd = joblib.load(tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
                            / "call_dna.joblib")
         fa_c, bam_c = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
-        p_any, n_call_dna = calldna.apply(p_any, keys, X, X_full[:, FEATURES.index("gatk_person_called")], bam_c, fa_c,
-                                          chrom, m_cd)
+        person = X_full[:, FEATURES.index("in_mode_donor" if info["mode_giab"] else "gatk_person_called")]
+        p_any, n_call_dna = calldna.apply(p_any, keys, X, person, bam_c, fa_c, chrom, m_cd)
         fa_c.close(); bam_c.close()
     p_raw = p_any
     if len(keys) and meta.get("thr_class"):
@@ -193,6 +194,17 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
                 p_any = np.where([k in every for k in keys], 0.0, p_any) if len(keys) else p_any
         except Exception as e:  # noqa: BLE001  (never stuck: fall back to the model)
             kg_own = f"error: {e}"[:300]
+    n_hom_hap = None
+    if not info["mode_giab"] and meta.get("hom_hap") and isinstance(kg_own, int) and len(keys):
+        # called indels that are not the person's: het/hom from reads judged against local haplotypes with their
+        # neighbours (hapgt.py)
+        import joblib
+        from answer_set.k2 import hapgt
+        m_hh = joblib.load(tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
+                           / "hom_hap.joblib")
+        fa_hh, bam_hh = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
+        p_hom, n_hom_hap = hapgt.apply(p_hom, keys, X, p_any, thr, donor, bam_hh, fa_hh, chrom, m_hh)
+        fa_hh.close(); bam_hh.close()
     allowed = None
     if info["mode_giab"] and meta.get("giab_bed_rule"):
         bed = beds[info["mode_donor"]]
@@ -333,6 +345,17 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         fa_g, bam_g = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
         recs, n_guard = readguard.apply(recs, bam_g, fa_g, chrom, dict(zip(keys, p_any)), thr)
         fa_g.close(); bam_g.close()
+    n_gt_unsure = None
+    if meta.get("gt_unsure_drop") and len(keys):
+        # an inserted indel whose het/hom the model is unsure of is left out: a wrong het/hom is both a miss and a
+        # false record, leaving it out only a miss. Only records still carrying the model's own genotype.
+        m_ = float(meta["gt_unsure_drop"])
+        ph_ = dict(zip(keys, p_hom))
+        before = len(recs)
+        recs = [r for r in recs if not (r[4] and len(r[1]) != len(r[2]) and (r[0], r[1], r[2]) in ph_
+                                        and abs(ph_[(r[0], r[1], r[2])] - 0.5) < m_
+                                        and r[3] == ("hom" if ph_[(r[0], r[1], r[2])] >= 0.5 else "het"))]
+        n_gt_unsure = before - len(recs)
     donor_raw = None
     if info["mode_giab"]:
         from answer_set.k2.util import donor_records
@@ -370,7 +393,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
         "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok",
-        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "hom_repeat": n_hom_repeat, "call_dna": n_call_dna, "hc_fallback": hc_fallback,
+        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "gt_unsure": n_gt_unsure, "hom_hap": n_hom_hap, "hom_repeat": n_hom_repeat, "call_dna": n_call_dna, "hc_fallback": hc_fallback,
     }
     (out / "report.json").write_text(json.dumps(report, indent=1))
     return report
