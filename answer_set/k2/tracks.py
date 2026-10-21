@@ -230,7 +230,7 @@ def release(track, name):
         return dst
     dst.mkdir(parents=True, exist_ok=True)
     for f in list(RELEASE_FILES) + [x for x in ("window.joblib", "spelling.joblib", "cluster_chooser.joblib",
-                                                "cluster_arbiter.joblib", "cluster_resolver.joblib", "hom_repeat.joblib", "call_dna.joblib", "hom_hap.joblib") if (src / x).exists()]:
+                                                "cluster_arbiter.joblib", "cluster_resolver.joblib", "hom_repeat.joblib", "call_dna.joblib", "hom_hap.joblib", "call_hap.joblib") if (src / x).exists()]:
         shutil.copy2(src / f, dst / f)
     return dst
 

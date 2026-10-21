@@ -180,6 +180,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
 
     donor = donors[info["mode_donor"]] if info["mode_giab"] else {}
     kg_own = None
+    kg_every = set()
     kgi = info.get("kg") or {}
     if (not info["mode_giab"] and meta.get("kg_own_rule") and kgi.get("gatk_person_checked")
             and not kgi.get("gatk_person_error")):
@@ -188,14 +189,27 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         from answer_set.k2 import kg
         try:
             own, every = kg.gatk_person_own(chrom, a, b, kgi["person"])
+            kg_every = every
             if own:
                 kg_own = len(own)
                 donor = own
                 p_any = np.where([k in every for k in keys], 0.0, p_any) if len(keys) else p_any
         except Exception as e:  # noqa: BLE001  (never stuck: fall back to the model)
             kg_own = f"error: {e}"[:300]
+    n_call_hap = None
+    if meta.get("call_hap") and (info["mode_giab"] or isinstance(kg_own, int)) and len(keys):
+        # indel candidates that are not the person's: called by a model that also sees reads judged against local
+        # haplotypes with their neighbours (hapgt.apply_call); before the het/hom step, which uses the calls
+        import joblib
+        from answer_set.k2 import hapgt
+        m_ch = joblib.load(tracks.vdir(track, (track_versions or {}).get(track) or tracks.active_name(track))
+                           / "call_hap.joblib")
+        fa_ch, bam_ch = pysam.FastaFile(str(ref_path(chrom))), pysam.AlignmentFile(str(bam))
+        p_any, n_call_hap = hapgt.apply_call(p_any, keys, X, meta, donor, set(donor) if info["mode_giab"] else kg_every,
+                                             bam_ch, fa_ch, chrom, m_ch)
+        fa_ch.close(); bam_ch.close()
     n_hom_hap = None
-    if not info["mode_giab"] and meta.get("hom_hap") and isinstance(kg_own, int) and len(keys):
+    if meta.get("hom_hap") and (info["mode_giab"] or isinstance(kg_own, int)) and len(keys):
         # called indels that are not the person's: het/hom from reads judged against local haplotypes with their
         # neighbours (hapgt.py)
         import joblib
@@ -252,7 +266,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
     win_path = out / "work" / "hg_windows_replace.pkl.gz"
     if not win_path.exists():
         win_path = out / "work" / "hg_windows.pkl.gz"
-    if info["mode_giab"] and meta.get("window_thr") is not None and win_path.exists():
+    if meta.get("window_thr") is not None and win_path.exists() and (info["mode_giab"] or isinstance(kg_own, int)):
         # window decisions: where the genotyper's whole-window answer replaces the per-variant one (hapwin.py)
         from answer_set.k2 import hapwin
         wm = tracks.load_window(track, (track_versions or {}).get(track) or tracks.active_name(track), exclude_round)
@@ -267,7 +281,9 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         if meta.get("window_lr"):                       # window model trained with lr_answer (hapwin.FEATS_LR)
             bam_lr, fa_lr = pysam.AlignmentFile(str(bam)), pysam.FastaFile(str(ref_path(chrom)))
             lr_fn = lambda s_, e_, w_, A_: hapwin.answer_lr(bam_lr, fa_lr, chrom, s_, e_, w_, A_)  # noqa: E731
-        cands = hapwin.candidates(wins, answer, dict(zip(keys, p_raw)), donor, beds[info["mode_donor"]], hc_calls, lr_fn)
+        from answer_set.k2.util import Everywhere
+        w_bed = beds[info["mode_donor"]] if info["mode_giab"] else Everywhere()     # 1000G: no confident region
+        cands = hapwin.candidates(wins, answer, dict(zip(keys, p_raw)), donor, w_bed, hc_calls, lr_fn)
         wthr = dict(meta["window_thr_group"], default=meta["window_thr"]) if meta.get("window_thr_group") \
             else meta["window_thr"]
         vname = (track_versions or {}).get(track) or tracks.active_name(track)
@@ -280,10 +296,11 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         if cands:
             pw = wm.predict_proba(np.vstack([c[5] for c in cands]))[:, 1]
             recs, n_windows = hapwin.apply(recs, cands, pw, wthr, respell_fn)
-        fa_emit = pysam.FastaFile(str(ref_path(chrom)))
-        recs, n_sp, n_emit = hapwin.emit_from_called(recs, wins, donor, beds[info["mode_donor"]], fa_emit, chrom,
-                                                     dict(zip(keys, p_raw)))
-        n_windows = (n_windows or 0) + n_sp + n_emit
+        if info["mode_giab"]:                            # GIAB only: leftover Minos events next to donor haplotypes
+            fa_emit = pysam.FastaFile(str(ref_path(chrom)))
+            recs, n_sp, n_emit = hapwin.emit_from_called(recs, wins, donor, beds[info["mode_donor"]], fa_emit, chrom,
+                                                         dict(zip(keys, p_raw)))
+            n_windows = (n_windows or 0) + n_sp + n_emit
     if info["mode_giab"]:
         # Shorten a merged allele before the second-spelling pass. A one-base-longer indel
         # sitting on a homozygous run is the run plus the real allele; dropping it first
@@ -393,7 +410,7 @@ def build(bam, region, out, threads=8, exclude_round=None, track_versions=None):
         "predicted_injections": len(injected), "mutations_N": len(muts), "threshold": thr,
         "model": used, "seconds": {"features": round(t_feat, 1), "total": round(time.time() - t0, 1)},
         "readdiff": info.get("readdiff"), "kg_own_rule": kg_own, "inputs": changed_inputs or "ok",
-        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "gt_unsure": n_gt_unsure, "hom_hap": n_hom_hap, "hom_repeat": n_hom_repeat, "call_dna": n_call_dna, "hc_fallback": hc_fallback,
+        "windows_replaced": n_windows, "run_edge": n_run_edge, "read_guard": n_guard, "gt_unsure": n_gt_unsure, "hom_hap": n_hom_hap, "call_hap": n_call_hap, "hom_repeat": n_hom_repeat, "call_dna": n_call_dna, "hc_fallback": hc_fallback,
     }
     (out / "report.json").write_text(json.dumps(report, indent=1))
     return report

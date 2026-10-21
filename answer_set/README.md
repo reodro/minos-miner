@@ -35,7 +35,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k050_20261021T0135) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k060_20261021T1303) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -266,6 +266,18 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   genotype errors 544 -> 476, with neighbours 306 -> 242, >= 4 bp 193 -> 147.
   Release check: 41 held-out 1000G rounds (k047's out/kg_release set): +0.0218/round, t 3.87, better 22 / worse 5,
   false records 325 -> 291 (test/answer_set/gt_study). Rollback: `--rollback` (k047).
+- k060 (1000G, released 2026-10-21) = k050 + window decisions on 1000G (hapwin.py, the GIAB step, now also for 1000G:
+  `window.joblib`, meta `window_thr` 0.70; build.py runs it when the person's records are known, with util.Everywhere
+  for the missing confident region; GIAB's emit_from_called stays GIAB-only). On k050's 44 live 1000G rounds, at
+  1.86 inserted indels per round that never became candidates the local genotyper's called pair of sequences was
+  exactly the truth's (compound clusters in repeats, spelled differently from Minos's records); 1000G had no step that
+  writes whole windows. Window model trained on k050's 102 rounds (test/answer_set/gt_study/kg_train_window.py,
+  leave-out folds; cut-off 0.70: 117 windows fixed / 16 broken). Release check, 41 held-out 1000G rounds: +0.0087/round
+  vs k050, t 2.63, better 17 / worse 7, false records 291 -> 284 (cut-off 0.45, the folds' best: +0.0020, t 0.49 -
+  0.70 was chosen after seeing that, so a fresh-round check runs in kg_holdout_grow from 2026-10-21 14:00).
+- Off by default, tested and not released: haplotype-aware CALL model (hapgt.apply_call, meta call_hap; 1000G k057
+  -0.0007, GIAB g080/g081 +0.009 t 1.74 - fresh-round check running), GIAB haplotype het/hom (g079 -0.0019), entry
+  rule 3 (features.KG_RD_ENTRY 3, compound-het second alleles; k056 retrained +0.0063 t 0.97).
 - Off by default, not in any released version: `gt_unsure_drop` (leave out inserted indels whose het/hom p is within
   m of 0.5; k048 m 0.1 +0.0055/round, t 2.32 - a scoring tactic, held back) and the GIAB DNA call model hook
   (`call_dna` with `in_mode_donor` as the person; g078 +0.0036/round, t 0.67 on 30 frozen rounds - not released).

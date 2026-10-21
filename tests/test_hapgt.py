@@ -58,5 +58,20 @@ class HapCountsTest(unittest.TestCase):
         self.assertEqual(hapgt._edit("ACGTACGT", 1, [(2, "C", "T")]), "ATGTACGT")
 
 
+class EverywhereTest(unittest.TestCase):
+    """1000G window decisions run without a confident region: util.Everywhere stands in for the Bed."""
+
+    def test_every_position_counts(self):
+        from answer_set.k2.util import Everywhere
+        e = Everywhere()
+        self.assertTrue(e.contains(1) and e.contains(10 ** 9))
+        self.assertEqual(e.covered_bp(100, 131), 32)
+
+    def test_window_candidates_accept_it(self):
+        from answer_set.k2 import hapwin
+        from answer_set.k2.util import Everywhere
+        self.assertEqual(hapwin.candidates([], {}, {}, {}, Everywhere()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

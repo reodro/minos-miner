@@ -53,6 +53,9 @@ HC_BUDGET_S = 300
 # 0: >= 2 edited reads, >= 25% of the cover, >= the strongest change within 10 bp (half of it for 1-bp indels).
 # 2 (2026-10-18): indels with >= 3 edited reads also enter at >= 15% of the cover if still >= that neighbour, or at
 #    >= 25% whatever the neighbour (k040's 18 live rounds: +1.7 real inserted indels per round, +2.2 noise)
+# 3 (2026-10-21): 2, plus the second-strongest indel at the same anchor as a stronger one with >= 3 edited reads and
+#    >= 15% of the cover - a compound het's other inserted allele (101 1000G rounds 10-05..10-17: +1.32 real, +1.83 noise
+#    per round; 71 of 100 never-candidate inserted indels >= 2 bp on k047's live rounds were validator misses)
 KG_RD_ENTRY = int(os.environ.get("MINOS_KG_RD_ENTRY", "0"))
 # 1000G rounds: read-comparison candidates judged per SITE for indels >= 2 bp (meta kg_site_rule; build.py sets it).
 # In tandem repeats Minos's inserted indel shows up in the edited reads at several lengths, so no single length reaches
@@ -522,11 +525,26 @@ def _extract(bam, region, workdir, threads, cand_vcf, reuse, chrom, a, b, hc_job
                         top = [x for j, x in enumerate(top) if rdiff[x[0]][2] >= 2
                                and (j == 0 or x[1] >= 0.3 * top[0][1])]
                     site_keep.update(k for k, _, _ in top if abs(len(k[1]) - len(k[2])) >= 2)
+        second_keep = set()
+        if KG_RD_ENTRY >= 3 and not mode_giab:
+            # version 3: the second-strongest indel at the same anchor as a stronger one - Minos's other inserted
+            # allele of a compound het (one per copy), which "as strong as the neighbour" always rejects
+            by_anchor = {}
+            for k, (sup, cov, ori) in rdiff.items():
+                if L_rd(k) >= 1:
+                    by_anchor.setdefault(k[0], []).append((sup, cov, k))
+            for al in by_anchor.values():
+                if len(al) >= 2:
+                    sup2, cov2, k2 = sorted(al, reverse=True)[1]
+                    if sup2 >= 3 and sup2 >= 0.15 * cov2:
+                        second_keep.add(k2)
         for k, (sup, cov, ori) in rdiff.items():
             # 1-bp indels: half the strongest neighbour is enough (g005's "must be strongest" rule lost real ones)
             need = RD_1BP_FACTOR * sib_max(k) if abs(len(k[1]) - len(k[2])) == 1 else sib_max(k)
             if k in site_keep and k not in cands and k not in own and a <= k[0] <= b:
                 pass                                    # a strong repeat site's best lengths (KG_SITE_RULE)
+            elif k in second_keep and k not in cands and k not in own and a <= k[0] <= b:
+                pass                                    # a compound het's second allele (KG_RD_ENTRY 3)
             elif (KG_RD_ENTRY >= 2 and not mode_giab and L_rd(k) >= 1 and k not in cands and k not in own
                     and a <= k[0] <= b and sup >= 3 and ((sup >= 0.15 * cov and sup >= need) or sup >= 0.25 * cov)):
                 pass                                    # the looser 1000G entry (KG_RD_ENTRY 2)

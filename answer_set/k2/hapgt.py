@@ -121,3 +121,32 @@ def apply(p_hom, keys, X, p_any, thr, person, bam, fa, chrom, model):
         out[i] = model.predict_proba(np.hstack([X[i], f])[None, :])[0, 1]
         n += 1
     return out, n
+
+
+def apply_call(p_any, keys, X, meta, person, every, bam, fa, chrom, model):
+    """p_any with the haplotype-aware call model's value for every indel candidate that is not one of the person's
+    GATK calls (`every`): repeat/read measurements (calldna.feats) + the haplotype-aware read counts, neighbours =
+    the person's records + the candidates called so far; the class cut-offs are applied to the new values
+    -> (p_any, n replaced). Held-out on k047's 102 rounds (test/answer_set/gt_study/kg_callhap_eval.py): missed real
+    inserted indels 521 -> 467, false calls 227 -> 213."""
+    from answer_set.k2 import calldna, tracks
+    thr = meta["threshold"]
+    called = [k for k, p in zip(keys, p_any) if p >= thr and k not in person]
+    nb, pos = neighbours(keys, called, person)
+    idx = [i for i, k in enumerate(keys) if len(k[1]) != len(k[2]) and k not in every]
+    if not idx:
+        return p_any, 0
+    F = []
+    for i in idx:
+        k = keys[i]
+        _, span, _ = repeat_at(fa, chrom, k)
+        c = hap_counts(bam, fa, chrom, k, span, [x[0] for x in window_neigh(nb, pos, k, span)])
+        neigh = window_neigh(nb, pos, k, span)
+        n = c["carry"] + c["without"]
+        F.append(calldna.feats(bam, fa, chrom, k) + [c["carry"], c["without"], c["other"], c["carry"] / n if n else np.nan,
+                                                     len(neigh), sum(x[1] == "person" for x in neigh),
+                                                     sum(x[1] == "called" for x in neigh)])
+    raw = model.predict_proba(np.hstack([X[idx], np.array(F, dtype=float)]))[:, 1]
+    out = p_any.copy()
+    out[idx] = tracks.apply_class_thr(meta, [keys[i] for i in idx], raw)
+    return out, len(idx)

@@ -170,6 +170,16 @@ class Bed:
         return sum(max(0, min(y, b) - max(x, a - 1)) for x, y in self.iv if y > a - 1 and x < b)
 
 
+class Everywhere:
+    """Bed's interface for rounds without a confident region (1000G): every position counts."""
+
+    def contains(self, pos1):
+        return True
+
+    def covered_bp(self, a, b):
+        return b - a + 1
+
+
 def donor_records(d, chrom, a, b):
     """{pos: (REF, ALTs, GT)} of the donor's GIAB records in the window, written the way Minos's truth writes them:
     NIST's own REF, ALT order and genotype order, phased '|' as '/'. The validator classes a two-allele record by
