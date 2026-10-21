@@ -86,6 +86,22 @@ public final class Utils {
         MinosKBest.reset();
     }
 
+    /** minos split chain: generators in a new JVM's state (the seed), as a piece starting at the region's start has. */
+    public static MinosRecordingRandom minosFreshRandom() { return new MinosRecordingRandom(GATK_RANDOM_SEED); }
+    public static MinosRecordingWell minosFreshWell() { return new MinosRecordingWell(GATK_RANDOM_SEED); }
+
+    /**
+     * minos split runs: put both global generators exactly where a whole-region run had them - at the seed, then
+     * `gaussians` nextGaussian calls on the Random (the only way genotyping draws from it) and `steps` raw steps on
+     * the Well (every Well draw is one step). Recording and counters restart from there.
+     */
+    public static void minosSeek(final long gaussians, final long steps) {
+        randomGenerator.minosReset(GATK_RANDOM_SEED);
+        randomGenerator.skipGaussians(gaussians);
+        randomWell.minosReset(GATK_RANDOM_SEED);
+        randomWell.skipSteps(steps);
+    }
+
     private static final int TEXT_WARNING_WIDTH = 68;
     private static final String TEXT_WARNING_PREFIX = "* ";
     private static final String TEXT_WARNING_BORDER = StringUtils.repeat('*', TEXT_WARNING_PREFIX.length() + TEXT_WARNING_WIDTH);

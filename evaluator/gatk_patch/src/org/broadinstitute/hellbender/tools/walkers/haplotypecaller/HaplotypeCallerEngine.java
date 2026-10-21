@@ -302,6 +302,8 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         minosInitGenotypingVariants();
         minosInitWarm();
         minosInitRepair();
+        minosInitRngProbe();
+        minosInitSplit();
 
         // Create other custom genotyping engines if user provided ploidyRegions
         for (final int ploidy : this.allCustomPloidies) {
@@ -763,7 +765,338 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
         }
     }
 
+    // ---------------------------------------------------------------------------------------------------------------
+    // minos split runs (evaluator/split.py). -Dminos.rng.log=<file>: one line per region before it is called - span
+    // start, span end, the Random's gaussians, the Well's steps, the Random's raw draws. -Dminos.rng.at=<pos>:<g>:<w>:
+    // at the first region starting at or after <pos>, both generators are moved to exactly (g, w) (Utils.minosSeek),
+    // the positions a whole-region run had there, so a region piece draws the same numbers from its own part on.
+    // ---------------------------------------------------------------------------------------------------------------
+    private java.io.PrintWriter minosRngLog = null;
+    private long minosRngAtPos = -1, minosRngAtG = 0, minosRngAtW = 0;
+
+    private void minosInitRngProbe() {
+        final String log = System.getProperty("minos.rng.log");
+        if (log != null) {
+            try {
+                minosRngLog = new java.io.PrintWriter(Files.newBufferedWriter(Paths.get(log)), true);
+            } catch (final IOException e) {
+                throw new UserException("cannot write " + log, e);
+            }
+        }
+        final String at = System.getProperty("minos.rng.at");
+        if (at != null) {
+            final String[] f = at.split(":");
+            minosRngAtPos = Long.parseLong(f[0]);
+            minosRngAtG = Long.parseLong(f[1]);
+            minosRngAtW = Long.parseLong(f[2]);
+        }
+    }
+
+    private void minosRngProbe(final AssemblyRegion region) {
+        if (minosRngAtPos >= 0 && region.getSpan().getStart() >= minosRngAtPos) {
+            Utils.minosSeek(minosRngAtG, minosRngAtW);
+            minosRngAtPos = -1;
+        }
+        if (minosRngLog != null) {
+            minosRngLog.println(region.getSpan().getStart() + "\t" + region.getSpan().getEnd() + "\t"
+                    + Utils.minosGlobalRandom().gaussians() + "\t" + Utils.minosGlobalWell().steps() + "\t"
+                    + Utils.minosGlobalRandom().minosRawDraws());
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // minos split chain (evaluator/split.py). A region piece walks its region as usual. For every region of its own
+    // part [lo, hi) it keeps what genotyping needs (as the warm JVM does) for the main config and every genotyping or
+    // PairHMM batch variant, plus the random draws the read pass made since the previous region. After the walk it
+    // waits for the generator states a whole-region run has at the start of its part (-Dminos.split.state.in, written
+    // by the piece before it; the first piece starts from the seed), genotypes its own regions again with them -
+    // replaying each region's read-pass draws first, which also proves the walk kept the reads a whole run keeps
+    // (else that config is "diverged") - writes <output>.split.vcf.gz per config, and passes the states on
+    // (-Dminos.split.state.out). Genotyping is ~1% of a run, so the chain adds seconds, not a second pass.
+    //   -Dminos.split.part=<lo>:<hi>  -Dminos.split.main.out=<vcf>  -Dminos.split.status=<file>
+    //   -Dminos.split.cancel=<file>   (appears when another piece failed: stop waiting)
+    // ---------------------------------------------------------------------------------------------------------------
+    private long minosSplitLo = -1, minosSplitHi = -1;
+    private final List<MinosSplitRegion> minosSplitRegions = new ArrayList<>();
+    private MinosSplitRegion minosSplitCurrent = null;
+    private String[] minosSplitBoundary = null;         // the first region at or after hi: key, Random / Well draw counts
+    private static final long MINOS_SPLIT_WAIT_MS = 30 * 60 * 1000L;
+
+    private static final class MinosSplitTask {
+        final MinosGenotypingVariant variant;            // null = the main config
+        final HaplotypeCallerGenotypingEngine engine;
+        final List<Haplotype> haplotypes;
+        final AlleleLikelihoods<GATKRead, Haplotype> likelihoods;
+        final AlleleLikelihoods<GATKRead, Haplotype> preFilter;
+        final Map<String, List<GATKRead>> filteredReads;
+        final byte[] fullRef;
+        final SimpleInterval paddedLoc;
+        final SimpleInterval span;
+        final FeatureContext features;
+        final List<Event> givenAlleles;
+        final SAMFileHeader readsHeader;
+        final Set<Integer> suspicious;
+
+        MinosSplitTask(final MinosGenotypingVariant variant, final HaplotypeCallerGenotypingEngine engine,
+                       final List<Haplotype> haplotypes, final AlleleLikelihoods<GATKRead, Haplotype> likelihoods,
+                       final AlleleLikelihoods<GATKRead, Haplotype> preFilter, final Map<String, List<GATKRead>> filteredReads,
+                       final byte[] fullRef, final SimpleInterval paddedLoc, final SimpleInterval span,
+                       final FeatureContext features, final List<Event> givenAlleles, final SAMFileHeader readsHeader,
+                       final Set<Integer> suspicious) {
+            this.variant = variant;
+            this.engine = engine;
+            this.haplotypes = haplotypes;
+            this.likelihoods = likelihoods;
+            this.preFilter = preFilter;
+            this.filteredReads = filteredReads;
+            this.fullRef = fullRef == null ? null : fullRef.clone();
+            this.paddedLoc = paddedLoc;
+            this.span = span;
+            this.features = features;
+            this.givenAlleles = givenAlleles;
+            this.readsHeader = readsHeader;
+            this.suspicious = new HashSet<>(suspicious);
+        }
+    }
+
+    private static final class MinosSplitRegion {
+        String key;
+        List<int[]> randomDraws;
+        List<int[]> wellDraws;
+        final List<MinosSplitTask> tasks = new ArrayList<>();
+    }
+
+    /** One config's generators along the chain, and its output. */
+    private static final class MinosSplitConfig {
+        final String name;
+        final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng;
+        final org.broadinstitute.hellbender.utils.MinosRecordingWell well;
+        final org.apache.commons.math3.random.RandomDataGenerator rdg;
+        VariantContextWriter writer;
+        boolean diverged = false;
+
+        MinosSplitConfig(final String name, final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng,
+                         final org.broadinstitute.hellbender.utils.MinosRecordingWell well) {
+            this.name = name;
+            this.rng = rng;
+            this.well = well;
+            this.rdg = new org.apache.commons.math3.random.RandomDataGenerator(well);
+        }
+    }
+
+    private void minosInitSplit() {
+        final String part = System.getProperty("minos.split.part");
+        if (part == null || System.getProperty("minos.repair.log") != null || System.getProperty("minos.warm.dir") != null) {
+            return;                                      // not a piece, or a mode the chain cannot share (no status: the runner runs whole)
+        }
+        final String[] f = part.split(":");
+        minosSplitLo = Long.parseLong(f[0]);
+        minosSplitHi = Long.parseLong(f[1]);
+        Utils.minosGlobalRandom().setRecording(true);    // read-pass draws; minosBefore/AfterGenotyping pause it
+        Utils.minosGlobalWell().setRecording(true);
+    }
+
+    private void minosSplitEnter(final AssemblyRegion region) {
+        if (minosSplitLo < 0) {
+            return;
+        }
+        final List<int[]> randomDraws = Utils.minosGlobalRandom().takeDraws();
+        final List<int[]> wellDraws = Utils.minosGlobalWell().takeDraws();
+        final long start = region.getSpan().getStart();
+        minosSplitCurrent = null;
+        if (start >= minosSplitLo && start < minosSplitHi) {
+            final MinosSplitRegion r = new MinosSplitRegion();
+            r.key = minosRegionKey(region);
+            r.randomDraws = randomDraws;
+            r.wellDraws = wellDraws;
+            minosSplitRegions.add(r);
+            minosSplitCurrent = r;
+        } else if (start >= minosSplitHi && minosSplitBoundary == null) {
+            minosSplitBoundary = new String[]{minosRegionKey(region), String.valueOf(randomDraws.size()),
+                    String.valueOf(wellDraws.size())};
+        }
+    }
+
+    private void minosSplitCapture(final MinosGenotypingVariant variant, final HaplotypeCallerGenotypingEngine engine,
+                                   final List<Haplotype> haplotypes, final AlleleLikelihoods<GATKRead, Haplotype> likelihoods,
+                                   final AlleleLikelihoods<GATKRead, Haplotype> preFilter,
+                                   final Map<String, List<GATKRead>> filteredReads, final byte[] fullRef,
+                                   final SimpleInterval paddedLoc, final SimpleInterval span, final FeatureContext features,
+                                   final List<Event> givenAlleles, final SAMFileHeader readsHeader, final Set<Integer> suspicious) {
+        if (minosSplitCurrent == null) {
+            return;
+        }
+        minosSplitCurrent.tasks.add(new MinosSplitTask(variant, engine, haplotypes, likelihoods, preFilter, filteredReads,
+                fullRef, paddedLoc, span, features, givenAlleles, readsHeader, suspicious));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void minosSplitChain() {
+        if (minosSplitLo < 0) {
+            return;
+        }
+        final java.nio.file.Path status = Paths.get(System.getProperty("minos.split.status"));
+        final String in = System.getProperty("minos.split.state.in");
+        final java.nio.file.Path cancel = Paths.get(System.getProperty("minos.split.cancel"));
+        final java.nio.file.Path out = Paths.get(System.getProperty("minos.split.state.out"));
+        final List<String> lines = new ArrayList<>();
+        try {
+            if (minosTraversalFailed || minosSequenceDictionary == null
+                    || minosGenotypingVariants.stream().anyMatch(v -> v.assemblyKey != null || v.stream >= 0)) {
+                minosSplitWrite(status, "unsupported\n");
+                minosSplitCancel(out);
+                return;
+            }
+            final List<MinosSplitConfig> configs = new ArrayList<>();
+            Map<String, byte[][]> states = null;
+            String[] boundary = null;
+            if (in != null) {
+                final java.nio.file.Path inPath = Paths.get(in);
+                final long until = System.currentTimeMillis() + MINOS_SPLIT_WAIT_MS;
+                while (!Files.exists(inPath)) {
+                    if (Files.exists(cancel) || System.currentTimeMillis() > until) {
+                        minosSplitWrite(status, "cancelled\n");
+                        minosSplitCancel(out);
+                        return;
+                    }
+                    Thread.sleep(20);
+                }
+                try (java.io.ObjectInputStream ois = new java.io.ObjectInputStream(Files.newInputStream(inPath))) {
+                    final Object head = ois.readObject();
+                    if (!(head instanceof String[])) {           // the piece before cancelled the chain
+                        minosSplitWrite(status, "cancelled\n");
+                        minosSplitCancel(out);
+                        return;
+                    }
+                    boundary = (String[]) head;
+                    states = (Map<String, byte[][]>) ois.readObject();
+                }
+            }
+            // a config's chain name is its place in the batch (each piece writes its outputs under its own names)
+            final String mainName = "main";
+            final List<String> names = new ArrayList<>();
+            final List<String> outputs = new ArrayList<>();
+            names.add(mainName);
+            outputs.add(System.getProperty("minos.split.main.out"));
+            for (int i = 0; i < minosGenotypingVariants.size(); i++) {
+                names.add("v" + (i + 1));
+                outputs.add(minosGenotypingVariants.get(i).output + ".split.vcf.gz");
+            }
+            for (int ci = 0; ci < names.size(); ci++) {
+                final String name = names.get(ci);
+                final org.broadinstitute.hellbender.utils.MinosRecordingRandom rng;
+                final org.broadinstitute.hellbender.utils.MinosRecordingWell well;
+                if (states == null) {
+                    rng = Utils.minosFreshRandom();
+                    well = Utils.minosFreshWell();
+                } else {
+                    final byte[][] st = states.get(name);
+                    if (st == null) {
+                        throw new IllegalStateException("no chain state for " + name);
+                    }
+                    rng = ((org.broadinstitute.hellbender.utils.MinosRecordingRandom)
+                            org.apache.commons.lang3.SerializationUtils.deserialize(st[0])).minosLoaded();
+                    well = ((org.broadinstitute.hellbender.utils.MinosRecordingWell)
+                            org.apache.commons.lang3.SerializationUtils.deserialize(st[1])).minosLoaded();
+                }
+                final MinosSplitConfig c = new MinosSplitConfig(name, rng, well);
+                c.writer = GATKVariantContextUtils.createVCFWriter(Paths.get(outputs.get(ci)), minosSequenceDictionary, false,
+                        htsjdk.variant.variantcontext.writer.Options.INDEX_ON_THE_FLY);
+                c.writer.writeHeader(makeVCFHeader(minosSequenceDictionary, minosDefaultHeaderLines));
+                configs.add(c);
+            }
+            // the region where this piece starts must be the one the piece before saw there, with as many draws
+            boolean boundaryOk = true;
+            if (boundary != null) {
+                final MinosSplitRegion first = minosSplitRegions.isEmpty() ? null : minosSplitRegions.get(0);
+                boundaryOk = first != null && first.key.equals(boundary[0])
+                        && first.randomDraws.size() == Integer.parseInt(boundary[1])
+                        && first.wellDraws.size() == Integer.parseInt(boundary[2]);
+            }
+            try {
+                for (final MinosSplitRegion r : minosSplitRegions) {
+                    for (final MinosSplitConfig c : configs) {
+                        for (final int[] d : r.randomDraws) {
+                            if (!c.rng.replay(d)) {
+                                c.diverged = true;
+                            }
+                        }
+                        for (final int[] d : r.wellDraws) {
+                            if (!c.well.replay(d)) {
+                                c.diverged = true;
+                            }
+                        }
+                    }
+                    for (final MinosSplitTask t : r.tasks) {
+                        final MinosSplitConfig c = configs.get(t.variant == null ? 0 : 1 + minosGenotypingVariants.indexOf(t.variant));
+                        Utils.minosSetRandomOverride(c.rng);
+                        Utils.minosSetRandomDataOverride(c.rdg);
+                        try {
+                            t.engine.assignGenotypeLikelihoods(t.haplotypes, t.likelihoods, t.filteredReads, t.fullRef,
+                                    t.paddedLoc, t.span, t.features, t.givenAlleles, emitReferenceConfidence(),
+                                    hcArgs.maxMnpDistance, t.readsHeader, haplotypeBAMWriter.isPresent(), t.suspicious,
+                                    t.preFilter)
+                                .getCalls().stream().map(RMSMappingQuality.getInstance()::finalizeRawMQ).forEach(c.writer::add);
+                        } finally {
+                            Utils.minosSetRandomOverride(null);
+                            Utils.minosSetRandomDataOverride(null);
+                        }
+                    }
+                }
+            } finally {
+                configs.forEach(c -> c.writer.close());
+            }
+            final Map<String, byte[][]> next = new HashMap<>();
+            for (final MinosSplitConfig c : configs) {
+                next.put(c.name, new byte[][]{org.apache.commons.lang3.SerializationUtils.serialize(c.rng),
+                        org.apache.commons.lang3.SerializationUtils.serialize(c.well)});
+            }
+            final String[] mine = minosSplitBoundary != null ? minosSplitBoundary : new String[]{"", "0", "0"};
+            final java.nio.file.Path tmp = out.resolveSibling(out.getFileName() + ".part");
+            try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(Files.newOutputStream(tmp))) {
+                oos.writeObject(mine);
+                oos.writeObject(next);
+            }
+            Files.move(tmp, out, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            for (int ci = 0; ci < configs.size(); ci++) {
+                final MinosSplitConfig c = configs.get(ci);
+                lines.add(c.name + "\t" + (ci == 0 ? "-" : Paths.get(minosGenotypingVariants.get(ci - 1).output).getFileName())
+                        + "\t" + (c.diverged || !boundaryOk ? "diverged" : "exact"));
+            }
+            minosSplitWrite(status, String.join("\n", lines) + "\n");
+        } catch (final Exception e) {
+            logger.warn("minos split chain failed: " + e);
+            try {
+                minosSplitWrite(status, "error " + e.toString().replace('\n', ' ') + "\n");
+            } catch (final IOException ignored) {
+                // no status: the runner treats the piece as failed
+            }
+            minosSplitCancel(out);
+        }
+    }
+
+    private static void minosSplitWrite(final java.nio.file.Path path, final String text) throws IOException {
+        final java.nio.file.Path tmp = path.resolveSibling(path.getFileName() + ".part");
+        Files.writeString(tmp, text);
+        Files.move(tmp, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /** Tell the next piece the chain ends here: its state file holds no states. */
+    private static void minosSplitCancel(final java.nio.file.Path out) {
+        try {
+            final java.nio.file.Path tmp = out.resolveSibling(out.getFileName() + ".part");
+            try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(Files.newOutputStream(tmp))) {
+                oos.writeObject("cancelled");
+            }
+            Files.move(tmp, out, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (final IOException ignored) {
+            // the next piece times out or sees the cancel file
+        }
+    }
+
     private List<VariantContext> minosCallRegionChecked(final AssemblyRegion region, final FeatureContext features, final ReferenceContext referenceContext) {
+        minosRngProbe(region);
+        minosSplitEnter(region);
         if (minosRepairLog != null) {
             return minosRepairRegion(region, features, referenceContext);
         }
@@ -1064,6 +1397,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
                 haplotypeBAMWriter.isPresent(),
                 suspiciousLocations,
                 readLikelihoods);
+        minosSplitCapture(null, localGenotypingEngine, haplotypes, subsettedReadLikelihoodsFinal, readLikelihoods,
+                perSampleFilteredReadList, assemblyResult.getFullReferenceWithPadding(), assemblyResult.getPaddedReferenceLoc(),
+                regionForGenotyping.getSpan(), features, givenAlleles, readsHeader, suspiciousLocations);
         // minos: one extra genotyping pass per variant. Variants whose PairHMM parameters equal the main config's
         // reuse its likelihoods; the others share one likelihood computation per distinct PairHMM parameter set,
         // on the same region, haplotypes and reads (computeReadLikelihoods copies its inputs; the only thing it
@@ -1091,6 +1427,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
                 }
                 preFilter = rl;
             }
+            minosSplitCapture(v, v.engine, rl.alleles(), rl, preFilter, perSampleFilteredReadList,
+                    assemblyResult.getFullReferenceWithPadding(), assemblyResult.getPaddedReferenceLoc(),
+                    regionForGenotyping.getSpan(), features, givenAlleles, readsHeader, suspiciousLocations);
             Utils.minosSetRandomOverride(v.rng);          // its QD jitter comes from its own stream, as in its own run
             Utils.minosSetRandomDataOverride(v.rdg);      // and its contamination downsampling too
             try {
@@ -1256,6 +1595,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
                 throw new UserException("cannot write " + kbestOut, e);
             }
         }
+        minosSplitChain();
         minosWarmServe();
         likelihoodCalculationEngine.close();
         if (pdhmmLikelihoodCalculationEngine != null) pdhmmLikelihoodCalculationEngine.close();
@@ -1470,6 +1810,9 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
      * it reports exact while QD and QUAL differ from a fresh run.
      */
     private void minosSyncRandom() {
+        if (minosSplitLo >= 0) {
+            return;                                   // split chain: minosSplitEnter takes them, region by region
+        }
         if (minosGenotypingVariants.isEmpty() && !minosWarmActive) {
             return;
         }
@@ -1492,7 +1835,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
     }
 
     private void minosBeforeGenotyping() {
-        if (minosGenotypingVariants.isEmpty() && !minosWarmActive) {
+        if (minosGenotypingVariants.isEmpty() && !minosWarmActive && minosSplitLo < 0) {
             return;
         }
         minosSyncRandom();
@@ -1501,7 +1844,7 @@ public class HaplotypeCallerEngine implements AssemblyRegionEvaluator, AssemblyR
     }
 
     private void minosAfterGenotyping() {
-        if (minosGenotypingVariants.isEmpty() && !minosWarmActive) {
+        if (minosGenotypingVariants.isEmpty() && !minosWarmActive && minosSplitLo < 0) {
             return;
         }
         Utils.minosGlobalRandom().setRecording(true);
