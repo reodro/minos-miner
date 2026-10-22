@@ -35,7 +35,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g077_20261016T0654, 1000G k060_20261021T1303) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g086_20261022T0508, 1000G k060_20261021T1303) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -275,6 +275,15 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   leave-out folds; cut-off 0.70: 117 windows fixed / 16 broken). Release check, 41 held-out 1000G rounds: +0.0087/round
   vs k050, t 2.63, better 17 / worse 7, false records 291 -> 284 (cut-off 0.45, the folds' best: +0.0020, t 0.49 -
   0.70 was chosen after seeing that, so a fresh-round check runs in kg_holdout_grow from 2026-10-21 14:00).
+- g086 (GIAB, released 2026-10-22) = GIAB retrained on its current pattern + the haplotype-aware call model. Since
+  2026-10-20 Minos's newer GIAB tasks insert 11% more indels per Mb and cluster 23% more of them (g077: 99.868 ->
+  99.834 per round). Base g082: train_track on the 229 GIAB rounds of 10-01 .. 10-21 10:58 (prepared_giab_v4c: GATK
+  evidence, genotyper version 4; float32 tables - 337 rounds as float64 ran out of memory); window model g083 on top
+  (train_window --hc --lr, cut-off 0.55: 2,028 windows fixed / 120 broken in 229 rounds); g077's cut-offs, spelling
+  model, cluster decoder and read guard; + call_hap.joblib (hapgt.apply_call, person = the donor's NIST records).
+  Release check on GIAB rounds from 2026-10-21 11:30 (never trained or tuned on; test/answer_set/giab_fresh_grow.sh),
+  9 rounds: +0.0224/round vs g077, t 2.06, better 7 / worse 2 (g085, without the call model: +0.0134; g081, g077 +
+  the call model: +0.0068). The combination was chosen after seeing those two on 8 of the 9 rounds. Rollback: g077.
 - Off by default, tested and not released: haplotype-aware CALL model (hapgt.apply_call, meta call_hap; 1000G k057
   -0.0007, GIAB g080/g081 +0.009 t 1.74 - fresh-round check running), GIAB haplotype het/hom (g079 -0.0019), entry
   rule 3 (features.KG_RD_ENTRY 3, compound-het second alleles; k056 retrained +0.0063 t 0.97).
