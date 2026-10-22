@@ -340,6 +340,18 @@ def island_distances(rows: Sequence[dict]) -> List[dict]:
     return out
 
 
+def race_cull(base, views: Sequence[IslandClient], made: Dict[int, "Island"]) -> None:
+    """islands.race_k (generalized Step A, 2026-10-22): when the race ends, the `keep` islands with the highest best
+    score climb on; the others stop (their climbers end, their workers go to the winners through rebalance)."""
+    keep = max(1, int(getattr(next(iter(made.values())), "keep", 2)))
+    ranked = sorted(views, key=lambda v: -(_score(base, _best_key(v)) or float("-inf")))
+    winners = {v.index for v in ranked[:keep]}
+    for v in views:
+        if v.index not in winners and v.index in made:
+            made[v.index].stopped = True
+    log.info("islands: race over: %s climb on; %s stop", sorted(winners), sorted(set(made) - winners))
+
+
 def merge_notes(base, views: Sequence[IslandClient], cap: int) -> None:
     """client.notes["engine"]: the best island's notes, every island's summary and every island's climbers."""
     rows, lead, lead_best = [], None, None
@@ -374,27 +386,48 @@ def merge_notes(base, views: Sequence[IslandClient], cap: int) -> None:
     base.notes["engine"] = merged
 
 
-async def _guarded(coro, index: int) -> None:
+async def _guarded(coro, index: int, board: Optional[dict] = None) -> None:
     try:
         await coro
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - one island's failure must not end the others
         log.exception("engine: island %d failed", index)
+    finally:
+        if board is not None:                           # far.step_c_top: the others stop waiting for this island
+            board.setdefault("done", set()).add(index)
 
 
-async def run(base, cap: int, k: int, start: Callable[[IslandClient, Island], object]) -> List[IslandClient]:
-    """Run k islands to the end of the round. `start(view, island)` is one whole engine run."""
+async def run(base, cap: int, k: int, start: Callable[[IslandClient, Island], object],
+              attrs: Optional[Sequence[dict]] = None) -> List[IslandClient]:
+    """Run k islands to the end of the round. `start(view, island)` is one whole engine run. `attrs[i]`: extra
+    attributes of island i (offline test T1: its move_k)."""
     views: List[IslandClient] = []
     for i, q in enumerate(quotas(cap, k)):
         views.append(IslandClient(base, i, q, views))
     seats: Dict[int, List[Config]] = {}
     from search.engine import carry_arms, round_arms
     arms = round_arms(base)
-    tasks = [asyncio.ensure_future(_guarded(start(v, Island(v.index, k, seats, arms, views)), v.index)) for v in views]
+    board: dict = {}                                  # shared by the islands (far.step_c_top: the round's top climbers)
+
+    made: Dict[int, Island] = {}
+
+    def island_of(v):
+        isl = Island(v.index, k, seats, arms, views)
+        made[v.index] = isl
+        isl.board = board
+        for name, value in ((attrs[v.index] if attrs and v.index < len(attrs) else None) or {}).items():
+            setattr(isl, name, value)
+        return isl
+    tasks = [asyncio.ensure_future(_guarded(start(v, island_of(v)), v.index, board)) for v in views]
     virtual = hasattr(base.executor, "now")
     try:
+        culled = False
         while True:
+            race_end = next((getattr(i, "race_end", None) for i in made.values()), None)
+            if not culled and race_end is not None and base.clock() >= race_end:
+                culled = True
+                race_cull(base, views, made)
             rebalance(views, cap)
             merge_notes(base, views, cap)
             name_pick(base, views)

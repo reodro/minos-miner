@@ -39,6 +39,7 @@ import asyncio
 import itertools
 import logging
 import math
+import os
 import random
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -119,6 +120,22 @@ def leftover_breeds() -> bool:
     return VERSION.startswith("v9.18")
 
 
+def isolated() -> bool:
+    """Offline test T1 (MINOS_T1_ISOLATE=1): no GA or RF-UCB breeding and no hand-offs between climbers or seats,
+    so each climber moves only by its own grid waves and centre jumps."""
+    return os.environ.get("MINOS_T1_ISOLATE") == "1"
+
+
+def move_k(ctx) -> Tuple[int, int]:
+    """(min, max) settings one grid candidate moves (0, 0: the single-setting compass). An island's own move_k (the
+    T1 test assigns a variant per island) wins over climb.move_k_min / climb.move_k_max."""
+    mk = getattr(getattr(ctx, "island", None), "move_k", None)
+    if mk is not None:
+        return (int(mk[0]), int(mk[1])) if mk else (0, 0)
+    lo = int(tune("climb.move_k_min"))
+    return lo, max(lo, int(tune("climb.move_k_max")))
+
+
 def line_coarse(ctx) -> int:
     """No line while GA is still moving candidates. After that, one rung, so a wave can finish.
 
@@ -145,6 +162,26 @@ def one_rung_neighbors(ctx, centre: Config) -> List[Config]:
                 continue
             keys.add(config.key)
             out.append(config)
+    full = getattr(ctx, "full_space", None) if getattr(ctx, "certifying", False) else None
+    if full is not None:
+        # island mode (search/global_a.py): the certify may try one rung outside the island's band on each influential
+        # setting; pcr_indel_model defines the island and stays
+        from search.global_a import INFLUENTIAL, PCR
+        from search.steps import Ladders
+        lad = getattr(ctx, "_full_ladders", None) or Ladders(full)
+        ctx._full_ladders = lad
+        for name in INFLUENTIAL:
+            if name == PCR or not lad.movable(name):
+                continue
+            for step in (-1, 1):
+                value = lad.shift(name, centre.params.get(name), step)
+                if value is None:
+                    continue
+                config = full._assemble({**centre.params, name: value})
+                if config is None or config.key in keys:
+                    continue
+                keys.add(config.key)
+                out.append(config)
     return out
 
 
@@ -491,6 +528,10 @@ class Climber:
         pick = getattr(ctx, "pick_at", None)
         if n <= 0 or not callable(pick) or ctx.clock() > float(pick()) - FILL_CUTOFF_S:
             return 0
+        dry = (self.centre.key, len(getattr(getattr(ctx, "client", None), "latest", None) or ()))
+        # nothing new since an empty fill: it would be empty again (03:09 live: re-tried at once, the loop starved)
+        if getattr(self, "_fill_dry", None) == dry:
+            return 0
         taken = ({c.key for c in self.pending} | {c.key for c in self.later} | {c.key for c in self.leaps}
                  | set(self.waiting))
         got = self.plan_leaps(self.centre, n, taken)
@@ -513,6 +554,8 @@ class Climber:
         self.leaps.extend(got)
         if got:
             self._filled = getattr(self, "_filled", 0) + len(got)
+        else:
+            self._fill_dry = dry
         return len(got)
 
     def beyond_crash(self, centre: Config, c: Config, margin: int = 0) -> bool:
@@ -691,6 +734,36 @@ class Climber:
             return value
         return None
 
+    def multi_heads(self, centre: Config, group: Sequence[str], n: int) -> List[Config]:
+        """climb.move_k_min/max (offline test T1, 2026-10-22): n candidates in place of the compass, each moving k in
+        [move_k_min, move_k_max] settings of the group at once, each by one of its compass offsets (a smaller group
+        moves all its settings). The same budget as the compass it replaces."""
+        kmin, kmax = move_k(self.ctx)
+        rng = getattr(self.ctx, "rng", None) or random.Random(self.id)
+        names = [x for x in group if any(o for o in self.compass_offsets(x))]
+        if len(names) < 2:
+            return []
+        out, keys, tries = [], {centre.key}, 0
+        while len(out) < n and tries < 20 * max(1, n):
+            tries += 1
+            k = min(len(names), rng.randint(kmin, kmax))
+            moves = {}
+            for x in rng.sample(names, k):
+                v = self.land(centre, x, rng.choice([o for o in self.compass_offsets(x) if o]))
+                if v is not None:
+                    moves[x] = v
+            if len(moves) < min(kmin, len(names)):
+                continue
+            c = self.with_(centre, moves)
+            if c is None or c.key in keys or not self.ctx.fresh(c):
+                continue
+            moved = sum(1 for x in self.all_names if c.params.get(x) != centre.params.get(x))
+            if not min(kmin, len(names)) <= moved <= kmax:      # a coupled setting moved too: outside the rule
+                continue
+            keys.add(c.key)
+            out.append(c)
+        return out
+
     def compass_heads(self, centre: Config, group: Sequence[str]) -> List[Config]:
         """Each grid setting at −d and +d, the others held. A flat step lands on the next untried rung."""
         heads, keys = [], {centre.key}
@@ -735,6 +808,37 @@ class Climber:
             if best_n is not None and best_n > base + margin:
                 live.append(n)
         return live
+
+    def additive_heads(self, centre: Config, live: Sequence[str], seen: set) -> List[Config]:
+        """climb.additive (2026-10-21): the winning settings of the compass, each at its best single-setting value,
+        combined - all together, all but one, the top pairs and triples - instead of the 3^m cube. Moves commute
+        96-99.7% (2026-10-16), so the winners' sum is the likely best; at most ~40 configs whatever m is."""
+        best: Dict[str, Tuple[object, float]] = {}
+        for item in self.wave_results:
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            c, sc = item
+            if c is None or not hasattr(c, "params") or sc is None:
+                continue
+            moved = [n for n in self.group if c.params.get(n) != centre.params.get(n)]
+            if len(moved) == 1 and moved[0] in live and sc > best.get(moved[0], (None, float("-inf")))[1]:
+                best[moved[0]] = (c.params.get(moved[0]), sc)
+        axes = sorted(best, key=lambda n: -best[n][1])
+        if len(axes) < 2:
+            return []
+        subsets: List[Tuple[str, ...]] = [tuple(axes)]
+        if len(axes) >= 3:
+            subsets += [tuple(a for a in axes if a != x) for x in axes]
+        subsets += list(itertools.combinations(axes[:6], 2)) + list(itertools.combinations(axes[:4], 3))
+        heads, keys = [], set(seen) | {centre.key}
+        for sub in subsets:
+            if len(sub) < 2:
+                continue
+            c = self.with_(centre, {n: best[n][0] for n in sub})
+            if c is not None and c.key not in keys:
+                keys.add(c.key)
+                heads.append(c)
+        return heads
 
     def confirm_heads(self, centre: Config, live: Sequence[str], seen: set) -> List[Config]:
         """The 3^m cube on the live axes, minus the centre and the one-setting faces already scored."""
@@ -1016,8 +1120,8 @@ class Climber:
         Four latest rounds (2026-10-16): a better result sat 35-41 minutes per run in total before its climber moved
         (13 on the slowest round): about half waiting for the rest of its own wave, a third for a cube around the old
         centre. No side effects: close_wave makes the move."""
-        if not self.batch_live or not int(tune("climb.move_at_once")):
-            return False
+        if not self.batch_live or not int(tune("climb.move_at_once")) or int(tune("climb.additive")):
+            return False                               # climb.additive: the wave runs to its quorum, then combines
         accept = float(tune("climb.accept_min"))
         wave = getattr(self, "_wave_id", 0)
         for k, c in self.waiting.items():
@@ -1091,6 +1195,9 @@ class Climber:
             if not heads:
                 self.flat.update(group)
                 return False
+        if (move_k(ctx)[0] > 0 and heads and not getattr(self, "compass_only", False)
+                and (self.origin or "") != "step C"):
+            heads = self.multi_heads(centre, group, len(heads)) or heads
         keys = {centre.key, *(c.key for c in heads)}
         known = tried(ctx, centre)
         # A hot GA sends nothing from this climber: begin_grid already returned. Once the updates
@@ -1106,6 +1213,22 @@ class Climber:
             self.later = self.centre_later(centre, known)
         self.line_keys = {c.key for c in line}
         self.pending, self.extra = heads + line, []
+        if int(tune("climb.borrow")):
+            # recombination (user, 2026-10-21): the latest winning move of each other climber on this island, applied
+            # to this centre (moves commute 96-99.7%, 2026-10-16), rides in this wave
+            borrowed = 0
+            for o in getattr(ctx, "climbers", ()) or ():
+                delta = getattr(o, "last_delta", None)
+                if o is self or not delta or getattr(o, "state", "") != "climbing" or borrowed >= 3:
+                    continue
+                b = self.with_(centre, dict(delta))
+                if b is not None and b.key not in keys and ctx.fresh(b):
+                    keys.add(b.key)
+                    self.pending.append(b)
+                    borrowed += 1
+            if borrowed:
+                ctx.say("climber %d it %d: %d borrowed move(s) from the other climbers", self.id, self.iteration,
+                        borrowed)
         # Centre jumps take climb.leap_share of this climber's workers, after its heads and packs (search/leaps.py).
         if float(tune("climb.leap_share")) > 0 and not getattr(self, "compass_only", False):
             taken = {c.key for c in self.pending} | {c.key for c in self.later}
@@ -1123,7 +1246,8 @@ class Climber:
         """Queue the joint cube on the live axes. False when every combo is already scored."""
         centre = self.wave_centre or self.centre
         seen = {centre.key, *(c.key for c, _ in self.wave_results)}
-        cube = self.confirm_heads(centre, live, seen)
+        additive = int(tune("climb.additive")) > 0
+        cube = self.additive_heads(centre, live, seen) if additive else self.confirm_heads(centre, live, seen)
         if not cube:
             return False
         self.phase = "confirm"
@@ -1133,7 +1257,8 @@ class Climber:
         self._wave_t0 = self.ctx.clock()
         self._wave_n = 0
         self.batch_live = True
-        self.ctx.say("climber %d it %d (%s): cube on %d axes", self.id, self.iteration, self.kind, len(live))
+        self.ctx.say("climber %d it %d (%s): %s on %d axes (%d configs)", self.id, self.iteration, self.kind,
+                     "additive jump" if additive else "cube", len(live), len(cube))
         return True
     def kick_configs(self, n: int) -> List[Config]:
         """Up to n configs 4-6 settings from the centre, each moved 3-9 rungs either way (published ranges only)."""
@@ -1312,7 +1437,7 @@ class Climber:
             centre = self.wave_centre or self.centre
             live = self.live_axes(centre, self.group, self.wave_results, self.wave_before)
             accept = float(tune("climb.accept_min"))
-            cleared = int(tune("climb.move_at_once")) and any(
+            cleared = int(tune("climb.move_at_once")) and not int(tune("climb.additive")) and any(
                 s - self.wave_before >= accept and family_allows(self, c, s) for c, s in self.wave_results)
             # A compass point that clears the bar is moved to now; the next compass, from there, tries the other live
             # settings. The cube on the old centre is for faces that only beat it by less than the bar.
@@ -1325,6 +1450,25 @@ class Climber:
         kind = self.kind
         old = self.wave_centre
         allowed = [r for r in self.wave_results if family_allows(self, r[0], r[1])]
+        apart = int(tune("climb.min_apart"))
+        if apart > 0:
+            # user, 2026-10-21: the climbers of an island stay apart - no move to within climb.min_apart settings of
+            # another climbing climber's centre (13:22: 3 climbers per island ended within 0.02-0.06 of each other)
+            others = [o.centre for o in getattr(ctx, "climbers", ()) or ()
+                      if o is not self and getattr(o, "state", "") == "climbing" and o.centre is not None]
+            names = list(ctx.space.names)
+            near = lambda c: any(sum(c.params.get(n) != oc.params.get(n) for n in names) < apart for oc in others)
+            kept = [r for r in allowed if not near(r[0])]
+            if len(kept) < len(allowed):
+                ctx.say("climber %d it %d: %d move(s) kept out (within %d settings of another climber)", self.id,
+                        self.iteration, len(allowed) - len(kept), apart)
+            allowed = kept
+        if float(tune("climb.min_dist")) > 0:
+            kept = [r for r in allowed if too_close(self, r[0]) is None]
+            if len(kept) < len(allowed):
+                ctx.say("climber %d it %d: %d move(s) kept out (within %.2f of another climber)", self.id,
+                        self.iteration, len(allowed) - len(kept), float(tune("climb.min_dist")))
+            allowed = kept
         refused = max((r for r in self.wave_results if r not in allowed), key=lambda t: t[1], default=None)
         if refused is not None and refused[1] > self.score:
             self.move(refused[0], refused[1], "refused")               # says why, once per config
@@ -1549,6 +1693,13 @@ class Climber:
         return best
 
     def move(self, c: Config, s: float, why: str) -> None:
+        near = None if why.startswith("C ") else too_close(self, c)
+        if near is not None:
+            if c.key not in self.__dict__.setdefault("_too_close", set()):
+                self._too_close.add(c.key)
+                self.ctx.say("climber %d does not move to %s %.4f (%s): within %.2f of climber %d", self.id, c.key[:8],
+                             s, why, float(tune("climb.min_dist")), near.id)
+            return
         if not family_allows(self, c, s):
             refused = getattr(self, "_refused", None)
             if refused is None:
@@ -1566,6 +1717,10 @@ class Climber:
                          "released", self.id, c.key[:8], s)
         part = self.note_part(c, s, why)
         self.last_wave_flat = False                                         # it moved: its grid share comes back
+        old_centre = self.centre
+        if old_centre is not None:                      # climb.borrow: the other climbers try this move on their centre
+            self.last_delta = {n: c.params.get(n) for n in self.all_names
+                               if c.params.get(n) != old_centre.params.get(n)}
         self.centre, self.score = c, s
         if getattr(self, "compass_only", False):
             self.tried_axes = set()
@@ -1718,7 +1873,7 @@ class Climber:
 
     def adopt(self, c: Config, s: float, why: str = "the GA best") -> None:
         """Leave this hill for a higher config. Runs already out still score, and a higher one takes the centre back."""
-        if not family_allows(self, c, s):
+        if not family_allows(self, c, s) or too_close(self, c) is not None:
             return
         was = self.best_found()
         self.ctx.say("climber %d takes %s %s %.4f (its best was %.4f, centre %s)",
@@ -1779,11 +1934,32 @@ PARTS = ("grid", "jump", "ga", "rf", "other")
 
 
 def encoded(ctx, c: Optional[Config]) -> Optional[List[float]]:
-    """A config's unit-cube encoding, rounded: the dashboard's 3D view projects these."""
+    """A config's unit-cube encoding, rounded: the dashboard's 3D view projects these. In island mode the full space
+    encodes (the island's banded space drops its fixed settings, and the view's axes come from the full space)."""
     try:
-        return None if c is None else [round(float(x), 3) for x in ctx.space.encode(c)]
+        space = getattr(ctx, "full_space", None) or ctx.space
+        return None if c is None else [round(float(x), 3) for x in space.encode(c)]
     except Exception:  # noqa: BLE001
         return None
+
+
+def too_close(cl, c: Optional[Config]):
+    """climb.min_dist (user, 2026-10-21): the other climbing climber whose centre is within this distance of `c` on
+    the unit-cube axes (the dashboard's), or None. Live 16:58 round: island 1's climbers began 1.26 apart and one rf
+    move put them 0.14 apart. Step C's fine-tunes are not held to it."""
+    d = float(tune("climb.min_dist"))
+    if d <= 0 or c is None or (getattr(cl, "origin", "") or "") == "step C":
+        return None
+    v = encoded(cl.ctx, c)
+    if v is None:
+        return None
+    for o in getattr(cl.ctx, "climbers", ()) or ():
+        if o is cl or getattr(o, "state", "") != "climbing" or o.centre is None:
+            continue
+        w = encoded(cl.ctx, o.centre)
+        if w is not None and math.dist(v, w) < d:
+            return o
+    return None
 
 
 SIMILAR_SETTINGS = 4          # fewer than this many searched-setting differences is the same hill
@@ -2138,6 +2314,8 @@ async def submit_rf(ctx, n: int) -> list:
     """RF-UCB configs (search/rf_ucb.py step_b) for climb.rf_ucb_share of the workers the grids leave to the GA.
     They are not kept away from the climbers like GA children: they aim at the top. Tagged "R"; they count as GA
     children, so a higher one moves a climber (adopt_ga_best) and joins the GA's parents."""
+    if isolated():
+        return []
     if n <= 0 or ctx.over():
         return []
     from search.rf_ucb import step_b
@@ -2181,6 +2359,8 @@ async def submit_ga(ctx, n: int, gen: int = 1) -> list:
     A child that is the same or similar to a climber's centre, or to another GA child still in flight, or closer
     than the seat distance, is not sent.
     """
+    if isolated():
+        return []
     if n <= 0 or ctx.over():
         return []
     if gen < 3:
@@ -2414,6 +2594,8 @@ def adopt_reference(ctx, live: Sequence[Climber]) -> bool:
     Once the grid is walking, the pile does not move the centre. The grid writes the setting it found.
     The highest score becomes the fingerprint, and a pile it overlaps is merged into this one.
     """
+    if isolated():
+        return False
     if not getattr(ctx, "_piles", None) or not ga_hot(ctx):
         return False
     climbing = [cl for cl in live if cl.state == "climbing"]
@@ -2455,6 +2637,8 @@ def switch_to_candidate(ctx, live: Sequence[Climber]) -> bool:
     A config another climber already holds, including one who has peaked, is not that candidate's
     score. Moving onto it would join that climber and free the seat, and the next seat would do the same.
     """
+    if isolated():
+        return False
     if not getattr(ctx, "_piles", None):
         return False
     climbing = [cl for cl in live if cl.state == "climbing"]
@@ -2505,6 +2689,8 @@ def adopt_ga_best(ctx, live: Sequence[Climber]) -> bool:
     v9.21: the highest score within 0.10 of a pile is that pile's reference, and its climber develops from it.
     A child outside every ball does not move an existing climber; an empty seat takes it when it is farther than 0.10.
     """
+    if isolated():
+        return False
     if piles_enabled() and getattr(ctx, "_piles", None):
         return _adopt_pile(ctx, live)
     return _adopt_ga_best_legacy(ctx, live)
@@ -2534,6 +2720,12 @@ def _adopt_pile(ctx, live: Sequence[Climber]) -> bool:
             continue
         taker = min(pool, key=lambda cl: (cl.best_found(), cl.id))
         if not family_allows(taker, c) or not centre_allowed(taker, c):
+            continue
+        close = too_close(taker, c)               # (not `near`: the legacy path's list of near climbers)
+        if close is not None:
+            if close.best_found() < s and family_allows(close, c, s) and too_close(close, c) is None:
+                close.adopt(c, s, why="the GA best near it")
+                return True
             continue
         other = held_by_climber(ctx, c, me=taker)
         if other is not None and (other.origin or "") != piles[i].label(i):
@@ -2585,6 +2777,12 @@ def _adopt_ga_best_legacy(ctx, live: Sequence[Climber]) -> bool:
             continue
         taker = min(pool, key=lambda cl: (cl.best_found(), cl.id))
         if not family_allows(taker, c, s):
+            continue
+        close = too_close(taker, c)               # (not `near`: the legacy path's list of near climbers)
+        if close is not None:
+            if close.best_found() < s and family_allows(close, c, s) and too_close(close, c) is None:
+                close.adopt(c, s, why="the GA best near it")
+                return True
             continue
         other = held_by_climber(ctx, c, me=taker)
         if other is not None:
@@ -2740,6 +2938,8 @@ def ensure_far_seat(ctx, live: List[Climber]) -> bool:
     Two AGGRESSIVE centres that differ in four genotyping settings look like two hills, so the old
     same-hill check left the stolen far seat there. Family-or-not is the test.
     """
+    if isolated():
+        return False
     climbing = [cl for cl in live if cl.state == "climbing" and getattr(cl, "centre", None) is not None]
     if len(climbing) < 2:
         return False
@@ -2815,6 +3015,8 @@ def ga_beat_lowest(ctx, live: Sequence[Climber]) -> bool:
 
 async def open_with_ga(ctx, live: List[Climber], until: float) -> None:
     """The start of Step B: the whole fleet breeds until a free GA beats the lowest climber, or the cap."""
+    if isolated():
+        return None
     if not live or ctx.over() or ctx.clock() >= until:
         return
     if free_workers(ctx) is None:
@@ -2978,6 +3180,12 @@ async def occupy(ctx, ready: Sequence[Tuple[Config, float, str]], until: float) 
     # when it is a new hill (044200Z, 2026-10-16: the one seat peaked at t+29.6m and Step B returned with half
     # the round left).
     while ctx.clock() < until and not ctx.over():
+        if getattr(getattr(ctx, "island", None), "stopped", False):    # lost the race (search/islands.py race_cull)
+            for cl in live:
+                if cl.state == "climbing":
+                    cl.state = "stopped"
+            ctx.say("step B: this island lost the race; its climbers stop")
+            return
         if any(cl.state == "climbing" and cl.claim_higher() for cl in live):
             continue
         if adopt_reference(ctx, live):

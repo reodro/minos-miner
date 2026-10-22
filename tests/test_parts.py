@@ -89,7 +89,8 @@ class LoopTest(unittest.TestCase):
 
         out, sub, _ = self.run_loop([random_stream(self.r, seed=2)], executor=LocalExecutor(self.runner, workers=2),
                                     max_evals=12, scoring=ScoringPool(2, scorer=Down()))
-        self.assertEqual((out.evaluated, out.failed, sub.sent), (0, 12, []))
+        self.assertEqual((out.evaluated, out.failed), (0, 12))
+        self.assertEqual(sub.sent, [(ROUND.round_id, ranges().defaults("gatk").key)])   # nothing scored: the baseline
         self.assertEqual(list(out.failures), ["scoring failed: hap.py down"])
 
     def test_gatk_runs_while_the_answer_set_is_built_and_its_results_wait(self):

@@ -102,7 +102,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from common.params import ParamRanges
 from common.tuning import tune
 from common.types import FULL, Config
-from search import far, islands, portfolio
+from search import far, global_a, islands, portfolio
 from search.bamgroups import bam_bounds
 from search.base import Strategy
 from search.candidates import StepA
@@ -541,6 +541,37 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             from search import probe as fleet_probe
             await fleet_probe.run(client, space, probe)
             return
+        ab = os.environ.get("MINOS_STEPA_AB")
+        if ab:                                         # offline test G: today's Step A vs the generalized one, side by
+            from search.global_g import GeneralizedA   # side on half the workers each, for the same minutes
+            length = float(ab) * 60
+            run_s = float(os.environ.get("MINOS_STEPA_RUN_S", "150"))
+
+            async def side(view, island):
+                if island.index == 0:
+                    await global_a.GlobalA(view, space, profile, length, view.quota).run(view.round.tag)
+                else:
+                    anchors = list(global_a.starts(space, profile, view.round.tag, 8).values())
+                    await GeneralizedA(view, space, length, runs=int(view.quota * length / run_s), seed=seed,
+                                       anchors=anchors).run()
+            log.info("engine: Step A test: today's Step A (island 0) vs the generalized Step A (island 1), %s min", ab)
+            await islands.run(client, cap, 2, side)
+            return
+        seats_file = os.environ.get("SEARCH_SEATS")
+        if seats_file:                                 # offline test T1: one island per (seat, variant) climber
+            spec = json.load(open(seats_file))
+            entries = [(space._assemble(e["params"]), e.get("move_k")) for e in spec["seats"]]
+            entries = [(c, mk) for c, mk in entries if c is not None]
+            log.info("engine: T1 test: %d independent climbers (%s)", len(entries),
+                     ", ".join(f"{c.key[:8]}/{mk}" for c, mk in entries))
+            await islands.run(client, cap, len(entries), lambda view, island: search_one(
+                view, space, profile, random.Random(seed * 1000 + 1 + island.index), view.quota, island,
+                given=[entries[island.index][0]], full_space=space),
+                attrs=[{"move_k": mk} for _, mk in entries])
+            return
+        if global_a.enabled():
+            await island_mode(client, space, profile, rng, cap, seed)
+            return
         k = islands.count(cap)
         if k <= 1:
             await search_one(client, space, profile, rng, cap)
@@ -551,6 +582,111 @@ def searcher(ranges: ParamRanges, workers: int, *, tool: str = "gatk", seed: int
             view, space, profile, random.Random(seed * 1000 + 1 + island.index), view.quota, island))
 
     return run
+
+
+async def island_mode_g(client, space: Space, profile: Optional[str], rng: random.Random, cap: int, seed: int) -> bool:
+    """islands.global_g (generalized Step A, user 2026-10-22): one scan over every searched setting
+    (search/global_g.py), territories read off it (search/territory.py: configs that climb to the same top), then a
+    race: the best islands.race_k territories start as islands, and after islands.race_s the islands.global_k best
+    climb on. Each island climbs inside its territory's band. False: the scan would be too thin for this fleet (the
+    caller runs today's Step A)."""
+    from search import territory
+    from search.global_g import MIN_RUNS, GeneralizedA
+    length = client.time_left() or 72 * 60
+    runs = cap * max(1, int(tune("islands.global_g_waves")))
+    if runs < MIN_RUNS:
+        return False
+    anchors = list(global_a.starts(space, profile, client.round.tag, 8).values())
+    g = GeneralizedA(client, space, length * float(tune("islands.global_a_share")), runs, seed=seed, anchors=anchors)
+    await g.run()
+    terrs = territory.territories(list(g.scores.values()), {n: g.values[n] for n in territory.NAMES if n in g.values},
+                                  phi=float(tune("islands.territory_phi")))
+    if not terrs:
+        log.warning("engine: generalized Step A scored nothing; the normal search runs")
+        await search_one(client, space, profile, rng, cap)
+        return True
+    best = terrs[0]["score"]
+    race = [t for t in terrs if t["score"] >= best - float(tune("islands.race_gap"))][:max(1, int(tune("islands.race_k")))]
+    keep = max(1, int(tune("islands.global_k")) or 2)
+    seats = max(1, int(tune("islands.global_seats")))
+    apart, dist = int(tune("islands.seat_apart")), float(tune("climb.min_dist"))
+    names = [global_a.PCR] + list(g.parts)
+    spaces, given = [], []
+    for t in race:
+        spaces.append(territory.restrict(space, g.values, t["members"], names))
+        chosen = [t["root"]]
+        for c, _ in sorted(t["members"], key=lambda m: -m[1]):
+            if len(chosen) >= seats:
+                break
+            if all(sum(c.params.get(n) != x.params.get(n) for n in space.names) >= apart
+                   and (dist <= 0 or math.dist(space.encode(c), space.encode(x)) >= dist) for x in chosen):
+                chosen.append(c)
+        given.append(chosen)
+    g.report["territories"] = [{"key": t["root"].key, "score": round(t["score"], 4), "size": t["size"]}
+                               for t in terrs[:20]]
+    client.notes["global_a"] = dict(g.report)
+    log.info("engine: generalized Step A: %d territories (best %.4f); race of %d for %.0f s, then %d climb on: %s",
+             len(terrs), best, len(race), float(tune("islands.race_s")), min(keep, len(race)),
+             " | ".join(f"{t['root'].key[:8]} {t['score']:.4f} ({t['size']} configs, {len(gv)} seats)"
+                        for t, gv in zip(race, given)))
+    race_end = client.clock() + float(tune("islands.race_s"))
+    await islands.run(client, cap, len(race), lambda view, island: search_one(
+        view, spaces[island.index], profile, random.Random(seed * 1000 + 1 + island.index), view.quota, island,
+        given=given[island.index], full_space=space),
+        attrs=[{"race_end": race_end, "keep": keep}] * len(race) if len(race) > keep else None)
+    return True
+
+
+async def island_mode(client, space: Space, profile: Optional[str], rng: random.Random, cap: int, seed: int) -> None:
+    """islands.global_a: the global Step A on the whole fleet, then island i climbs segments i, i + k, ... with its
+    influential settings banded around segment i (search/global_a.py)."""
+    if int(tune("islands.global_g")) and await island_mode_g(client, space, profile, rng, cap, seed):
+        return
+    length = client.time_left() or 72 * 60
+    ga = global_a.GlobalA(client, space, profile, length, cap)
+    segs = await ga.run(client.round.tag)
+    if not segs:
+        log.warning("engine: island mode found no segment; the normal search runs")
+        await search_one(client, space, profile, rng, cap)
+        return
+    k = int(tune("islands.global_k")) or islands.count(cap)
+    heads = ga.heads(segs, max(1, k))
+    ga.report["climbing"] = [{"key": h.key, "score": round(s, 4), "island": i,
+                              "influential": {n: h.params.get(n) for n in global_a.INFLUENTIAL},
+                              "band": {n: list(v) for n, v in ga.bands_for(h).items()}}
+                             for i, (h, s) in enumerate(heads)]
+    ga.publish()
+    if len(heads) <= 1:
+        await search_one(client, space, profile, rng, cap, given=[c for c, _ in segs])
+        return
+    k = len(heads)
+    # island i: its head first, then the other segments inside its band (a queued seat must be climbable there)
+    seats = max(1, int(tune("islands.global_seats")))
+    given = []
+    for h, _ in heads:
+        # islands.global_seats (user, 2026-10-21): the island's best distinct configs from Step A, so several climbers
+        # start on the island; then its in-band segments
+        same = sorted(((c, s) for c, s in ga.scores.values()
+                       if c.key != h.key and ga.on_hills(c.params) and ga.island_key(c.params) == ga.island_key(h.params)),
+                      key=lambda t: -t[1])
+        apart = int(tune("islands.seat_apart"))
+        dist = float(tune("climb.min_dist"))            # and at least climb.min_dist apart on the unit-cube axes
+        g = [h]
+        for c, _ in same:                               # the island's best configs at least seat_apart settings apart
+            if len(g) >= seats:
+                break
+            if all(sum(c.params.get(n) != x.params.get(n) for n in space.names) >= apart
+                   and (dist <= 0 or math.dist(space.encode(c), space.encode(x)) >= dist) for x in g):
+                g.append(c)
+        g += [c for c, _ in segs if c.key not in {x.key for x in g} and ga.in_band(h, c)]
+        given.append(g)
+    log.info("engine: island mode: %d islands on %d workers: %s", k, cap,
+             " | ".join(f"{h.key[:8]} {s:.4f} {h.params.get('pcr_indel_model')}/{h.params.get('min_pruning')} "
+                        f"({len(g)} segments)" for (h, s), g in zip(heads, given)))
+    await islands.run(client, cap, k, lambda view, island: search_one(
+        view, global_a.banded(space, heads[island.index][0].params, ga.bands_for(heads[island.index][0])), profile,
+        random.Random(seed * 1000 + 1 + island.index), view.quota, island, given=given[island.index],
+        full_space=space))
 
 
 def arms_path() -> str:
@@ -587,10 +723,13 @@ def carry_enabled(client) -> bool:
 
 
 async def search_one(client, space: Space, profile: Optional[str], rng: random.Random, cap: int,
-                     island: Optional["islands.Island"] = None) -> None:
-    """One whole search: Step A, Step B, Step C and the pick. With islands, `client` is the island's view."""
+                     island: Optional["islands.Island"] = None, given: Optional[List[Config]] = None,
+                     full_space: Optional[Space] = None) -> None:
+    """One whole search: Step A, Step B, Step C and the pick. With islands, `client` is the island's view.
+    `given` (island mode, search/global_a.py): the island's segments; its own Step A is skipped."""
     ctx = Context(client, space, rng, profile)
     ctx.island = island
+    ctx.full_space = full_space                         # island mode: the unbanded space, for the certify only
     if island is not None:
         ctx.climber_base = 100 * island.index
         if getattr(island, "arms", None) is not None:
@@ -607,12 +746,22 @@ async def search_one(client, space: Space, profile: Optional[str], rng: random.R
     ctx.step_a = StepA(ctx)
     forced = os.environ.get("SEARCH_START")
     known_score: Dict[str, float] = {}
-    if forced:
+    if given is not None:
+        # the global Step A scored these through the shared client; proposing them again lets this island's view
+        # see them (a scored config comes back at once)
+        await client.propose_all(list(given), tag="A")
+        starts = list(given)
+        ctx.say("step A: global (island mode): %d segment(s): %s", len(starts),
+                ", ".join(f"{c.key[:8]} {c.params.get('pcr_indel_model')}/{c.params.get('min_pruning')}"
+                          for c in starts[:6]))
+    elif forced:
         raw = json.loads(open(forced).read())
         seat = space._assemble(raw["params"])
         starts = [seat] if seat is not None else []
         if seat is not None and seat.key == raw.get("key"):
             known_score[seat.key] = float(raw["score"])
+        elif seat is not None:                         # an unscored seat (offline test T1): score it first
+            await client.propose_all([seat], tag="A")
         ctx.say("step A skipped: climbing frozen seat %s opened at %.4f (%s)",
                 seat.key[:8] if seat is not None else "?", float(raw.get("score") or 0), raw.get("group") or "")
     else:
@@ -629,7 +778,7 @@ async def search_one(client, space: Space, profile: Optional[str], rng: random.R
                     starts = await gate(ctx, list(starts))
                 except Exception:  # noqa: BLE001
                     log.exception("engine: the valley gate failed")
-    if island is not None:
+    if island is not None and given is None:
         starts = island.apart(ctx, starts)
     ctx.marks["a"] = ctx.elapsed()
     ctx.publish(force=True)

@@ -83,7 +83,11 @@ class FakeCtx:
 
     def propose(self, batch, tag, batches, priority=0):
         self.sent.append(list(batch))
-        loop = asyncio.get_event_loop()
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:                       # a run_round test before this one closed the default loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         out = []
         for _ in batch:
             fut = loop.create_future()

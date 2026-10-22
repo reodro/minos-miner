@@ -86,15 +86,18 @@ async function api(path, opts = {}) {
 
 // ---- tabs -----------------------------------------------------------------------------------------------------------
 function showTab() {
-  const hash = location.hash === "#settings" ? "settings" : location.hash === "#history" ? "history" : "live";
+  const hash = ["#settings", "#history", "#curves"].includes(location.hash) ? location.hash.slice(1) : "live";
   $("view-live").hidden = hash !== "live";
   $("view-history").hidden = hash !== "history";
+  $("view-curves").hidden = hash !== "curves";
   $("view-settings").hidden = hash !== "settings";
   $("tab-live").classList.toggle("on", hash === "live");
   $("tab-history").classList.toggle("on", hash === "history");
+  $("tab-curves").classList.toggle("on", hash === "curves");
   $("tab-settings").classList.toggle("on", hash === "settings");
   if (hash === "settings") loadSettings();
   else if (hash === "history") loadHistory();
+  else if (hash === "curves") loadCurves();
   else if (chart) setTimeout(sizeChart, 0);
 }
 window.addEventListener("hashchange", showTab);
@@ -105,30 +108,8 @@ function setTopHeight() { document.documentElement.style.setProperty("--top-h", 
 setTopHeight();
 if (window.ResizeObserver) new ResizeObserver(setTopHeight).observe(topBar);
 
-// ---- theme: the system setting until the toggle is used; the choice is remembered in this browser ----
-const darkQuery = matchMedia("(prefers-color-scheme: dark)");
-function effectiveTheme() {
-  const t = document.documentElement.dataset.theme;
-  return t === "dark" || t === "light" ? t : darkQuery.matches ? "dark" : "light";
-}
-function showThemeButton() {
-  const t = effectiveTheme(), other = t === "dark" ? "light" : "dark";
-  $("theme").textContent = other === "dark" ? "Dark" : "Light";
-  $("theme").setAttribute("aria-label", `Switch to the ${other} theme`);
-}
-function themeChanged() {
-  showThemeButton();
-  if (last) render();                           // the chart takes its colors from the theme when it is drawn
-  if (!$("view-history").hidden) renderHistoryCharts();
-}
-$("theme").addEventListener("click", () => {
-  const next = effectiveTheme() === "dark" ? "light" : "dark";
-  document.documentElement.dataset.theme = next;
-  try { localStorage.setItem("minos-theme", next); } catch (e) { /* not remembered, still switched */ }
-  themeChanged();
-});
-darkQuery.addEventListener("change", themeChanged);
-showThemeButton();
+// ---- theme: dark only (user, 2026-10-21) ----
+function effectiveTheme() { return "dark"; }
 $("drawer-close").addEventListener("click", closeDetail);
 $("drawer").addEventListener("click", (e) => { if (e.target === $("drawer")) closeDetail(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && detail) closeDetail(); });
@@ -193,6 +174,7 @@ function render() {
   renderResult(lastResult, finished);
   renderSchedule(E);
   renderLineage(E);
+  renderGlobalA(S.global_a || null);
   renderIslands(E);
   renderClimbers(E, finished, X);
   renderDetail(E, finished);
@@ -716,7 +698,7 @@ function rgba(col, a) {
 }
 
 async function fetchAllPoints() {
-  if (v3.fetching || Date.now() - v3.fetchedAt < 30000) return;
+  if (v3.fetching || Date.now() - v3.fetchedAt < 60000) return;
   v3.fetching = true;
   try {
     const r = await api("/api/points");
@@ -727,7 +709,9 @@ async function fetchAllPoints() {
 
 function projector(liveVectors) {
   const A = v3.all;
-  if (A && A.basis && A.mean) {
+  // the server's axes, when the live vectors have its dimensions (island mode's banded spaces had fewer, and every
+  // island point was dropped: an empty view); else the live points' own axes
+  if (A && A.basis && A.mean && (!liveVectors.length || liveVectors.some((v) => Array.isArray(v) && v.length === A.mean.length))) {
     const d = A.mean.length;
     return (v) => (Array.isArray(v) && v.length === d ? A.basis.map((b) => b.reduce((acc, x, j) => acc + x * (v[j] - A.mean[j]), 0)) : null);
   }
@@ -769,7 +753,16 @@ function buildScene(E) {
   }).filter(Boolean);
   const scores = bg.map((q) => q.s).sort((a, b) => a - b);
   const lo = scores.length ? scores[Math.floor(scores.length * 0.05)] : 0, hi = scores.length ? scores[scores.length - 1] : 1;
+  // colour by rank (percentile among the shown points), in 16 steps: scores bunch near the top (round 08:34: 75% within
+  // 0.44 of the best), so a linear scale painted almost every point orange-red
+  const order = bg.map((q, i) => i).sort((a, b) => bg[a].s - bg[b].s);
+  order.forEach((i, r) => { bg[i].t = order.length > 1 ? Math.round((r / (order.length - 1)) * 15) / 15 : 1; });
   return {bg, bests, paths, links, lo, hi};
+}
+
+function bgTip() {               // shared hover text of a background point (this = the hovered entry)
+  const q = this.q;
+  return `${q.src === "climber" ? `climber ${q.climber >= 0 ? q.climber : ""} · island ${q.island}` : q.src.replace("_", " ")} · ${fix(q.s)}`;
 }
 
 function draw3d(now) {
@@ -781,7 +774,7 @@ function draw3d(now) {
     cv = h("canvas", {class: "space-canvas"});
     box.append(cv, h("div", {class: "space-tip", id: "space-tip", hidden: true}), spaceControls());
   }
-  const dpr = window.devicePixelRatio || 1, W = Math.max(320, box.clientWidth || 600), H = 480;
+  const dpr = Math.min(1.5, window.devicePixelRatio || 1), W = Math.max(320, box.clientWidth || 600), H = 480;
   if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.width = `${W}px`; cv.style.height = `${H}px`; }
   const g = cv.getContext("2d");
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -832,18 +825,31 @@ function draw3d(now) {
       bgc.strokeStyle = mut; bgc.beginPath(); bgc.moveTo(o[0], o[1]); bgc.lineTo(o[0] + 22 * x1, o[1] - 22 * y2); bgc.stroke();
       bgc.fillStyle = mut; bgc.font = "10px system-ui"; bgc.fillText(`axis ${label}`, o[0] + 26 * x1 - 8, o[1] - 26 * y2 + 3);
     }
-    // background points, far first
-    const pts = sc.bg.map((q) => ({q, s: P(q.p)})).sort((a, b) => b.s[2] - a.s[2]);
+    // background points, far first, batched: one fill per colour and depth step (2,500 single arcs per frame made the
+    // auto-rotation stutter)
     const all = v3.mode === "all";
-    for (const {q, s: sp2} of pts) {
+    const batches = new Map();
+    for (const q of sc.bg) {
+      const sp2 = P(q.p);
       const depth = Math.max(0.15, Math.min(1, (1.6 - sp2[2]) / 2.2));
-      let col;
-      if (v3.colour === "score") col = heat(Math.pow((q.s - sc.lo) / Math.max(1e-9, sc.hi - sc.lo), 1.6));
-      else col = q.src === "climber" && q.island >= 0 ? islandColor(q.island) : css(SRC_TOKEN[q.src] || "--faint");
-      bgc.fillStyle = rgba(col, (all ? 0.55 : 0.6) * depth);
+      const dk = Math.round(depth * 4);
+      if (q._col == null || q._colKey !== v3.colour) {
+        q._colKey = v3.colour;
+        q._col = v3.colour === "score" ? heat(q.t == null ? 1 : q.t)
+          : q.src === "climber" && q.island >= 0 ? islandColor(q.island) : css(SRC_TOKEN[q.src] || "--faint");
+      }
+      const k = `${dk}|${q._col}`;
+      let b = batches.get(k);
+      if (!b) batches.set(k, (b = {dk, col: q._col, pts: []}));
       const r = (all ? 1.6 : 2.6) * sp2[3];
-      bgc.beginPath(); bgc.arc(sp2[0], sp2[1], r, 0, 6.2832); bgc.fill();
-      bgScreen.push({x: sp2[0], y: sp2[1], r: Math.max(3, r + 1), tip: () => `${q.src === "climber" ? `climber ${q.climber >= 0 ? q.climber : ""} · island ${q.island}` : q.src.replace("_", " ")} · ${fix(q.s)}`, w: 0});
+      b.pts.push(sp2[0], sp2[1], r);
+      if (!v3.auto) bgScreen.push({x: sp2[0], y: sp2[1], r: Math.max(3, r + 1), q, tip: bgTip, w: 0});
+    }
+    for (const b of [...batches.values()].sort((x, y) => x.dk - y.dk)) {
+      bgc.fillStyle = rgba(b.col, (all ? 0.55 : 0.6) * Math.max(0.15, b.dk / 4));
+      bgc.beginPath();
+      for (let i = 0; i < b.pts.length; i += 3) { const r = b.pts[i + 2]; bgc.rect(b.pts[i] - r, b.pts[i + 1] - r, 2 * r, 2 * r); }
+      bgc.fill();
     }
     v3.bgKey = key; v3.bgScreen = bgScreen;
   }
@@ -912,7 +918,7 @@ function spaceControls() {
   return h("div", {class: "space-ctl"},
     btn("space-mode", "All scored", () => { v3.mode = v3.mode === "all" ? "top" : "all"; v3.scene = null; if (v3.mode === "all") { v3.fetchedAt = 0; fetchAllPoints().then(() => renderIslands(last && last.search && last.search.engine)); } renderIslands(last && last.search && last.search.engine); }),
     btn("space-colour", "Colour: score", () => { v3.colour = v3.colour === "score" ? "source" : "score"; draw3d(); syncControls(); }),
-    btn("space-auto", "Auto-rotate", () => { v3.auto = !v3.auto; syncControls(); }),
+    btn("space-auto", "Auto-rotate", () => { v3.auto = !v3.auto; v3.bgKey = null; draw3d(); syncControls(); }),
     btn("space-reset", "Reset", () => { Object.assign(v3, {yaw: 0.7, pitch: 0.35, zoom: 1, fit: "all"}); draw3d(); syncControls(); }),
     sel);
 }
@@ -962,11 +968,17 @@ function wire3d() {
   box.addEventListener("pointerup", () => { drag = null; });
   box.addEventListener("pointerleave", () => { const tip = $("space-tip"); if (tip) tip.hidden = true; });
   box.addEventListener("wheel", (e) => { e.preventDefault(); v3.zoom = Math.max(0.3, Math.min(8, v3.zoom * (e.deltaY < 0 ? 1.12 : 0.89))); draw3d(); }, {passive: false});
+  // auto-rotation: every frame, turning at a fixed speed whatever the frame rate (the batched points keep a frame
+  // cheap); climbers moving without auto-rotation: at most 4 redraws a second. A drag or the wheel redraws at once.
   const tick = (now) => {
     if (v3.scene && !document.hidden && $("view-live") && !$("view-live").hidden) {
-      if (v3.auto) v3.yaw += 0.004;
-      if (v3.auto || v3.scene.paths.some((pa) => pa.c.status === "climbing")) draw3d(now);
+      const dt = Math.min(0.1, (now - (v3.lastFrame || now)) / 1000);
+      if (v3.auto) { v3.yaw += 0.35 * dt; draw3d(now); }
+      else if (now - (v3.lastTick || 0) >= 250 && v3.scene.paths.some((pa) => pa.c.status === "climbing")) {
+        v3.lastTick = now; draw3d(now);
+      }
     }
+    v3.lastFrame = now;
     v3.raf = requestAnimationFrame(tick);
   };
   v3.raf = requestAnimationFrame(tick);
@@ -976,7 +988,8 @@ function renderIslands(E) {
   const box = $("space3d"), dist = $("island-dist");
   const rows = islandRows(E);
   if (!E || !rows.length) { dist.replaceChildren(h("div", {class: "empty", text: "Waiting for the engine."})); return; }
-  $("islands-sub").textContent = `${rows.length} island${rows.length === 1 ? "" : "s"} · the configs' 25 settings on their 3 main axes · drag to turn, scroll to zoom, hover for details`;
+  const A = v3.all, sampled = A && A.n_total > A.n ? ` · ${int(A.n)} of ${int(A.n_total)} points (the best 1,000 and an even sample)` : "";
+  $("islands-sub").textContent = `${rows.length} island${rows.length === 1 ? "" : "s"} · the configs' 25 settings on their 3 main axes${sampled} · drag to turn, scroll to zoom, hover for details`;
   fetchAllPoints();
   v3.scene = buildScene(E);
   v3.sceneId = (v3.sceneId || 0) + 1;
@@ -1233,8 +1246,60 @@ function renderStepC(E) {
   box.replaceChildren(...rows);
 }
 
+const GA_SHORT = {base_quality_score_threshold: "BQST", active_probability_threshold: "APT",
+  min_base_quality_score: "MBQ", phred_scaled_global_read_mismapping_rate: "mismapping", pcr_indel_model: "PCR",
+  min_pruning: "min_pruning"};
+
+function gaStageTitle(name) {
+  if (name === "A1") return "A1 · every value of the 6 influential settings";
+  if (name === "A3") return "A3 · island heads (and fill)";
+  const m = /^A4_(\d+)_pm(.+)$/.exec(name);
+  return m ? `Re-tune pass ${m[1]} (±${m[2].replace("+", ", ±")} rungs)` : name;
+}
+
+function renderGlobalA(G) {
+  const panel = $("globala-panel"), box = $("globala");
+  if (!G) { panel.hidden = true; return; }
+  panel.hidden = false;
+  $("globala-sub").textContent = globalASub(G);
+  box.replaceChildren(...globalARows(G));
+}
+
+function globalASub(G) {
+  const done = G.done_minute != null;
+  return `${done ? `done at t+${fix(G.done_minute, 1)}m` : "running"} · stops by t+${fix(G.stop_minute, 1)}m` +
+    ` · fill ${G.fill ? "on" : "off"}`;
+}
+
+function globalARows(G) {
+  const rows = Object.entries(G.stages || {}).map(([name, st]) => h("div", {class: "rowline"},
+    h("div", {class: "top-line"}, h("b", {text: gaStageTitle(name)}),
+      h("span", {class: "num muted", text: `${int(st.scored)} / ${int(st.sent)} scored · t+${fix(st.minute, 1)}m`})),
+    bar(st.sent ? st.scored / st.sent : 0, "open", null),
+    h("div", {class: "muted", text: `best ${st.best != null ? fix(st.best) : "–"}${st.cut ? " · cut at the stop time" : ""}`})));
+  const hills = Object.entries(G.hills || {});
+  if (hills.length) rows.push(h("div", {class: "rowline"}, h("b", {text: "Hills (one island per hill and PCR model)"}),
+    kv(hills.map(([n, hs]) => [GA_SHORT[n] || n, hs.map((x) => `${x[0]} (${x[1]}–${x[2]})`).join(" · ")]))));
+  const climb = G.climbing || [];
+  if (climb.length) rows.push(h("div", {class: "rowline"}, h("b", {text: `Islands climbing (${climb.length})`}),
+    kv(climb.map((c) => [`Island ${c.island} · ${c.influential.pcr_indel_model} / mp ${c.influential.min_pruning}`,
+      `${fix(c.score)} · band ${Object.entries(c.band || {}).map(([n, b]) => `${GA_SHORT[n] || n} ${b[0]}–${b[1]}`).join(", ") || "–"}`]))));
+  const segs = G.segments || [];
+  if (segs.length) rows.push(h("div", {class: "rowline"}, h("b", {text: `Segments found (${segs.length})`}),
+    kv(segs.slice(0, 8).map((sg, i) => [`#${i + 1} · ${sg.influential.pcr_indel_model} / MBQ ${sg.influential.min_base_quality_score}`,
+      `${fix(sg.score)} · BQST ${sg.influential.base_quality_score_threshold} · APT ${sg.influential.active_probability_threshold}`]))));
+  return rows.length ? rows : [h("div", {class: "empty", text: "Step A is starting."})];
+}
+
 function renderStepA(E, R) {
   const box = $("waves");
+  const G = last && last.search && last.search.global_a;
+  if (G) {                         // island mode: its global Step A (the engine's own waves stay empty)
+    $("h-stepa").textContent = `Step A: global (island mode) · ${globalASub(G)}`;
+    box.replaceChildren(...globalARows(G));
+    return;
+  }
+  $("h-stepa").textContent = "Step A: candidates";
   if (!E || !(E.waves || []).length) { box.replaceChildren(h("div", {class: "empty", text: R && R.mode ? R.mode : "Not started."})); return; }
   const stepA = E.waves.filter((w) => !/^step C/i.test(w.label || ""));
   const waves = stepA.map((w, i) => {
@@ -1896,3 +1961,93 @@ $("history-refresh").addEventListener("click", loadHistory);
 // ---- start ----------------------------------------------------------------------------------------------------------
 showTab();
 poll();
+
+
+// ---- curves: per-setting response curves over the stored rounds (GET /api/curves) ---------------------------------
+const CURVE_GROUPS = [
+  ["Stable peak", "The best value sits in nearly the same place in most rounds: start at the usual peak and search near it."],
+  ["Depends on BAM type", "The peak follows the BAM's base qualities: low on binned BAMs (few quality levels), high on full-quality BAMs."],
+  ["Moves per round", "The peak changes from round to round, so these need searching every round."],
+  ["Flat", "The score barely changes across the whole range."],
+];
+const CURVE_YMIN = -3;
+let curvesData = null, curvesLoading = false;
+
+async function loadCurves() {
+  if (curvesData) { renderCurves(); return; }
+  if (curvesLoading) return;
+  curvesLoading = true;
+  try {
+    const r = await api("/api/curves");
+    curvesData = await r.json();
+  } catch (e) {
+    curvesData = null;
+    $("curves-sections").replaceChildren(h("div", {class: "empty", text: "The curves could not be loaded."}));
+  } finally {
+    curvesLoading = false;
+  }
+  if (curvesData) renderCurves();
+}
+
+function curveMedians(rounds, name, k) {
+  const out = [];
+  for (let b = 0; b < k; b++) {
+    const g = Object.values(rounds).map((r) => (r[name] ? r[name].gap[b] : null)).filter((x) => x != null).sort((a, c) => a - c);
+    if (g.length < 10) continue;
+    const m = g.length, med = m % 2 ? g[(m - 1) / 2] : (g[m / 2 - 1] + g[m / 2]) / 2;
+    out.push({bin: b, med, n: m, best: g[m - 1]});
+  }
+  return out;
+}
+
+function renderCurves() {
+  const box = $("curves-sections"), D = curvesData;
+  const rounds = D.rounds || {}, bins = D.bins || {}, summary = D.summary || [];
+  const nRounds = Object.keys(rounds).length;
+  $("curves-sub").textContent = nRounds ? `${nRounds} stored rounds, ${summary.length} settings · local scores` : "";
+  if (!summary.length) { box.replaceChildren(h("div", {class: "empty", text: "No curves yet: run test/bench/param_curves.py."})); return; }
+  box.replaceChildren(...CURVE_GROUPS.map(([g, note]) => {
+    const items = summary.filter((x) => x.group === g);
+    if (!items.length) return null;
+    return h("section", {class: "panel"},
+      h("h2", {text: g}), h("div", {class: "muted", text: note}),
+      h("div", {class: "curve-grid"}, items.map((x) => curveCard(x, rounds, bins[x.setting] || []))));
+  }).filter(Boolean));
+}
+
+function curveCard(x, rounds, labels) {
+  const k = labels.length, W = 320, H = 150, m = {t: 8, r: 10, b: 30, l: 28};
+  const X = (b) => m.l + ((W - m.l - m.r) * b) / Math.max(1, k - 1);
+  const y = (g) => m.t + (H - m.t - m.b) * (Math.max(CURVE_YMIN, Math.min(0, g)) / CURVE_YMIN);
+  const svg = s("svg", {viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": `Response curve of ${x.setting}`});
+  for (const t of [0, -1, -2, -3]) {
+    svg.append(s("line", {x1: m.l, x2: W - m.r, y1: y(t), y2: y(t), class: "curve-grid-line"}));
+    svg.append(s("text", {x: m.l - 5, y: y(t) + 3.5, "text-anchor": "end", class: "curve-tick"}, t === 0 ? "0" : "−" + Math.abs(t)));
+  }
+  const path = (pts) => pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
+  for (const r of Object.values(rounds)) {
+    const g = r[x.setting] ? r[x.setting].gap : [];
+    const pts = g.map((v, b) => [b, v]).filter((p) => p[1] != null);
+    if (pts.length > 1) svg.append(s("path", {d: path(pts), class: "curve-round"}));
+  }
+  const med = curveMedians(rounds, x.setting, k);
+  if (med.length) {
+    svg.append(s("path", {d: path(med.map((p) => [p.bin, p.med])), class: "curve-median"}));
+    const top = med.reduce((a, c) => (c.med > a.med ? c : a));
+    svg.append(s("circle", {cx: X(top.bin), cy: y(top.med), r: 4, class: "curve-peak"}));
+  }
+  const ticks = k <= 6 ? [...Array(k).keys()] : [0, Math.round((k - 1) / 2), k - 1];
+  ticks.forEach((b, i) => svg.append(s("text", {x: X(b), y: H - m.b + 14, class: "curve-tick",
+    "text-anchor": k <= 6 ? "middle" : i === 0 ? "start" : i === ticks.length - 1 ? "end" : "middle"}, String(labels[b]))));
+  // hover: one invisible column per value with its numbers
+  const step = (W - m.l - m.r) / Math.max(1, k - 1);
+  for (const p of med) {
+    const col = s("rect", {x: X(p.bin) - step / 2, y: m.t, width: Math.max(2, step), height: H - m.t - m.b, class: "curve-hit"});
+    col.append(s("title", {}, `value ${labels[p.bin]}\nmedian ${p.med >= 0 ? "+" : ""}${p.med.toFixed(3)} (${p.n} rounds)\nbest round ${p.best >= 0 ? "+" : ""}${p.best.toFixed(3)}`));
+    svg.append(col);
+  }
+  return h("div", {class: "curve-card"},
+    h("div", {class: "curve-head"}, h("b", {text: x.setting}), chip(x.shape)),
+    h("div", {class: "muted num curve-note"}, `Peak most often at ${x.top_peak} (${x.top_peak_rounds} of ${x.rounds} rounds) · middle half ${x.peak_low} to ${x.peak_high}`),
+    svg);
+}

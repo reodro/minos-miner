@@ -18,6 +18,7 @@ import random
 from typing import Dict, List, Optional
 
 from common.params import ParamRanges, ParamSpec
+from common.tuning import tune
 from common.types import Config
 from search.bamgroups import BQST, CONT, MBQ, MMQ, MRPAS, snap
 
@@ -38,6 +39,15 @@ PINNED = {"gatk": {"emit_ref_confidence": "NONE",
 # 0-1 (6 of 6 plain runs on 20261002T104100Z; 5 and 13 pass), and on 20261002T115300Z none of the 1,322 configs with
 # padding 0-4 reached the top 200 of 7,067 true-scored (best 85.67 against 85.84 at padding 13).
 FLOORS = {"gatk": {"assembly_region_padding": 5}}
+# space.padding_max (2026-10-19): the search's ceiling for assembly_region_padding, inside the published 0-500. In 32
+# rounds (1.08 M configs) every round's best had padding 12-35; the 9% of configs above 60 never made a final best (their
+# best was a median 0.66 below the round's) and padding jumps were the main source of crashes (044200Z, 2026-10-16).
+PADDING = "assembly_region_padding"
+# space.padding_min: a higher floor. 20261019T130600Z, stock GATK on the round's best: padding 5, 8, 9 and 11 crashed;
+# 12-19 were within 0.06 of the best (14), and TRUE fell slowly from 20 to 60 (86.70).
+# space.apt_max: a ceiling for active_probability_threshold. In 31 of 32 rounds the best score at 0.024 was 6-8 points
+# under the round's best (true calls collapse), and every round's best had 0.001-0.023 (0.022 or 0.023 in 17).
+APT = "active_probability_threshold"
 
 # Live /scoring/parameter-ranges is tighter than the validator GATK template (templates.tool_params). Until
 # 2026-10-18 the space opened the template bounds here ("validator edges": min_pruning 1, max_reads 0-24, haplotypes
@@ -106,8 +116,17 @@ class Space:
         self.bounds = bounds
         specs = ranges.tools[tool]
         self.floors = {n: f for n, f in FLOORS.get(tool, {}).items() if n in specs}
+        pad_min = int(tune("space.padding_min"))
+        if pad_min > 0 and tool == "gatk" and PADDING in specs:
+            self.floors[PADDING] = max(self.floors.get(PADDING, 0), pad_min)
         merged = dict(bounds.caps) if bounds is not None else {}
         merged.update(caps or {})
+        pad_max = int(tune("space.padding_max"))
+        if pad_max > 0 and tool == "gatk":
+            merged[PADDING] = min(int(merged.get(PADDING, pad_max)), pad_max)
+        apt_max = float(tune("space.apt_max"))
+        if apt_max > 0 and tool == "gatk":
+            merged[APT] = min(float(merged.get(APT, apt_max)), apt_max)
         self.caps = {n: c for n, c in merged.items() if n in specs and specs[n].max is not None and c < specs[n].max}
         self.groups: Dict[str, tuple] = dict(bounds.groups) if bounds is not None else {}
         mmq = specs.get(MMQ)

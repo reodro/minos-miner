@@ -8,6 +8,7 @@ so it can never slow down or break mining; main applies settings itself (common/
   GET  /api/status       main's live.json as it is, the server's clock, and the run's review/rank rows when they exist
   GET  /api/history      one row per finished run from rounds.jsonl (round, review, rank), newest first
   GET  /api/points       every config scored this round, projected to 3D (dashboard/points.py)
+  GET  /api/curves       per-setting response curves over the stored rounds (test/bench/param_curves.py)
   GET  /api/settings     every setting's metadata and default, the file's overrides and what main would reject
   PUT  /api/settings     {"set": {name: value}, "reset": [name]} -> checked, then the file is replaced atomically
 
@@ -332,7 +333,8 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
     async def index(request: Request):
         if user_of(request) is None:
             return RedirectResponse("/login", status_code=303)
-        return FileResponse(STATIC / "index.html")
+        # never cached: a cached page kept an old layout after an update (the island-mode Step A panel, 2026-10-21)
+        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-store"})
 
     @app.get("/login")
     async def login_page():
@@ -408,6 +410,18 @@ def create_app(status_dir: Optional[Path] = None, tuning_file: Optional[Path] = 
             return {"round": None, "n": 0}
         from dashboard.points import points
         return await asyncio.to_thread(points, tag)
+
+    @app.get("/api/curves")
+    async def curves(request: Request):
+        if user_of(request) is None:
+            return denied()
+        runs = HERE.parent / "test" / "runs"
+        try:
+            data = json.loads((runs / "param_curves.json").read_text())
+            summary = json.loads((runs / "param_curves_summary.json").read_text())
+        except (OSError, ValueError):
+            return {"bins": {}, "rounds": {}, "summary": []}
+        return {"bins": data.get("bins", {}), "rounds": data.get("rounds", {}), "summary": summary}
 
     @app.get("/api/history")
     async def history(request: Request):

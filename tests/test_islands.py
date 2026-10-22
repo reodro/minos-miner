@@ -662,6 +662,28 @@ class StepCFillTest(unittest.TestCase):
         self.assertTrue(multi)
         self.assertTrue(all(c.key in cl.leap_meta for c in cl.leaps))
 
+    def test_a_blocked_fill_is_bounded_and_not_retried(self):
+        # 2026-10-22 03:09 live: the crash guard blocked nearly every candidate; each fill made 20 tries per idle worker
+        # (~11,000) and was called again at once - the event loop starved for the rest of the round
+        from search import leaps
+        ctx = JumpCtx(self.space, lambda c: 80.0)
+        ctx.rng = random.Random(4)
+        ctx.pick_at = lambda: 1e9
+        calls = [0]
+
+        def blocked(c):
+            calls[0] += 1
+            return False
+        ctx.fresh = blocked
+        cl = Climber(ctx, 0, self.space._assemble({MMQ: 40}), 80.0, origin="step C")
+        ctx.climbers.append(cl)
+        self.assertEqual(cl.fill_step_c(600), 0)
+        # single jumps (bounded by the space, ~2,000 here) + at most MUTATION_TRIES mutation tries; before: + 20 x 600
+        self.assertLessEqual(calls[0], 2000 + leaps.MUTATION_TRIES)
+        before = calls[0]
+        self.assertEqual(cl.fill_step_c(600), 0)                        # nothing new: not tried again
+        self.assertEqual(calls[0], before)
+
     def test_no_fill_once_a_run_could_not_return_before_the_pick(self):
         from search.climb import FILL_CUTOFF_S
         ctx = JumpCtx(self.space, lambda c: 80.0)

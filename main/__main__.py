@@ -57,6 +57,26 @@ def _board():
     return _BOARD["b"]
 
 
+def baselines(r: ParamRanges) -> list:
+    """The known-good configs, best first; [0] is what a round with nothing scored submits. main.generalist_first
+    (user, 2026-10-22): generalist g0 (/minos/data/portfolio/generalists_a1.json, mean gap 1.448 to the round's best over
+    15 released rounds) before GATK's defaults (4-6 below). Round 03:46 fell back to defaults when its answer set came
+    45 min late. A g0 outside the published ranges, or a missing file, leaves the defaults alone."""
+    import json
+    from common.tuning import tune
+    from common.types import Config
+    out = [r.defaults("gatk")]
+    if int(tune("main.generalist_first")):
+        try:
+            with open(os.path.join(SETTINGS.data_dir, "portfolio", "generalists_a1.json")) as f:
+                g0 = Config("gatk", {**out[0].params, **json.load(f)["configs"][0]})
+            if not r.errors(g0):
+                out.insert(0, g0)
+        except (OSError, ValueError, KeyError, IndexError):
+            pass
+    return out
+
+
 def make_parts(rnd: Round, r: ParamRanges, submitter, workers: int, fleet=None, scoring=None):
     """The pieces of one round, each from its own part's factory: main never builds another part's internals."""
     import evaluator
@@ -69,8 +89,9 @@ def make_parts(rnd: Round, r: ParamRanges, submitter, workers: int, fleet=None, 
     executor = fleet if fleet is not None else evaluator.local_executor(workers)
     os.makedirs(os.path.join(SETTINGS.cache_dir, "results"), exist_ok=True)
     store = ResultStore(os.path.join(SETTINGS.cache_dir, "results", f"{rnd.tag}.sqlite"))
-    return Parts(answer_set.builder(), executor, evaluator.scorer(), search.searcher(r, workers), submitter, r,
-                 [r.defaults("gatk")], LoopSettings(resubmit_interval_s=tune("main.resubmit_interval_s"),
+    from main.answer_reuse import reusing
+    return Parts(reusing(answer_set.builder()), executor, evaluator.scorer(), search.searcher(r, workers), submitter, r,
+                 baselines(r), LoopSettings(resubmit_interval_s=tune("main.resubmit_interval_s"),
                                                     resubmit_margin=tune("main.resubmit_margin"),
                                                     stop_before_deadline_s=tune("main.stop_before_deadline_s")), store,
                  status=_board(), scoring=scoring)

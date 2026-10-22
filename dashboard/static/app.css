@@ -1,6 +1,6 @@
 /* Minos live dashboard. Layout: a sticky top bar, then a three-tab body (Live | History | Settings) in one centred column that
-   widens to a two-column grid on large screens. Colors are tokens: "clean white" for light, "midnight" for dark.
-   The page follows the system setting until the top bar's toggle sets data-theme on <html> (remembered per browser). */
+   widens to a two-column grid on large screens. Colors are tokens; the page is dark only ("midnight"): the second
+   :root block overrides the first one's colors. */
 :root {
   --bg: #f6f8fa;
   --panel: #ffffff;
@@ -40,44 +40,7 @@
   --axis-r: 66px;
   color-scheme: light;
 }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #0d1230;
-    --panel: #151b42;
-    --panel-2: #1a2150;
-    --ink: #eef0ff;
-    --muted: #989cb0;
-    --label: #898ca2;
-    --faint: #62667f;
-    --line: #313651;
-    --track: #262a47;
-    --accent: #4ea8ff;
-    --open: #34d399;
-    --merge: #fbbf24;
-    --final: #f472b6;
-    --scout: #a3e635;
-    --good: #34d399;
-    --warn: #f97316;
-    --bad: #f87171;
-    --rf: #f472b6;
-    --retired: #3a4275;
-    --on-strong: #080b1d;
-    --top-bg: #0a0e26;
-    --top-ink: #eef0ff;
-    --top-muted: #979aad;
-    --top-line: #33374d;
-    --accent-soft: #1b335e;
-    --open-soft: #163c47;
-    --merge-soft: #41382d;
-    --final-soft: #40274d;
-    --scout-soft: #2e4131;
-    --good-soft: #163c47;
-    --warn-soft: #432c22;
-    --bad-soft: #41273e;
-    color-scheme: dark;
-  }
-}
-:root[data-theme="dark"] {
+:root {   /* dark only (user, 2026-10-21): these tokens override the base block above */
   --bg: #0d1230;
   --panel: #151b42;
   --panel-2: #1a2150;
@@ -127,7 +90,6 @@ a { color: var(--accent); }
   padding: 10px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
 .brand { font-weight: 700; letter-spacing: .02em; display: flex; align-items: center; gap: 8px; }
 .brand i { width: 10px; height: 10px; border-radius: 2px; background: var(--accent); display: inline-block; }
-.theme-toggle { min-width: 4.5em; }
 .round-name { color: var(--top-muted); font-size: 13px; min-width: 0; overflow-wrap: anywhere; }
 .top #updated { color: var(--top-muted); }
 .top .btn { background: transparent; border-color: var(--top-line); color: var(--top-ink); }
@@ -403,3 +365,17 @@ table.stable { border-collapse: collapse; width: 100%; min-width: 760px; font-si
   box-shadow: 0 4px 14px rgba(0, 0, 0, .18); pointer-events: none; }
 .space-ctl { position: absolute; top: 8px; right: 8px; display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; max-width: 70%; }
 .small-select { font-size: 12px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); }
+
+/* curves tab (2026-10-19) */
+.curve-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 12px; }
+.curve-card { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--panel-2); display: grid; gap: 4px; min-width: 0; }
+.curve-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.curve-head b { font-size: 13px; margin-right: auto; overflow-wrap: anywhere; }
+.curve-note { font-size: 12px; }
+.curve-grid-line { stroke: var(--track); stroke-width: 1; }
+.curve-tick { fill: var(--muted); font-size: 10px; }
+.curve-round { fill: none; stroke: var(--faint); stroke-width: 1; stroke-opacity: .45; stroke-linejoin: round; }
+.curve-median { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.curve-peak { fill: var(--rf); stroke: var(--panel); stroke-width: 1; }
+.curve-hit { fill: transparent; }
+.curve-hit:hover { fill: var(--accent-soft); fill-opacity: .35; }

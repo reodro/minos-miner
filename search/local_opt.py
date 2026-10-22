@@ -43,6 +43,14 @@ def higher_neighbor(ctx, centre, score):
 
 
 async def certify_round(ctx) -> None:
+    ctx.certifying = True                              # island mode: the neighbours may leave the band by one rung
+    try:
+        await _certify_round(ctx)
+    finally:
+        ctx.certifying = False
+
+
+async def _certify_round(ctx) -> None:
     """Until the pick, keep the round's best at a 1-rung local optimum."""
     pick = getattr(ctx, "pick_at", None)
     until = float(pick()) if callable(pick) else ctx.clock()

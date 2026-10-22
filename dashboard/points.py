@@ -17,7 +17,9 @@ import numpy as np
 
 from common.settings import SETTINGS
 
-CACHE_S = 20.0
+CACHE_S = 60.0
+MAX_POINTS = 2500        # the 3D view gets at most this many: the best TOP_POINTS and an even sample of the rest
+TOP_POINTS = 1000        # (a 486-worker round scores tens of thousands; drawing them all stalled the browser)
 SOURCES = ["climber", "ga", "rf", "step_a", "released", "other"]     # the page's colour per source
 
 _lock = threading.Lock()
@@ -76,6 +78,12 @@ def _compute(tag: str, path: Path) -> dict:
         db.close()
     if len(rows) < 4:
         return empty
+    total = len(rows)
+    if total > MAX_POINTS:
+        rows = sorted(rows, key=lambda r: -float(r[2]))
+        rest = rows[TOP_POINTS:]
+        step = len(rest) / (MAX_POINTS - TOP_POINTS)
+        rows = rows[:TOP_POINTS] + [rest[int(i * step)] for i in range(MAX_POINTS - TOP_POINTS)]
     from common.types import Config
     space = _space_once()
     if _enc_round != tag:
@@ -99,7 +107,7 @@ def _compute(tag: str, path: Path) -> dict:
             basis[k] = -basis[k]
     xyz = (X - mean) @ basis.T
     src = [source_of(t) for _k, _c, _s, t in rows]
-    return {"round": tag, "n": len(rows), "names": list(space.names), "sources": SOURCES,
+    return {"round": tag, "n": len(rows), "n_total": total, "names": list(space.names), "sources": SOURCES,
             "mean": [round(float(x), 5) for x in mean], "basis": [[round(float(x), 5) for x in b] for b in basis],
             "xyz": [round(float(x), 4) for x in xyz.ravel()], "score": [round(float(r[2]), 4) for r in rows],
             "src": [s[0] for s in src], "island": [s[1] for s in src], "climber": [s[2] for s in src]}

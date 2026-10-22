@@ -32,6 +32,8 @@ class LoopSettings:
                                         # a better config found meanwhile is submitted when the interval ends
                                         # and, at the latest, just before the loop stops
     stop_before_deadline_s: float = 120.0
+    fallback_before_deadline_s: float = 1200.0  # nothing submitted this long before the deadline: a baseline goes out
+                                        # unscored (2026-10-21: 0 workers, nothing scored, rounds 19:22-21:46 missed)
     build_timeout_s: float = 1500.0     # a build not done by then (a hung 1000G path) ends the round on the baseline
     score_margin_s: float = 45.0        # scoring after GATK: work must end this long before the final submission
     max_evals: Optional[int] = None     # budget by count (backtests must match config count, not wall time)
@@ -74,6 +76,7 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
     submitted: List[Optional[str]] = [None]
     last_submit = [float("-inf")]
     last_refused = [float("-inf")]                # a refused submission (platform down, fee) is retried after 30 s
+    last_fallback = [float("-inf")]               # the unscored baseline fallback, retried every 60 s
     since_update: List[CallSet] = []
     held: List[CallSet] = []                      # GATK results that arrived before the answer set
     started = clock()
@@ -142,6 +145,17 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                 out.submissions.append((clock(), best.config_key, score))
             else:
                 last_refused[0] = clock()
+
+    def fallback(when: str):
+        """Nothing submitted yet: the first legal baseline goes out unscored, so no round is missed (5 epochs).
+        trusted() has no score for it, so any scored best found later replaces it."""
+        if submitted[0] is not None or not baselines:
+            return
+        for c in baselines:
+            if not ranges.errors(c) and submitter.submit(round, c):
+                submitted[0] = c.key
+                log.warning("%s: nothing submitted %s; baseline %s submitted unscored", round.round_id, when, c.key)
+                return
 
     def on_result(o: Outcome):
         if o.ok:
@@ -276,6 +290,10 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
                     out.answer_set_version = new.version
                     publish_answer_set(new)
             maybe_submit()                        # an improvement held back by the interval goes out when it ends
+            if (deadline_ts is not None and clock() >= deadline_ts - settings.fallback_before_deadline_s
+                    and clock() - last_fallback[0] >= 60.0):
+                last_fallback[0] = clock()
+                fallback(f"{settings.fallback_before_deadline_s / 60:.0f} min before the deadline")
             if on_tick:
                 on_tick(client, out, executor)    # the dashboard snapshot (throttled by the callee)
             idle_spins = idle_spins + 1 if (virtual and not batch and client.in_flight == 0) else 0
@@ -287,6 +305,8 @@ async def run_round_async(round: Round, provider: AnswerSetProvider, executor: E
         if scoring_tasks:                         # results already computed are worth submitting on
             await asyncio.gather(*scoring_tasks, return_exceptions=True)
         maybe_submit(force=True)                  # last chance: the best found so far, whatever the interval
+        if not (building.done() and not building.cancelled() and building.exception() is not None):
+            fallback("when the search ended")     # (a failed answer set: the caller submits its static baseline)
         end = getattr(executor, "end_round", None)  # nobody will read this round's results any more: free every
         if end:                                   # worker (queued jobs dropped, running containers killed)
             end(round.round_id)

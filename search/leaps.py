@@ -402,6 +402,10 @@ def momentum(ctx, centre: Config, name: str, sign: int, k: int, skip: Callable[[
     return out
 
 
+MUTATION_TRIES = 400   # per call: 2026-10-22 03:09 live, 20 per idle worker (~11,000) with the crash guard blocking
+                       # nearly all of them starved the event loop for the rest of the round
+
+
 def mutations(ctx, centre: Config, names: Sequence[str], skip: Callable[[Config], bool], n: int, rng,
               taken=(), sizes=(2, 3)) -> List[Tuple[str, int, int, Config]]:
     """Up to n configs that move two or three settings of `centre` at once, each by a value drawn from its own arm,
@@ -414,7 +418,7 @@ def mutations(ctx, centre: Config, names: Sequence[str], skip: Callable[[Config]
     out: List[Tuple[str, int, int, Config]] = []
     seen = set(taken) | {centre.key}
     tries = 0
-    while len(out) < n and tries < 20 * max(1, n) and live:
+    while len(out) < n and tries < min(20 * max(1, n), MUTATION_TRIES) and live:
         tries += 1
         want = rng.choice(sizes)
         chosen, used = [], set()

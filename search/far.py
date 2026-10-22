@@ -42,10 +42,18 @@ def fine_tune_at(ctx) -> float:
 
 
 async def refine(ctx) -> None:
-    """The round's Step C. Climb the best config until the pick. A higher score restarts that climb. No GA."""
+    """The round's Step C. Climb the best config until the pick. A higher score restarts that climb. No GA.
+    far.step_c_top = n (user, 2026-10-21): the round's n best-scoring climbers, across every island, are fine-tuned
+    instead (an island with none of them stops; one with two runs both at once)."""
     if ctx.over() or ctx.clock() >= ctx.pick_at():
         return
     horizon = ctx.pick_at()
+    if getattr(getattr(ctx, "island", None), "stopped", False):        # lost the race: nothing to fine-tune
+        return
+    top_n = int(tune("far.step_c_top"))
+    if top_n > 0:
+        await refine_top(ctx, top_n, horizon)
+        return
     top = ctx.best()
     if top is None or ctx.clock() >= horizon:
         ctx.say("step C: nothing left to fine-tune")
@@ -72,6 +80,61 @@ async def refine(ctx) -> None:
         cl.state = "stopped"
     ctx.say("step C: fine-tune %s %.4f -> %.4f (%s, %d it)", c.key[:8], s, cl.score, cl.state, cl.iteration)
     ctx.publish(force=True)
+
+async def refine_top(ctx, top_n: int, horizon: float) -> None:
+    mine: Dict[str, Tuple[float, Config]] = {}
+    for cl in getattr(ctx, "climbers", ()) or ():
+        if (getattr(cl, "origin", "") or "") == "step C" or getattr(cl, "centre", None) is None:
+            continue
+        s = float(getattr(cl, "score", float("-inf")))
+        if cl.centre.key not in mine or s > mine[cl.centre.key][0]:
+            mine[cl.centre.key] = (s, cl.centre)
+    ranked = sorted(mine.values(), key=lambda t: -t[0])[:top_n]
+    island = getattr(ctx, "island", None)
+    if island is not None and getattr(island, "board", None) is not None:
+        posted = island.board.setdefault("step_c", {})
+        posted[island.index] = [(s, c, island.index) for s, c in ranked]
+        done = island.board.setdefault("done", set())
+        virtual = hasattr(getattr(ctx.client, "executor", None), "now")
+        waited = 0
+        # wait for every other island to post its climbers (or end), so all islands pick the same top n; live at
+        # most 180 s (a 600-yield wait gave up early in the simulation and the islands picked different tops)
+        while any(i not in posted and i not in done for i in range(island.k)):
+            if ctx.over() or (not virtual and waited >= 180):
+                ctx.say("step C: island(s) %s have not posted their climbers; the top %d is taken from the rest",
+                        [i for i in range(island.k) if i not in posted and i not in done], top_n)
+                break
+            await asyncio.sleep(0 if virtual else 1)
+            waited += 1
+        everyone = sorted((t for lst in posted.values() for t in lst), key=lambda t: -t[0])[:top_n]
+        targets = [(c, s) for s, c, i in everyone if i == island.index]
+        ctx.say("step C: the round's top %d climbers %s; this island fine-tunes %d", top_n,
+                ", ".join(f"{s:.4f} (island {i})" for s, _, i in everyone), len(targets))
+    else:
+        targets = [(c, s) for s, c in ranked]
+    if not targets:
+        return
+    from search.separate import enabled as separate_enabled
+    ctx.phase = "C: fine-tune"
+    cls = []
+    for c, s in targets:
+        ctx.say("step C: fine-tune %s opened at %.4f", c.key[:8], s)
+        cl = Climber(ctx, len(ctx.climbers), c, s, origin="step C")
+        cl.compass_only = separate_enabled()
+        ctx.climbers.append(cl)
+        cls.append((cl, c, s))
+
+    async def one(cl):
+        try:
+            await cl.run(horizon)
+        except Exception:  # noqa: BLE001 - the fine-tune must not end the round
+            log.exception("engine: step C fine-tune failed")
+            cl.state = "stopped"
+    await asyncio.gather(*(one(cl) for cl, _, _ in cls))
+    for cl, c, s in cls:
+        ctx.say("step C: fine-tune %s %.4f -> %.4f (%s, %d it)", c.key[:8], s, cl.score, cl.state, cl.iteration)
+    ctx.publish(force=True)
+
 
 def second_highs(ctx, peak: Config, score: float, known: Dict[str, Dict[int, float]]) -> List[Tuple[float, str, int, int, int]]:
     """(score, setting, rung, low, high) of each second high point within far.second_margin of the peak: higher than its

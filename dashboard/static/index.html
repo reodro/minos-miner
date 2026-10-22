@@ -1,14 +1,14 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Minos dashboard</title>
-<script src="/static/theme.js?v=17"></script>
+<script src="/static/theme.js?v=18"></script>
 <link rel="stylesheet" href="/static/vendor/uPlot.min.css">
-<link rel="stylesheet" href="/static/app.css?v=57">
+<link rel="stylesheet" href="/static/app.css?v=59">
 <script src="/static/vendor/uPlot.iife.min.js" defer></script>
-<script src="/static/app.js?v=127" defer></script>
+<script src="/static/app.js?v=135" defer></script>
 </head>
 <body>
 <header class="top">
@@ -17,8 +17,7 @@
   <span class="chip" id="phase-chip">–</span>
   <div class="spacer"></div>
   <div class="muted num" id="updated"></div>
-  <nav class="tabs" aria-label="Views"><a href="#live" id="tab-live" class="on">Live</a><a href="#history" id="tab-history">History</a><a href="#settings" id="tab-settings">Settings</a></nav>
-  <button class="btn theme-toggle" id="theme" type="button">Dark</button>
+  <nav class="tabs" aria-label="Views"><a href="#live" id="tab-live" class="on">Live</a><a href="#history" id="tab-history">History</a><a href="#curves" id="tab-curves">Curves</a><a href="#settings" id="tab-settings">Settings</a></nav>
   <button class="btn" id="logout" type="button">Log out</button>
 </header>
 
@@ -41,6 +40,11 @@
       <span><i class="retired"></i>joined another</span><span><i class="grid"></i>grid update</span><span><i class="jump"></i>centre jump</span>
       <span><i class="ga"></i>GA child</span><span><i class="rf"></i>RF-UCB</span><span><i class="returned"></i>own run back late (older rounds)</span><span><i class="find"></i>a Step C find</span>
     </div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-globala" id="globala-panel" hidden>
+    <h2 id="h-globala">Island mode: global Step A <span class="sub" id="globala-sub"></span></h2>
+    <div class="rows" id="globala"></div>
   </section>
 
   <section class="panel" aria-labelledby="h-islands">
@@ -125,6 +129,14 @@
     <div class="muted">Finished runs, newest first. Select one to see its scores, the search, and the answer set.</div>
     <div class="hist" id="history-list"></div>
   </section>
+</main>
+
+<main id="view-curves" hidden>
+  <section class="panel" aria-labelledby="h-curves">
+    <h2 id="h-curves">Setting response curves <span class="sub" id="curves-sub"></span></h2>
+    <div class="muted">For each searched setting, the best local score any config reached at each value, as the distance below that round's best (0 is the round's peak). Grey: one line per round. Colour: the median of the rounds, its peak marked. All cards share one scale; drops deeper than 3 points sit on the bottom edge. Hover a card for the numbers at each value.</div>
+  </section>
+  <div id="curves-sections" class="rows"></div>
 </main>
 
 <main id="view-settings" hidden>

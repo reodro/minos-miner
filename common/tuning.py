@@ -86,6 +86,7 @@ def fmt(x: float) -> str:
 
 
 GROUPS = {
+    "space": "The search space: limits the search keeps inside the published ranges",
     "candidates": "Step A: candidates (wave 0, the genetic generations, the pick)",
     "climb": "Step B: each candidate's grid climb",
     "islands": "Islands: independent searches sharing one fleet",
@@ -135,7 +136,7 @@ KNOBS_LIST: List[Knob] = [
          "Two candidates are at least this far apart by callset distance (class-weighted 1 - Jaccard)."),
     Knob("candidates.min_setting_distance", 0.05, 0.0, 1.0, LIVE, "x",
          "The same when a callset has no sketch: mean normalised setting difference."),
-    Knob("climb.group_size", 5, 1, 7, LIVE, "count",
+    Knob("climb.group_size", 5, 1, 20, LIVE, "count",
          "Settings in each grid (every combination at -d, 0, +d: 3^n points)."),
     Knob("climb.accept_min", 0.005, 0.0, 0.1, LIVE, "score",
          "An iteration gaining less than this has failed; both grid kinds failing in a row is a stall."),
@@ -200,17 +201,94 @@ KNOBS_LIST: List[Knob] = [
     Knob("climb.head_reserve", 24, 0, 200, LIVE, "count",
          "Workers the GA leaves free for a climber's next heads once its wave is half back (at most this many per "
          "climber). 0: the GA fills every free worker."),
-    Knob("islands.workers", 324, 50, 100000, ROUND, "count",
+    Knob("space.padding_max", 0, 0, 500, ROUND, "count",
+         "Ceiling for assembly_region_padding in the search (inside the published 0-500); seeds and portfolio members "
+         "above it are clamped. 0: the published maximum. 2026-10-19: every round's best in 32 rounds had 12-35."),
+    Knob("space.padding_min", 0, 0, 500, ROUND, "count",
+         "Floor for assembly_region_padding in the search, above the built-in 5; seeds below it are raised. 0: the "
+         "built-in floor. 2026-10-19: padding 5, 8, 9 and 11 crashed GATK on the round's best; 12-19 were the best."),
+    Knob("space.apt_max", 0.0, 0.0, 0.05, ROUND, "share",
+         "Ceiling for active_probability_threshold in the search (inside the published 0.001-0.05); seeds above it are "
+         "clamped. 0: the published maximum. 2026-10-19: a 6-8 point cliff at 0.024 in 31 of 32 rounds."),
+    Knob("islands.workers", 324, 16, 100000, ROUND, "count",
          "One independent search per this many workers (810: two islands of 405). Below twice this, one search."),
     Knob("islands.min_settings", 8, 0, 30, LIVE, "count",
          "A Step A seat that differs in fewer settings than this from another island's seat is passed over "
          "while the island has another."),
+    Knob("islands.global_a", 0, 0, 1, ROUND, "count",
+         "Island mode (search/global_a.py): one global Step A over the influential settings, then one island per "
+         "segment with those settings held in a band. 0 = the islands each run their own Step A."),
+    Knob("islands.global_a_share", 0.3056, 0.05, 0.6, ROUND, "share",
+         "Island mode: Step A stops at this share of the round (22 of 72 minutes), whatever stage it is in."),
+    Knob("islands.global_a_short", 0, 0, 1, ROUND, "count",
+         "Island mode: short Step A tail: A3 only for islands no A1 point stands on, and two re-tune waves "
+         "(+-3 and +-1 together, then +-1) instead of three."),
+    Knob("islands.global_a_fill", 0, 0, 1, ROUND, "count",
+         "Island mode: the waves after A1 (A3, re-tune) fill the free workers with the island heads' neighbours on "
+         "every setting (+-1..3 rungs, inside the island). Live 2026-10-21: 19 of 486 workers were busy there."),
+    Knob("islands.global_a_quorum", 1.0, 0.5, 1.0, ROUND, "share",
+         "Island mode: a Step A wave ends once this share of its configs is back (scored or failed); the rest keep "
+         "running and still reach the store. 1.0 = wait for all (or the stop time)."),
+    Knob("islands.global_a_waves", 0, 0, 1, ROUND, "count",
+         "Island mode: 1 = one-wave Step A: islands straight from the A1 sweep, no A3 or re-tune waves (Step B climbs "
+         "them on the whole fleet); 0 = the full Step A."),
+    Knob("islands.global_a_probe", 0.0, 0.0, 600.0, ROUND, "s",
+         "Island mode: the A1 starts run alone first for up to this long (during the answer-set build); a crashing start "
+         "is replaced by a spare before its sweep. 0 = off."),
+    Knob("islands.global_a_extra", 0, 0, 1, ROUND, "count",
+         "Island mode: A1 also sweeps calling confidence and min mapping quality from the 8 main starts."),
+    Knob("islands.global_a_scan", 0, 0, 1, ROUND, "count",
+         "Build B (test): 1 = today's Step A filled by the generalized scan (search/global_g.py) instead of the "
+         "one-setting sweep; hills, heads, bands and seats unchanged."),
+    Knob("islands.global_a_heads", 0, 0, 1, ROUND, "count",
+         "Build B2 (test): 1 = island heads are the best complete configs (islands.seat_apart settings apart), not the "
+         "per-value hills."),
+    Knob("islands.global_g", 0, 0, 1, ROUND, "count",
+         "1: generalized Step A (search/global_g.py scan, search/territory.py territories, a race of islands); "
+         "0: today's Step A (search/global_a.py)."),
+    Knob("islands.race_k", 6, 1, 16, ROUND, "count",
+         "Generalized Step A: the territories (within islands.race_gap of the best) that start as islands for the race."),
+    Knob("islands.race_gap", 0.5, 0.0, 5.0, ROUND, "score", "Generalized Step A: a territory races only this close to the best."),
+    Knob("islands.race_s", 240.0, 0.0, 1800.0, ROUND, "s",
+         "Generalized Step A: after this long the islands.global_k best islands climb on and the rest stop."),
+    Knob("islands.global_g_waves", 1, 1, 4, ROUND, "count", "Generalized Step A: the scan's runs, in waves of the fleet."),
+    Knob("islands.territory_phi", 2.0, 1.0, 5.0, ROUND, "share",
+         "Generalized Step A: a nearest-better link longer than this x the mean link crosses a valley (a new territory)."),
+    Knob("islands.global_a_inline", 0, 0, 1, ROUND, "count",
+         "Idle fix 1: Step A's starts go out with their sweeps at once (a failed start is replaced by a spare with its "
+         "sweep) instead of the probe wait. 0 = the probe (islands.global_a_probe)."),
+    Knob("islands.global_a_tail", 0.0, 0.0, 1.0, ROUND, "share",
+         "Idle fix 2: a Step A wave ends once 60% of it is back and at least this share of the workers is idle. 0 = off."),
+    Knob("islands.global_seats", 1, 1, 8, ROUND, "count",
+         "Island mode: climber starts per island (its best distinct Step A configs). The climbers seated follow "
+         "candidates.workers_per_candidate."),
+    Knob("far.step_c_top", 0, 0, 8, ROUND, "count",
+         "Step C fine-tunes the round's n best-scoring climbers across every island (an island with none stops; one "
+         "with two runs both at once). 0 = each search fine-tunes its own best config (as before)."),
+    Knob("islands.seat_apart", 1, 1, 20, ROUND, "count",
+         "Island mode: an island's climber starts differ from each other in at least this many settings."),
+    Knob("climb.min_apart", 0, 0, 20, LIVE, "count",
+         "A climber does not move to within this many settings of another climbing climber's centre (0 = off)."),
+    Knob("climb.min_dist", 0.0, 0.0, 2.0, LIVE, "share",
+         "No climber move (grid, jump, GA/RF, borrowed) lands within this distance of another climbing climber's "
+         "centre on the unit-cube axes; island starts keep it too (0 = off). Step C is exempt."),
+    Knob("climb.move_k_min", 0, 0, 10, LIVE, "count",
+         "Offline test T1: >0 replaces each grid wave's single-setting compass by as many candidates that each move "
+         "move_k_min..move_k_max settings of the group at once (0 = off)."),
+    Knob("climb.move_k_max", 0, 0, 10, LIVE, "count", "Offline test T1: the most settings one grid candidate moves."),
+    Knob("climb.borrow", 0, 0, 1, LIVE, "count",
+         "1: each climber's wave also tries the latest winning move of each other climber on its island (up to 3)."),
+    Knob("islands.global_k", 0, 0, 16, ROUND, "count",
+         "Island mode: islands climbing at once. 0 = as many as islands.workers makes (at least 1)."),
     Knob("climb.wait_riders", 0, 0, 1, LIVE, "count",
          "1: a wave decides once its riders are back too. 0: once its grid points are back; riders that come back "
          "later count at the next decision."),
     Knob("climb.quorum", 0.8, 0.5, 1.0, LIVE, "share",
          "A wave counts as back at this share: the slowest fifth no longer holds the next wave (their scores still "
          "count when they return). 1.0 before 2026-10-16."),
+    Knob("climb.additive", 0, 0, 1, LIVE, "count",
+         "1: a grid wave runs to climb.quorum (no early move) and its winning settings are combined at their best "
+         "values - all together, all but one, top pairs and triples (~40 configs) - instead of the 3^m cube."),
     Knob("climb.move_at_once", 1, 0, 1, LIVE, "count",
          "1: a run that beats the centre by climb.accept_min moves it at once (the wave closes early; no cube on the "
          "old centre once a compass point clears the bar). 0: the climber moves only when its whole wave is back."),
@@ -268,6 +346,8 @@ KNOBS_LIST: List[Knob] = [
          "queued again and the node is told to drop it."),
     Knob("main.resubmit_interval_s", 300.0, 0.0, 3600.0, ROUND, "s", "Least time between two submissions."),
     Knob("main.resubmit_margin", 0.0, 0.0, 5.0, ROUND, "score", "A new best must gain this much to be resubmitted."),
+    Knob("main.generalist_first", 1, 0, 1, ROUND, "count",
+         "1: a round with nothing scored submits generalist g0 (portfolio/generalists_a1.json) before GATK's defaults."),
     Knob("main.stop_before_deadline_s", 60.0, 10.0, 900.0, ROUND, "s", "The search stops this long before the deadline."),
     Knob("answer_set.n", 548, 50, 2000, ROUND, "count",
          "How many targets the next round's answer set writes. The local score divides false calls by this. "

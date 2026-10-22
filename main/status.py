@@ -128,6 +128,7 @@ class StatusBoard:
         s["points"] = s["points"][-5000:]
         s["failure_reasons"] = sorted(out.failures.items(), key=lambda kv: -kv[1])[:8]
         s["engine"] = (getattr(client, "notes", None) or {}).get("engine")
+        s["global_a"] = (getattr(client, "notes", None) or {}).get("global_a")   # island mode's Step A (dashboard)
         s.update(evaluated=out.evaluated, failed=out.failed, in_flight=client.in_flight,
                  scored=sum(1 for r in full.values() if r.score is not None),
                  zero=sum(1 for r in full.values() if r.score is not None and r.score <= 0),
