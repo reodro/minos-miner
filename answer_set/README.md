@@ -35,7 +35,7 @@ the released truth.
 | `k2/tracks.py`, `k2/assemble.py` | model versions per track (ACTIVE, rollback); scores -> records |
 | `k2/util.py` | input and cache paths (`SETTINGS`), bcftools in Docker, VCF helpers |
 
-Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g086_20261022T0508, 1000G k060_20261021T1303) and
+Released models are code: `k2/models/<track>/ACTIVE` names the version main runs (GIAB g085_20261022T0421, 1000G k065_20261023T1524) and
 `k2/models/<track>/<version>/` holds its `model.joblib`, `hom.joblib`, `meta.json` (~3 MB per track). Releasing a new
 version = `tracks.promote` (copies those files, plus window / spelling / cluster models when the version has them, here) + commit; rollback = `--rollback` or git revert.
 `python -m answer_set.k2.tracks` lists versions.
@@ -284,6 +284,15 @@ prepared training rounds, the input manifest. Training: `k2/prepare.py` -> `k2/t
   Release check on GIAB rounds from 2026-10-21 11:30 (never trained or tuned on; test/answer_set/giab_fresh_grow.sh),
   9 rounds: +0.0224/round vs g077, t 2.06, better 7 / worse 2 (g085, without the call model: +0.0134; g081, g077 +
   the call model: +0.0068). The combination was chosen after seeing those two on 8 of the 9 rounds. Rollback: g077.
+- g085 (GIAB, released 2026-10-23) = g086 without the haplotype-aware call model (base g082 + window g083 + g077's
+  cut-offs, spelling model, cluster decoder, read guard). On 35 fresh GIAB rounds (from 2026-10-21 11:30) vs g077:
+  g085 +0.0142/round, t 2.06, better 22 / worse 13; g086 (with the call model) +0.0119, t 1.53 - the call model's
+  early gain did not hold. Rollback: g086.
+- k065 (1000G, released 2026-10-23) = k060's recipe retrained on 146 rounds (k047's 102 + 44 of 10-17 15:30 ..
+  10-21 04:58; test/answer_set/gt_study/retrain_kg2.sh): base k061, + repeat het/hom, DNA call model, k038's decoder
+  (k062), + haplotype het/hom (k063; leave-out genotype errors 726 -> 610), + 1000G window model (cut-off 0.70).
+  Fresh 1000G rounds (from 2026-10-21 14:00), 9: +0.0177/round vs k060, t 1.69, better 6 / worse 3 - released
+  before reaching t 2 (few 1000G rounds lately; same recipe, more data). Rollback: k060.
 - Off by default, tested and not released: haplotype-aware CALL model (hapgt.apply_call, meta call_hap; 1000G k057
   -0.0007, GIAB g080/g081 +0.009 t 1.74 - fresh-round check running), GIAB haplotype het/hom (g079 -0.0019), entry
   rule 3 (features.KG_RD_ENTRY 3, compound-het second alleles; k056 retrained +0.0063 t 0.97).
